@@ -26,7 +26,7 @@ Mlp::Mlp(Fabric &fab, const Config &cfg, int rows) : fab_(fab), cfg_(cfg), step_
     k.out = static_cast<bf16 *>(dev(static_cast<size_t>(step_rows_) * hidden_ * 2));
     k.silu = static_cast<float *>(dev(static_cast<size_t>(kernels::kSiluTabSize) * 4));
     if (C > 1) {
-      k.wire.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), kernels::pair_wire_words(hidden_) * 4));
+      k.wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(kernels::pair_wire_words(hidden_) * 4));
       k.wire.error = static_cast<uint32_t *>(dev(64));
     }
   }
@@ -78,7 +78,7 @@ void Mlp::reserve_rows(int rows_max, const std::vector<bf16 *> &h, const std::ve
         throw std::invalid_argument("qwen35 mlp: the caller's wire is short of rows_max rows");
       r.wire = {};  // run_rows reads the caller's wire at each call (its bf16 flag stays the MLP's own: fp32)
     } else if (C > 1) {
-      r.wire.inbox = static_cast<uint32_t *>(fab_.alloc_mailbox(static_cast<size_t>(c), kernels::pair_rows_wire_words(rows_max, hidden_) * 4));
+      r.wire.inbox = static_cast<uint32_t *>(fab_.alloc_kernel_mailbox(kernels::pair_rows_wire_words(rows_max, hidden_) * 4));
       r.wire.error = static_cast<uint32_t *>(dev(64));
       r.wire.rows_max = rows_max;
       r.wire.n_max = hidden_;

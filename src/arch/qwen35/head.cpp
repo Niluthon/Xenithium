@@ -57,7 +57,7 @@ Head::Head(Fabric &fab, const load::DenseStore &dense, const Config &cfg, bool i
       k.tiles = static_cast<int32_t *>(dev(static_cast<size_t>(rows_) * kernels::kHeadTilesMax * kernels::head_select_parts(vpc_) * 4));  // TP1: 2 parts
     }
     if (C > 1) {
-      k.wire.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), 4096));
+      k.wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(4096));
       k.wire.step = static_cast<int32_t *>(dev(4));
       k.wire.error = static_cast<uint32_t *>(dev(4));
     }

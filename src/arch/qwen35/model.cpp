@@ -442,7 +442,7 @@ Model::Model(Fabric &fab, const std::string &dir, const ModelOptions &opt) : fab
           cd->pf_wire.rows_max = R;
           cd->pf_wire.bf16 = opt_.prefill_wire_bf16;
           cd->pf_wire.n_max = H;
-          cd->pf_wire.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), k::pair_rows_wire_words(R, H) * 4));
+          cd->pf_wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::pair_rows_wire_words(R, H) * 4));
           cd->mem.push_back(cd->pf_wire.inbox);
         }
         cd->pf_ids = static_cast<int32_t *>(fab.alloc_host(std::max<size_t>(static_cast<size_t>(R) * 4, 4096)));
@@ -450,7 +450,7 @@ Model::Model(Fabric &fab, const std::string &dir, const ModelOptions &opt) : fab
       }
     }
     if (C > 1) {  // TP1: no wire (every kernel takes a null one: the sum is the card's own partial, rounded)
-      cd->wire.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), k::pair_wire_words(H) * 4));
+      cd->wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::pair_wire_words(H) * 4));
       cd->mem.push_back(cd->wire.inbox);
     }
     cd->wire.error = static_cast<uint32_t *>(dev(64));

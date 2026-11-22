@@ -222,7 +222,7 @@ Card make_card(xenithium::Fabric &f, int card, const Model &m, k::QsaKv kv, int 
   f.compute(card).memcpy(cd.rope, rope.data(), rope.size() * 2).wait();
   cd.out = static_cast<bf16 *>(cd.dev(f, card, 16ull * H * 2));
   if (cards > 1) {
-    cd.wire.inbox = static_cast<uint32_t *>(f.alloc_mailbox(card, k::pair_wire_words(H) * 4));
+    cd.wire.inbox = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::pair_wire_words(H) * 4));
     cd.mem.push_back(cd.wire.inbox);
     cd.wire.error = static_cast<uint32_t *>(cd.dev(f, card, 64));
     f.compute(card).memset(cd.wire.error, 0, 64).wait();
@@ -1038,7 +1038,7 @@ void test_rows(xenithium::Fabric &f, const Model &m, k::QsaKv kv, int ncards) {
     if (sh.head_dim == 256 && sh.gate)  // the oneDNN attention's scratch (the whole cache's tokens)
       k::gqa_sdpa_scratch_bind(sh, RM, cap, cd.dev(f, c, k::gqa_sdpa_scratch_bytes(sh, RM, cap)), rs[c]);
     if (ncards > 1) {
-      rw[c].inbox = static_cast<uint32_t *>(f.alloc_mailbox(c, k::pair_rows_wire_words(RM, H) * 4));
+      rw[c].inbox = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::pair_rows_wire_words(RM, H) * 4));
       cd.mem.push_back(rw[c].inbox);
       rw[c].error = cd.wire.error;
       rw[c].rows_max = RM;

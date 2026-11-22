@@ -344,9 +344,10 @@ DFlash::DFlash(Fabric &fab, const std::string &dir, const std::string &target_di
     q.memset(cd.wire.error, 0, 64);
     if (C > 1) {  // TP1: no wire (the sums are the card's own partials, the top-k its own list)
       const size_t tw_words = C == 4 ? k::kDfTopkWireWords4 : k::kDfTopkWireWords;  // two hops at four cards
-      cd.wire.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), k::pair_wire_words(H, C) * 4));
+      cd.wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::pair_wire_words(H, C) * sizeof(uint32_t)));
       cd.mem.push_back(cd.wire.inbox);
-      cd.tw.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), tw_words * 4));
+      const size_t topk_bytes = tw_words * sizeof(uint32_t);
+      cd.tw.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(topk_bytes));
       cd.mem.push_back(cd.tw.inbox);
       k::df_topk_wire_init(q, cd.tw.inbox, tw_words);
     }
@@ -365,7 +366,7 @@ DFlash::DFlash(Fabric &fab, const std::string &dir, const std::string &target_di
       if (C > 1) {
         cd.fl_wire.rows_max = opt.ctx_defer;
         cd.fl_wire.n_max = H;
-        cd.fl_wire.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), k::pair_rows_wire_words(opt.ctx_defer, H, C) * 4));
+        cd.fl_wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::pair_rows_wire_words(opt.ctx_defer, H, C) * sizeof(uint32_t)));
         cd.mem.push_back(cd.fl_wire.inbox);
         cd.fl_wire.error = cd.wire.error;
       }

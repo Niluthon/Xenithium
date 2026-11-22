@@ -299,7 +299,7 @@ Card make_card(xenithium::Fabric &f, int c, const Model &m, int cards, k::QsaKv 
   d.out = static_cast<bf16 *>(d.dev(f, c, kR * H * 2));
   d.pos = static_cast<int32_t *>(d.dev(f, c, 64));
   if (cards > 1) {
-    d.wire.inbox = static_cast<uint32_t *>(f.alloc_mailbox(c, k::pair_wire_words(H, cards) * 4));
+    d.wire.inbox = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::pair_wire_words(H, cards) * 4));
     d.mem.push_back(d.wire.inbox);
     d.wire.error = static_cast<uint32_t *>(d.dev(f, c, 4096));
     k::pair_wire_init(*d.q, H, d.wire.inbox, cards).wait();
@@ -698,7 +698,7 @@ void test_cards_owner(xenithium::Fabric &f, const Model &m, k::QsaKv kv, const c
   std::vector<k::OwnerShare> share(C);
   std::vector<uint32_t *> inbox(C);
   for (int c = 0; c < C; ++c) {
-    inbox[c] = static_cast<uint32_t *>(f.alloc_mailbox(c, mw * 4));
+    inbox[c] = static_cast<uint32_t *>(f.alloc_kernel_mailbox(mw * 4));
     k::owner_mail_init(f.compute(c), inbox[c], mw).wait();
   }
   for (int c = 0; c < C; ++c) {
@@ -975,7 +975,7 @@ void test_rows_cards(xenithium::Fabric &f, k::QsaKv kv, int p0, int M) {
     for (int sl = 0; sl < slices; ++sl) words[static_cast<size_t>(sl) * 2] = p0 + 4 * sl;
     r.wd = up(f, c, words, r.d.mem);
     if (cards > 1) {
-      r.wire.quad.inbox[c] = static_cast<uint32_t *>(f.alloc_mailbox(c, k::pair_rows_wire_words(M, H, cards) * 4));
+      r.wire.quad.inbox[c] = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::pair_rows_wire_words(M, H, cards) * 4));
       r.d.mem.push_back(r.wire.quad.inbox[c]);
       k::pair_rows_wire_init(*r.d.q, M, H, r.wire.quad.inbox[c], cards).wait();
       r.wire.error = r.d.wire.error;

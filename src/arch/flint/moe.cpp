@@ -47,7 +47,7 @@ MoeSet::MoeSet(Fabric &fab, const model::Checkpoint &ck, const load::DenseStore 
     silu[static_cast<size_t>(c)] = static_cast<float *>(dev(k::kSiluTabSize * 4));
     k::swiglu_table(q, silu[static_cast<size_t>(c)]);
     if (C > 1) {
-      cd.wire.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), k::pair_wire_words(H) * 4));
+      cd.wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::pair_wire_words(H) * 4));
       cd.mem.push_back(cd.wire.inbox);
     }
     cd.wire.error = static_cast<uint32_t *>(dev(64));

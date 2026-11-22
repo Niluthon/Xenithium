@@ -48,7 +48,7 @@ Head::Head(Fabric &fab, const load::DenseStore &dense, const Config &cfg) : fab_
     k.tokens = static_cast<int32_t *>(dev(kernels::kPickMaxRows * 4));
     k.scratch = dev(kernels::pick_scratch_bytes(vpc_));
     if (C > 1) {
-      k.wire.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), 4096));
+      k.wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(4096));
       k.wire.step = static_cast<int32_t *>(dev(4));
       k.wire.error = static_cast<uint32_t *>(dev(4));
     }

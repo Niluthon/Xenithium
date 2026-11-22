@@ -252,7 +252,7 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
     q.memcpy(K.rope, rope_h.data(), rope_h.size() * 2);
     // pair wire (n = hidden)
     if (nc_ > 1) {  // TP1 has no wire
-      K.pw.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(c, k::pair_wire_words(H, nc_) * 4));
+      K.pw.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::pair_wire_words(H, nc_) * sizeof(uint32_t)));
       K.mem.push_back(K.pw.inbox);
     }
     K.pw.error = static_cast<uint32_t *>(dev(64));
@@ -276,7 +276,7 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
       K.msc.hs = static_cast<float *>(dev(k::moe_hs_elems(msh) * 4));
     }
     if (nc_ > 1) {
-      K.mw.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(c, k::moe_wire_words(msh) * 4));
+      K.mw.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::moe_wire_words(msh) * sizeof(uint32_t)));
       K.mem.push_back(K.mw.inbox);
     }
     K.mw.error = static_cast<uint32_t *>(dev(64));
@@ -424,7 +424,7 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
         }
         K.pf.mw.rows_max = R;
         if (nc_ > 1) {
-          K.pf.mw.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(c, k::moe_rows_wire_words(msh, R) * 4));
+          K.pf.mw.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::moe_rows_wire_words(msh, R) * 4));
           K.mem.push_back(K.pf.mw.inbox);
         }
         K.pf.mw.error = K.mw.error;
@@ -457,7 +457,7 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
         K.pf.pw.rows_max = R;
         K.pf.pw.n_max = H;
         if (nc_ > 1) {
-          K.pf.pw.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(c, k::pair_rows_wire_words(R, H, nc_) * 4));
+          K.pf.pw.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::pair_rows_wire_words(R, H, nc_) * 4));
           K.mem.push_back(K.pf.pw.inbox);
         }
         K.pf.pw.error = K.pw.error;
@@ -1470,7 +1470,7 @@ void Model::dec_owner_init() {
   auto mailboxes = [&](size_t words) {
     k::OwnerMail mail;
     for (int c = 0; c < nc_; ++c) {
-      auto *inbox = static_cast<uint32_t *>(fab_.alloc_mailbox(static_cast<size_t>(c), words * sizeof(uint32_t)));
+      auto *inbox = static_cast<uint32_t *>(fab_.alloc_kernel_mailbox(words * sizeof(uint32_t)));
       cards_[static_cast<size_t>(c)]->mem.push_back(inbox);
       k::owner_mail_init(fab_.compute(c), inbox, words).wait();
       mail.inbox[static_cast<size_t>(c)] = inbox;

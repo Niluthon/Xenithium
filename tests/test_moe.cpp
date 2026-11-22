@@ -708,7 +708,7 @@ void test_cards(xenithium::Fabric &f, const Model &m, const char *tag) {
     d.push_back(make_card(f, c, m, C));
     s[c].cards = C;
     s[c].card = c;
-    d[c].wire.inbox = static_cast<uint32_t *>(f.alloc_mailbox(c, k::moe_wire_words(s[c]) * 4));
+    d[c].wire.inbox = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::moe_wire_words(s[c]) * 4));
     d[c].wire.error = static_cast<uint32_t *>(f.alloc(c, 4096));
   }
   for (int c = 0; c < C; ++c) {
@@ -868,7 +868,7 @@ void test_cards(xenithium::Fabric &f, const Model &m, const char *tag) {
     const size_t sum_words = k::owner_sum_words(m.s.hidden);
     k::OwnerMail mail;
     for (int c = 0; c < C; ++c) {
-      mail.inbox[c] = static_cast<uint32_t *>(f.alloc_mailbox(c, sum_words * 4));
+      mail.inbox[c] = static_cast<uint32_t *>(f.alloc_kernel_mailbox(sum_words * 4));
       k::owner_mail_init(f.compute(c), mail.inbox[c], sum_words).wait();
     }
     const bf16 sentinel = bf16(-777.f);
@@ -944,7 +944,7 @@ void test_cpu(xenithium::Fabric &f, const Model &m0, const char *tag) {
   const k::MoeBlobLayout lay = k::moe_tp_layout(H, m.s.inter, 2, &stride);
   for (int c = 0; c < 2; ++c) {
     s[c].cards = 2, s[c].card = c;
-    d[c].wire.inbox = static_cast<uint32_t *>(f.alloc_mailbox(c, k::moe_wire_words(s[c]) * 4));
+    d[c].wire.inbox = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::moe_wire_words(s[c]) * 4));
     d[c].wire.error = static_cast<uint32_t *>(f.alloc(c, 4096));
     d[c].mem.push_back(d[c].wire.inbox), d[c].mem.push_back(d[c].wire.error);
     // pinned host copies of this card's distinct blobs; every third expert's entry points there
@@ -1205,12 +1205,12 @@ void test_rows_quad(xenithium::Fabric &f, const Model &m0, const char *tag, int 
       mem[c].push_back(p);
       return p;
     };
-    dq.inbox[c] = static_cast<uint32_t *>(f.alloc_mailbox(c, k::moe_wire_words(s[c]) * 4));
+    dq.inbox[c] = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::moe_wire_words(s[c]) * 4));
     mem[c].push_back(dq.inbox[c]);
     k::moe_wire_init(f.compute(c), s[c], dq.inbox[c]).wait();
     d[c].wire.error = static_cast<uint32_t *>(dev(4096));
     f.compute(c).memset(d[c].wire.error, 0, 4).wait();
-    rq.inbox[c] = static_cast<uint32_t *>(f.alloc_mailbox(c, k::moe_rows_wire_words(s[c], M) * 4));
+    rq.inbox[c] = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::moe_rows_wire_words(s[c], M) * 4));
     mem[c].push_back(rq.inbox[c]);
     k::moe_rows_wire_init(f.compute(c), s[c], M, rq.inbox[c]).wait();
     rs[c] = rows_scratch(f, c, s[c], M, m.router_n, mem[c]);
@@ -1314,13 +1314,13 @@ void test_rows(xenithium::Fabric &f, const Model &m0, const char *tag, int M) {
       return p;
     };
     if (C > 1) {
-      d[c].wire.inbox = static_cast<uint32_t *>(f.alloc_mailbox(c, k::moe_wire_words(s[c]) * 4));
+      d[c].wire.inbox = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::moe_wire_words(s[c]) * 4));
       mem[c].push_back(d[c].wire.inbox);
       d[c].wire.error = static_cast<uint32_t *>(dev(4096));
       k::moe_wire_init(f.compute(c), s[c], d[c].wire.inbox).wait();
       f.compute(c).memset(d[c].wire.error, 0, 4).wait();
       rw[c].rows_max = M;
-      rw[c].inbox = static_cast<uint32_t *>(f.alloc_mailbox(c, k::moe_rows_wire_words(s[c], M) * 4));
+      rw[c].inbox = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::moe_rows_wire_words(s[c], M) * 4));
       mem[c].push_back(rw[c].inbox);
       rw[c].error = d[c].wire.error;
       k::moe_rows_wire_init(f.compute(c), s[c], M, rw[c].inbox).wait();

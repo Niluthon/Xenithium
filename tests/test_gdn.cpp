@@ -198,7 +198,7 @@ Card make_card(xenithium::Fabric &f, int c, const Model &m, int cards) {
   d.out = static_cast<bf16 *>(dev(kR * H * 2));
   d.q->memset(d.sc.core, 0, kR * s.val_w() * 2).wait();
   if (cards > 1) {
-    d.wire.inbox = static_cast<uint32_t *>(f.alloc_mailbox(c, k::pair_wire_words(H, cards) * 4));
+    d.wire.inbox = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::pair_wire_words(H, cards) * 4));
     d.mem.push_back(d.wire.inbox);
     d.wire.error = static_cast<uint32_t *>(dev(4096));
     k::pair_wire_init(*d.q, H, d.wire.inbox, cards).wait();
@@ -670,7 +670,7 @@ void test_rows(xenithium::Fabric &f, const Model &m, const char *tag, int M) {
       if (cards > 1) {
         rw[c].rows_max = M;
         rw[c].n_max = H;
-        rw[c].inbox = static_cast<uint32_t *>(f.alloc_mailbox(c, k::pair_rows_wire_words(M, H, cards) * 4));
+        rw[c].inbox = static_cast<uint32_t *>(f.alloc_kernel_mailbox(k::pair_rows_wire_words(M, H, cards) * 4));
         mem[c].push_back(rw[c].inbox);
         rw[c].error = d[c].wire.error;
         k::pair_rows_wire_init(f.compute(c), M, H, rw[c].inbox, cards).wait();

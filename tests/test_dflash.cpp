@@ -410,7 +410,7 @@ void test_topk_cards(const xenithium::l0::Loader &loader, int C) {
   uint64_t *d_k[4];
   float *d_l[4];
   for (int c = 0; c < C; ++c) {
-    w[c].inbox = static_cast<uint32_t *>(fab.alloc_mailbox(c, words * 4));
+    w[c].inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(words * 4));
     w[c].step = static_cast<int32_t *>(fab.alloc(c, 4096));
     w[c].error = static_cast<uint32_t *>(fab.alloc(c, 4096));
     scratch[c] = fab.alloc(c, k::df_topk_scratch_bytes(n));

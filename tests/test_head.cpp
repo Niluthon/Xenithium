@@ -778,7 +778,7 @@ void test_pick_cards(const xenithium::l0::Loader &loader, const int rows, const 
   std::vector<int32_t *> d_t(C);
   std::vector<float *> d_l(C);
   for (int c = 0; c < C; ++c) {
-    w[c].inbox = static_cast<uint32_t *>(fab.alloc_mailbox(c, words * 4));
+    w[c].inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(words * 4));
     w[c].step = static_cast<int32_t *>(fab.alloc(c, 4096));
     w[c].error = static_cast<uint32_t *>(fab.alloc(c, 4096));
     scratch[c] = fab.alloc(c, k::pick_scratch_bytes(n));

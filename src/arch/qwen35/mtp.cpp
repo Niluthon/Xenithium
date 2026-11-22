@@ -114,7 +114,7 @@ Mtp::Mtp(Fabric &fab, const std::string &dir, const Config &cfg, int64_t capacit
       cd.cat = static_cast<bf16 *>(dev(cb));
       q.memset(cd.cat, 0, cb);
     } else {
-      cd.wire.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), k::pair_wire_words(H) * 4));
+      cd.wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::pair_wire_words(H) * 4));
       cd.mem.push_back(cd.wire.inbox);
     }
     cd.wire.error = static_cast<uint32_t *>(dev(64));
@@ -137,7 +137,7 @@ Mtp::Mtp(Fabric &fab, const std::string &dir, const Config &cfg, int64_t capacit
       if (C > 1) {
         cd.fl_wire.rows_max = opt.kv_defer;
         cd.fl_wire.n_max = H;
-        cd.fl_wire.inbox = static_cast<uint32_t *>(fab.alloc_mailbox(static_cast<size_t>(c), k::pair_rows_wire_words(opt.kv_defer, H) * 4));
+        cd.fl_wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(k::pair_rows_wire_words(opt.kv_defer, H) * 4));
         cd.mem.push_back(cd.fl_wire.inbox);
         cd.fl_wire.error = cd.wire.error;
       }

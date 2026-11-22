@@ -49,6 +49,11 @@ class Fabric {
   // device is lost. Mailboxes only: peer residency may mirror the buffer
   // into host RAM (compute-runtime #968), so keep these small.
   void *alloc_mailbox(size_t r, size_t bytes);
+  // Fused kernel mailboxes use pinned host USM. Concurrent kernel reads and
+  // peer stores into device-backed inboxes can return stale or torn sectors
+  // on Battlemage. DMA buffers and separately sequenced flags still use
+  // alloc_mailbox() so their device-resident transport is unchanged.
+  void *alloc_kernel_mailbox(size_t bytes) { return alloc_host(bytes); }
   void release(void *ptr) { ctx_.free(ptr); }
 
   // Driver's answer, not a promise: a peer copy across VMM blocks can still hang
