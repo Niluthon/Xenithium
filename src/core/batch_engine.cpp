@@ -15,6 +15,7 @@ namespace xenithium::core {
 
 namespace {
 using dsec = std::chrono::duration<double>;
+uint64_t g_depth_hist[16] = {};  // diagnostic (XEN_STEPSTAT): steps per a.depth
 constexpr int kTreePathMax = 64;  // a tree row's path tokens (a segment holds <= max_rows rows)
 
 // The leading rows of a draft tree that are a chain: row r's parent is row r - 1 (parents[0] = -1 is the fed token's
@@ -696,6 +697,23 @@ void BatchEngine::spec_step(const std::vector<size_t> &dec_in, std::vector<std::
     while (accepted < a.n && accepted + 1 < rk && a.next[accepted] == t[accepted + 1]) ++accepted;
     return accepted;
   };
+  if (const char *ss = std::getenv("XEN_STEPSTAT")) {  // one line per request: its speculative accounting
+    (void)ss;
+    for (int k = 0; k < N; ++k) {
+      if (dec[static_cast<size_t>(k)] < 0) continue;  // a row with no request
+      Req &r = *active_[dec[static_cast<size_t>(k)]];
+      if (fin[static_cast<size_t>(k)] == Finish::none || r.st_done) continue;
+      r.st_done = true;
+      std::fprintf(stderr, "STEPSTAT prompt_len %zu steps %llu draft %llu acc %llu lk %llu df_yield %.2f lk_yield %.2f\n",
+                   r.prompt_len, static_cast<unsigned long long>(r.st_steps), static_cast<unsigned long long>(r.st_draft),
+                   static_cast<unsigned long long>(r.st_acc), static_cast<unsigned long long>(r.st_lk), static_cast<double>(r.df_yield),
+                   static_cast<double>(r.lk_yield));
+      std::fprintf(stderr, "DEPTHHIST");
+      for (int d = 0; d < 16; ++d) std::fprintf(stderr, " d%d=%llu", d, static_cast<unsigned long long>(g_depth_hist[d]));
+      std::fprintf(stderr, "  src_draft_depth(1)=%d src_draft_depth(2)=%d src_layout_depth(1)=%d wide_depth=%d wide_from=%d\n",
+                   m_.draft_depth(1), m_.draft_depth(2), m_.layout_depth(1), m_.wide_depth(), m_.wide_from());
+    }
+  }
   std::vector<size_t> going_i;
   for (int k = 0; k < N; ++k)
     if (fin[static_cast<size_t>(k)] == Finish::none) going_i.push_back(dec[static_cast<size_t>(k)]);
@@ -711,6 +729,17 @@ void BatchEngine::spec_step(const std::vector<size_t> &dec_in, std::vector<std::
     const int accepted = confirmed(k);
     if (!active_[dec[static_cast<size_t>(k)]]->lk_used) wide_acc = std::min(accepted, rk - 1);
     Req &r = *active_[dec[static_cast<size_t>(k)]];
+    static uint64_t d0_zero = 0, d0_nonzero = 0;
+    if (r.drafts.empty() || r.drafts[0] == 0) ++d0_zero; else ++d0_nonzero;
+    if (std::getenv("XEN_STEPSTAT") && r.st_steps % 50 == 0) std::fprintf(stderr, "STEPD0 zero %llu nonzero %llu\n",
+                                                                          static_cast<unsigned long long>(d0_zero), static_cast<unsigned long long>(d0_nonzero));
+    if (std::getenv("XEN_STEPSTAT") && r.st_steps % 50 == 0) {
+      std::fprintf(stderr, "STEPACC slot %d rk %d drafts %zu acc %d d0 %d d1 %d next0 %d next1 %d\n", r.slot, rk,
+                   r.drafts.size(), accepted, r.drafts.empty() ? -1 : r.drafts[0],
+                   r.drafts.size() < 2 ? -1 : r.drafts[1], a.n > 0 ? a.next[0] : -1, a.n > 1 ? a.next[1] : -1);
+    }
+    r.st_steps += 1, r.st_draft += static_cast<uint64_t>(rk - 1), r.st_acc += static_cast<uint64_t>(accepted);
+    r.st_lk += r.lk_used ? 1u : 0u;
     if (r.lk_used) continue;  // the lookup's drafts: the drafter's acceptance is not observed
     depth_observe(r, rk - 1, std::min(accepted, rk - 1));
     if (cfg_.lookup > 0) r.df_yield += (static_cast<float>(std::min(accepted, rk - 1) + 1) - r.df_yield) * kLkAlpha;
@@ -749,13 +778,17 @@ void BatchEngine::spec_step(const std::vector<size_t> &dec_in, std::vector<std::
       if (fin[static_cast<size_t>(k)] != Finish::none) continue;
       lk_score(r);
       if (lk_depth > 0) lk_props[static_cast<size_t>(k)] = lk_propose(r, lk_depth);
-      lk_step = lk_step && !lk_props[static_cast<size_t>(k)].empty() && r.lk_yield > r.df_yield;
+      // a trial at every 5th drafting step of the request: without it equal priors would never break the tie
+      static const bool lk_trial_on = [] { const char *e = std::getenv("XEN_LK_TRIAL"); return e && *e == '1'; }();
+      const bool lk_trial = cfg_.lookup > 0 && lk_trial_on && (r.st_steps % 5) == 0;
+      lk_step = lk_step && !lk_props[static_cast<size_t>(k)].empty() && (r.lk_yield > r.df_yield || lk_trial);
     }
   size_t gi = 0;  // the going requests in order (req_depth)
   for (int k = 0; k < N; ++k) {
     auto &a = acc[static_cast<size_t>(k)];
     const bool goes = fin[static_cast<size_t>(k)] == Finish::none;
     a.depth = goes && !lk_step ? (uneq ? req_depth[gi] : depth) : 0;
+    if (a.depth >= 0 && a.depth < 16) ++g_depth_hist[a.depth];
     gi += goes;
     gen_add += static_cast<uint64_t>(a.n);
     const int rk = rv[static_cast<size_t>(k)];

@@ -452,8 +452,16 @@ class BatchEngine final : public Engine {
     std::unordered_map<uint64_t, int32_t> lk_idx;
     size_t lk_indexed = 0;  // windows ending before this position are in lk_idx
     std::deque<std::pair<size_t, std::vector<int32_t>>> lk_pend;
+    // Both start at the same prior: the lookup could never outbid a 1.0 against 4.0 until the drafter had already
+    // collapsed to 1.0, so it only ever ran on kinds the drafter had given up on (measured: 0 lookup steps on math and
+    // code, 1 on json, 10 on prose). Equal priors plus the trial in pick_lookup let the two be compared.
     float lk_yield = 1.f, df_yield = 4.f;
     bool lk_used = false;
+    // XEN_STEPSTAT: this request's speculative accounting (steps, drafts offered, drafts accepted, steps the lookup
+    // drafted instead of the drafter), printed once when it finishes -- one line per request, so a bench that sends a
+    // kind per request gets the numbers per kind.
+    uint64_t st_steps = 0, st_draft = 0, st_acc = 0, st_lk = 0;
+    bool st_done = false;
     bool lay_draft = false;  // drafting in pick_layout's last layout (kept unless another leads by kLayStick)
     bool lay_deep = false;  // in pick_deep's deeper class (kept likewise)
   };
