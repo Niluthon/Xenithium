@@ -338,8 +338,6 @@ int cmd_wiremin(int argc, char **argv) {
     if (sendonly) {
       // the store half only: rank 0 stores its partial into rank 1's slot; the host verifies rank 1's slot afterwards
       const int cols = k::pair_cols(rows, n, b16 != 0);
-      if (inboxfill) {  // an inbox that is not empty: every word must be replaced by the store
-      } else;  // the 0xFF fill is the wire's own state
       send_only(f.compute(0), part[0], inbox[1], rows, n, cols);
       f.compute(0).wait();
       std::vector<uint32_t> got(elems);
