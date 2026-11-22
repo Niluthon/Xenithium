@@ -1,6 +1,8 @@
 #include "xenithium/arch/qwen38/head.hpp"
+#include "xenithium/util/env.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -23,6 +25,7 @@ Head::Head(Fabric &fab, const load::DenseStore &dense, const Config &cfg) : fab_
   lora_ld_ = std::max(R, (R + hc_.streams + 15) / 16 * 16);  // room for a layer mixer's down|inject output
   cards_.resize(static_cast<size_t>(C));
   ev_.resize(static_cast<size_t>(C));
+  host_pick_ = C > 1 && (util::env_flag("XEN_Q38_HOST_PICK") || (C == 4 && util::env_flag("XEN_Q38_COPY_WIRE")));
   for (int c = 0; c < C; ++c) {
     auto get = [&](const std::string &n) -> const load::DeviceTensor & { return dense.at(c, n); };
     embed_.push_back(reinterpret_cast<const bf16 *>(get(kP + "embed_tokens.weight").ptr));
@@ -47,6 +50,7 @@ Head::Head(Fabric &fab, const load::DenseStore &dense, const Config &cfg) : fab_
     k.logits = static_cast<float *>(dev(static_cast<size_t>(kRows) * vpc_ * 4));
     k.tokens = static_cast<int32_t *>(dev(kernels::kPickMaxRows * 4));
     k.scratch = dev(kernels::pick_scratch_bytes(vpc_));
+    if (host_pick_) k.local_keys = static_cast<uint64_t *>(fab.alloc_host(kernels::kPickMaxRows * sizeof(uint64_t)));
     if (C > 1) {
       k.wire.inbox = static_cast<uint32_t *>(fab.alloc_kernel_mailbox(4096));
       k.wire.step = static_cast<int32_t *>(dev(4));
@@ -84,7 +88,7 @@ Head::~Head() {
   for (size_t c = 0; c < cards_.size(); ++c) fab_.compute(c).wait();
   for (Card &k : cards_)
     for (void *p : {(void *)k.st.res[0], (void *)k.st.res[1], (void *)k.st.lora[0], (void *)k.st.lora[1], (void *)k.xn, (void *)k.s, (void *)k.gate, (void *)k.out, (void *)k.logits,
-                    (void *)k.tokens, k.scratch, (void *)k.wire.inbox, (void *)k.wire.step, (void *)k.wire.error})
+                    (void *)k.tokens, (void *)k.local_keys, k.scratch, (void *)k.wire.inbox, (void *)k.wire.step, (void *)k.wire.error})
       if (p) fab_.release(p);
   if (ids_host_) fab_.release(ids_host_);
 }
@@ -131,7 +135,8 @@ void Head::lm_pick(int rows) {
   for (size_t c = 0; c < C; ++c) ev_[c].lm = kernels::dense_gemm(fab_.compute(c), rows, cards_[c].out, lm_[c], cards_[c].logits);
   for (size_t c = 0; c < C; ++c)
     ev_[c].pick = kernels::greedy_pick(fab_.compute(c), cards_[c].logits, vpc_, rows, vpc_, static_cast<int>(c) * vpc_, cards_[c].scratch,
-                                       C > 1 ? &cards_[c].wire : nullptr, cards_[c].tokens, &ev_[c].chunks);
+                                       C > 1 && !host_pick_ ? &cards_[c].wire : nullptr, cards_[c].tokens, &ev_[c].chunks,
+                                       cards_[c].local_keys);
 }
 
 void Head::lm_pick(int rows, const std::vector<const bf16 *> &in, const std::vector<int32_t *> &tokens, const std::vector<float *> &logits,
@@ -151,7 +156,32 @@ void Head::wait() {
 
 std::vector<int32_t> Head::tokens(int card, int rows) {
   std::vector<int32_t> t(static_cast<size_t>(rows));
-  fab_.compute(static_cast<size_t>(card)).memcpy(t.data(), cards_[static_cast<size_t>(card)].tokens, t.size() * 4).wait();
+  if (host_pick_) {
+    std::vector<uint64_t> best(static_cast<size_t>(rows));
+    wait();
+    for (const auto &entry : cards_)
+      for (size_t r = 0; r < best.size(); ++r) best[r] = std::max(best[r], entry.local_keys[r]);
+    for (size_t r = 0; r < best.size(); ++r) t[r] = static_cast<int32_t>(0xFFFFFFFEu - static_cast<uint32_t>(best[r]));
+    return t;
+  }
+  fab_.compute(static_cast<size_t>(card)).memcpy(t.data(), cards_[static_cast<size_t>(card)].tokens, t.size() * sizeof(int32_t)).wait_and_throw();
+  const int vocab = static_cast<int>(cards_.size()) * vpc_;
+  std::vector<float> logits;
+  for (int r = 0; r < rows; ++r) {
+    int32_t &token = t[static_cast<size_t>(r)];
+    if (token >= 0 && token < vocab) continue;
+    std::fprintf(stderr, "qwen38 head: invalid device pick %d (row %d of %d, card %d); rescoring logits\n", token, r, rows, card);
+    logits.resize(static_cast<size_t>(vpc_));
+    uint64_t best = 0;
+    for (size_t c = 0; c < cards_.size(); ++c) {
+      const float *row = cards_[c].logits + static_cast<size_t>(r) * vpc_;
+      fab_.compute(c).memcpy(logits.data(), row, logits.size() * sizeof(float)).wait_and_throw();
+      const int base = static_cast<int>(c) * vpc_;
+      for (int j = 0; j < vpc_; ++j)
+        best = std::max(best, kernels::pick_key(logits[static_cast<size_t>(j)], base + j));
+    }
+    token = static_cast<int32_t>(0xFFFFFFFEu - static_cast<uint32_t>(best));
+  }
   return t;
 }
 

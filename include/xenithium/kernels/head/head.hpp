@@ -62,7 +62,7 @@ inline constexpr size_t kPickWireWords4 = 2 * kPickWireWords;  // four cards: a 
 // logits fp32 [rows][ld]; tokens int32 [rows] (global indices). wire null = one card.
 // Returns the merge launch; chunks_event (optional) receives the first launch's event.
 sycl::event greedy_pick(sycl::queue &q, const float *logits, int ld, int rows, int n, int col_base, void *scratch, const PickWire *wire,
-                        int32_t *tokens, sycl::event *chunks_event = nullptr);
+                        int32_t *tokens, sycl::event *chunks_event = nullptr, uint64_t *local_keys = nullptr);
 
 // Coupled drafting for sampled requests. A slot's record: the Gumbel key, the output position its first
 // draft predicts, 1 / T (0 = the slot keeps its argmax draft). util/gumbel.hpp is the shared noise.

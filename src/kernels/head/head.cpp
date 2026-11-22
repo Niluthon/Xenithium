@@ -40,7 +40,7 @@ class PickMerge;
 // not coherent with peer writes (a cached load can return a stale key), so every mailbox access
 // is an uncached L1/L3 load or store, with a fence inside the spin so the load is not hoisted.
 template <bool WIRE>
-sycl::event merge(sycl::queue &q, const uint64_t *keys, int rows, int chunks, PickWire w, int32_t *tokens) {
+sycl::event merge(sycl::queue &q, const uint64_t *keys, int rows, int chunks, PickWire w, int32_t *tokens, uint64_t *local_keys) {
   namespace esimd = sycl::ext::intel::esimd;
   return q.parallel_for<PickMerge<WIRE>>(sycl::nd_range<1>(kPickMaxRows, kPickMaxRows), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
     const int r = static_cast<int>(it.get_local_id(0));
@@ -55,6 +55,7 @@ sycl::event merge(sycl::queue &q, const uint64_t *keys, int rows, int chunks, Pi
 #pragma unroll
         for (int i = 0; i < 8; ++i) best = v[i] > best ? v[i] : best;
       }
+      if (local_keys) local_keys[r] = best;
       if constexpr (WIRE) {
         constexpr auto uc = esimd::properties{esimd::cache_hint_L1<esimd::cache_hint::uncached>,
                                               esimd::cache_hint_L2<esimd::cache_hint::uncached>, esimd::alignment<8>};
@@ -123,7 +124,7 @@ int pick_chunks(int n) { return (n + kPickChunk - 1) / kPickChunk; }
 size_t pick_scratch_bytes(int n) { return static_cast<size_t>(kPickMaxRows) * pick_chunks(n) * sizeof(uint64_t); }
 
 sycl::event greedy_pick(sycl::queue &q, const float *logits, int ld, int rows, int n, int col_base, void *scratch, const PickWire *wire,
-                        int32_t *tokens, sycl::event *chunks_event) {
+                        int32_t *tokens, sycl::event *chunks_event, uint64_t *local_keys) {
   if (rows < 1 || rows > kPickMaxRows || n < 1 || ld < n) throw std::invalid_argument("greedy_pick: shape");
   const int chunks = pick_chunks(n);
   auto *keys = static_cast<uint64_t *>(scratch);
@@ -139,7 +140,7 @@ sycl::event greedy_pick(sycl::queue &q, const float *logits, int ld, int rows, i
     if (lid == 0) keys[static_cast<size_t>(r) * chunks + ch] = best;
   });
   if (chunks_event) *chunks_event = ce;
-  return wire ? merge<true>(q, keys, rows, chunks, *wire, tokens) : merge<false>(q, keys, rows, chunks, PickWire{}, tokens);
+  return wire ? merge<true>(q, keys, rows, chunks, *wire, tokens, local_keys) : merge<false>(q, keys, rows, chunks, PickWire{}, tokens, local_keys);
 }
 
 uint64_t pick_key(float logit, int64_t global_index) { return make_key(logit, static_cast<uint32_t>(global_index)); }

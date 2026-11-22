@@ -34,6 +34,7 @@ class Head {
     bf16 *out = nullptr;     // [kRows][hidden]
     float *logits = nullptr; // [kRows][vocab / cards]
     int32_t *tokens = nullptr;
+    uint64_t *local_keys = nullptr;
     void *scratch = nullptr;
     kernels::PickWire wire;
   };
@@ -93,6 +94,7 @@ class Head {
   kernels::HcShape hc_;
   int vpc_ = 0, lora_ld_ = 0;
   std::vector<Card> cards_;
+  bool host_pick_ = false;
   int32_t *ids_host_ = nullptr;  // the next embed's token ids, pinned host [kPickMaxRows]
   std::vector<Events> ev_;
   // weights per card
