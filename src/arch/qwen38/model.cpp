@@ -1340,6 +1340,8 @@ void Model::verify_batch(const std::vector<SeqRows> &segs) {
     const auto &g = segs[static_cast<size_t>(i)];
     int64_t toks[Head::kRows];
     for (int r = 0; r < g.rows; ++r) {
+      if (g.tokens[r] < 0 || g.tokens[r] >= cfg_.vocab)
+        throw std::runtime_error("qwen38 model: invalid verify token " + std::to_string(g.tokens[r]) + " at row " + std::to_string(r0 + r));
       toks[r] = g.tokens[r];
       tokens[r0 + r] = g.tokens[r];
     }

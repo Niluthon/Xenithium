@@ -171,8 +171,23 @@ std::vector<std::vector<int32_t>> StepModelAdapter::accept_dflash(const std::vec
   for (int k = 0; k < vsegs_; ++k) {
     const auto &x = a[static_cast<size_t>(k)];
     keep.push_back(x.n);
-    anchor.push_back(x.next[x.n - 1]);
-    depth.push_back(std::clamp(x.depth, 0, seg_rows_max() - 1));  // each segment's own (unequal segments)
+    const int32_t anc = x.next[x.n - 1];
+    anchor.push_back(anc);
+    // A sentinel token (any id below 0: no sampled token this row) must never reach the drafter: its block row 0 embeds
+    // the anchor, and an out-of-range id faults the GPU (CAT error -> DEVICE_LOST). Such a segment drafts nothing; the
+    // pass stays a context-only pass and the request keeps decoding.
+    const bool bad_anchor = anc < 0;
+    static int bad_anchor_logged = 0;
+    if (bad_anchor && bad_anchor_logged < 8) {
+      ++bad_anchor_logged;
+      std::fprintf(stderr, "qwen38 adapter: sentinel anchor %d (n %d, depth %d): no drafts for this segment\n", anc, x.n, x.depth);
+    }
+    if (const char *d = std::getenv("XEN_PASSDUMP"); d && *d == '1') {
+      std::fprintf(stderr, "ACCEPTGEO seg %d n %d depth %d anchor %d next", k, x.n, x.depth, x.next[x.n - 1]);
+      for (int r = 0; r < x.n && r < 8; ++r) std::fprintf(stderr, " %d", x.next[r]);
+      std::fprintf(stderr, "\n");
+    }
+    depth.push_back(bad_anchor ? 0 : std::clamp(x.depth, 0, seg_rows_max() - 1));  // each segment's own (unequal segments)
   }
   // the walked rows of the tree segments (SpecAccept::path)
   std::vector<const int *> paths;

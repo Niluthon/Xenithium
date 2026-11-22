@@ -112,6 +112,11 @@ void Model::prefill_abort() {
 std::vector<int32_t> Model::draft_after_prefill(int32_t first, int depth, int seqs) {
   if (!dflash_ && !mtp_) throw std::logic_error("qwen38 model: no drafter loaded (ModelOptions::mtp_dir / dflash_dir)");
   const bool mtp_drafting = mtp_drafts(seqs);
+  // A block drafter drafts at most block - 1 tokens per pass (DFlash 2: block 8 -> 7). The caller's cap is the step's
+  // rows (XEN_SEG_ROWS - 1, 15 at the 16-row default), which is a DSpine b16 setting: asking a block-8 drafter for 15
+  // drafts overruns its block layout, and an 8K prompt then resets the engine (CCS job timeouts + a CAT error, all four
+  // cards, "UR_RESULT_ERROR_DEVICE_LOST"). Clamp to whichever is smaller.
+  if (dflash_ && !mtp_drafting) depth = std::min(depth, dflash_->max_depth());
   if (mtp_) {
     Mtp &M = *mtp_;
     if (M.last_rows < 1) throw std::logic_error("qwen38 model: draft_after_prefill without a drafted prefill");

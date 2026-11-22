@@ -672,6 +672,22 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
     for (size_t c = 0; c < C; ++c) fab_.compute(c).wait();
     t_mark = std::chrono::steady_clock::now();
   }
+  // Keep invalid token IDs out of the embedding gather. The verifier logs the source rows separately.
+  {
+    static unsigned long bad_ids = 0;
+    unsigned bad_here = 0;
+    for (int r = 0; r < ns * block_rows; ++r) {
+      if (ids[r] < 0 || static_cast<int64_t>(ids[r]) >= tgt_.vocab) {
+        if (std::getenv("XEN_DF_STAGE")) ++bad_here;
+        ids[r] = static_cast<int32_t>(cfg_.mask_id);
+      }
+    }
+    if (bad_here) {
+      bad_ids += bad_here;
+      std::fprintf(stderr, "qwen38 adapter: %u block ids outside [0, %lld) mapped to mask_id %lld (total %lu)\n",
+                   bad_here, static_cast<long long>(tgt_.vocab), static_cast<long long>(cfg_.mask_id), bad_ids);
+    }
+  }
   const bool watch_input = rb > 0 && std::getenv("XEN_DF_STAGE");
   for (size_t c = 0; c < C; ++c) {
     Card &cd = cards_[c];
