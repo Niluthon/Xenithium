@@ -652,8 +652,28 @@ const char *const *DFlash::stage_names() {
 
 // Every GPU operation of a pass (pass() fills the pinned words first). Recorded into graphs, or run directly with
 // DFlashOptions::profile (each stage waited and timed).
+namespace {
+// The confidence cut a context pass (or a pass with nothing to trim) uses: the shipped default.
+constexpr float kConfCutDefault = 0.02f;
+}  // namespace
+
 void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree) {
   const int H = cfg_.hidden, rc = ns * ctx_rows, rb = ns * block_rows;
+  if (const char *e = std::getenv("XEN_DRAFT_TRACE"); e && *e == '1')
+    std::fprintf(stderr, "dflash submit: ns %d ctx_rows %d block_rows %d ctx_row0 %d tree %d -> cut %.4g%s\n", ns, ctx_rows, block_rows, ctx_row0, tree,
+                 static_cast<double>(ctx_rows > 0 ? kConfCutDefault : opt_.conf_cut), ctx_rows > 0 ? " (context: default)" : " (verify: configured)");
+  // The block pass's layout limits (DFlash 2: block 8, a verify segment's rows <= 16). `pass` refuses the first two, so
+  // a fault under a deep check shows up as a CCS timeout with no numbers; print them once instead.
+  if (block_rows > cfg_.block || rb > ns * k::kStepRows16 || ctx_rows > k::kStepRows16) {
+    static bool said = false;
+    if (!said) {
+      said = true;
+      std::fprintf(stderr,
+                   "dflash: block pass over its layout: ns %d, block_rows %d, ctx_rows %d, ctx_row0 %d, cfg_.block %d, "
+                   "kStepRows16 %d, rb %d\n",
+                   ns, block_rows, ctx_rows, ctx_row0, cfg_.block, k::kStepRows16, rb);
+    }
+  }
   const size_t C = cards_.size();
   const float eps = static_cast<float>(cfg_.eps);
   auto wire_of = [&](Card &cd) -> const k::PairWire * { return C > 1 ? &cd.wire : nullptr; };  // TP1: no two-card sum
@@ -1046,7 +1066,18 @@ std::vector<std::vector<int32_t>> DFlash::pass(const std::vector<Seg> &segs, int
       auto &o = out[static_cast<size_t>(i)];
       o.assign(host_ + kDraftOff + i * (block_rows - 1), host_ + kDraftOff + (i + 1) * (block_rows - 1));
       // one sequence only: a step of several shares its rows (the shortest segment sets them for all)
-      if (opt_.conf_cut > 0 && ns == 1) o.resize(static_cast<size_t>(confident(o, i * block_rows)));
+      const double cut = ctx_rows > 0 ? kConfCutDefault : opt_.conf_cut;  // a context pass keeps the default cut
+      const auto invalid = std::find_if(o.begin(), o.end(), [&](int32_t token) { return token < 0 || token >= tgt_.vocab; });
+      if (invalid != o.end()) {
+        std::fprintf(stderr, "dflash: out-of-vocabulary draft %d at index %td; discarding the suffix\n", *invalid, invalid - o.begin());
+        o.erase(invalid, o.end());
+      }
+      const size_t pre = o.size();
+      if (cut > 0 && ns == 1) o.resize(static_cast<size_t>(confident(o, i * block_rows, static_cast<float>(cut))));
+      if (const char *d = std::getenv("XEN_CHAIN_TRACE"); d && *d == '1')
+        std::fprintf(stderr, "CHAIN slot %d requested_drafts %zu block_rows %d returned %zu cut %.3f first_id %d ctx_rows %d ids %d %d %d\n",
+                     segs[static_cast<size_t>(i)].slot, pre, block_rows, o.size(), cut, pre > 0 ? o[0] : -999, ctx_rows,
+                     pre > 0 ? o[0] : -999, pre > 1 ? o[1] : -999, pre > 2 ? o[2] : -999);
     }
   ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   return out;
@@ -1103,8 +1134,9 @@ void DFlash::set_noise(int slot, uint64_t key, uint64_t pos, float inv_t) {
 
 // How many of a segment's drafts to keep: the chain of their confidences (each draft's softmax probability among its
 // block row's top-16 logits; draft j comes from block row j + 1) stays >= conf_cut.
-int DFlash::confident(const std::vector<int32_t> &drafts, int row0) const {
+int DFlash::confident(const std::vector<int32_t> &drafts, int row0, float cut) const {
   const auto *keys = reinterpret_cast<const uint64_t *>(host_ + kKeysOff);
+  const bool trace = std::getenv("XEN_CONF_TRACE") != nullptr;  // diagnostic: which draft fails to match a key row
   double p = 1;
   for (size_t j = 0; j < drafts.size(); ++j) {
     const uint64_t *kr = keys + (static_cast<size_t>(row0) + j + 1) * k::kDfTopK;
@@ -1117,8 +1149,35 @@ int DFlash::confident(const std::vector<int32_t> &drafts, int row0) const {
       if (sub_k_ > 0 && t >= sub_k_) t = t - sub_k_ + sub_s0_;
       if (t == drafts[j]) sel = v;
     }
-    p *= sel > -1e29 ? std::exp(sel - mx) / se : 0.0;
-    if (p < opt_.conf_cut) return static_cast<int>(j);
+    const double pr = sel > -1e29 ? std::exp(sel - mx) / se : 0.0;
+    if (j == 0) {
+      if (const char *d = std::getenv("XEN_CHAIN_TRACE"); d && *d == '1') {
+        int64_t braw = -1, brem = -1, r0 = -1, r1 = -1, r2 = -1;
+        double bv = -1e30;
+        for (int b = 0; b < k::kDfTopK; ++b) {
+          const double v = k::df_key_value(kr[b]);
+          int64_t t = k::df_key_index(kr[b]);
+          const int64_t tr = (sub_k_ > 0 && t >= sub_k_) ? t - sub_k_ + sub_s0_ : t;
+          if (b == 0) r0 = t;
+          if (b == 1) r1 = t;
+          if (b == 2) r2 = t;
+          if (v > bv) bv = v, braw = t, brem = tr;
+        }
+        std::fprintf(stderr,
+                     "CHAINID row0 %d draft %d argmax_raw %lld argmax_remap %lld key0..2 %lld %lld %lld sub_k %d sub_s0 %d matched %d\n",
+                     row0, drafts[j], static_cast<long long>(braw), static_cast<long long>(brem), static_cast<long long>(r0),
+                     static_cast<long long>(r1), static_cast<long long>(r2), sub_k_, sub_s0_, sel > -1e29 ? 1 : 0);
+      }
+    }
+    p *= pr;
+    if (trace)
+      std::fprintf(stderr, "conf j=%zu draft=%d matched=%d prob=%.3e p=%.3e cut=%.3g\n", j, drafts[j],
+                   sel > -1e29 ? 1 : 0, pr, p, static_cast<double>(cut));
+    // A draft that does not appear in its block row's top-16 has an unknown, not zero, probability: stopping the
+    // chain there is right, but returning 0 throws away the guesses already accepted and degenerates the step to
+    // plain decode (1 tok/step). Keep at least the first guess, which is what a cut of 0.02 buys on the reference
+    // rig (2.25 tok/step on prose).
+    if (p < cut) return std::max(1, static_cast<int>(j));
   }
   return static_cast<int>(drafts.size());
 }

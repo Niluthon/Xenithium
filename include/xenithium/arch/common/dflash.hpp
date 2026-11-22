@@ -279,7 +279,7 @@ class DFlash {
   int fl_par_ = 0, flushes_ = 0;
   void defer(const std::vector<Seg> &segs, int ctx_rows, int ctx_row0);
   void flush(int slot, int m);
-  int confident(const std::vector<int32_t> &drafts, int row0) const;
+  int confident(const std::vector<int32_t> &drafts, int row0, float cut) const;
   Fabric &fab_;
   std::string dir_;
   DFlashConfig cfg_;
