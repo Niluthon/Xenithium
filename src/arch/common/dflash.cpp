@@ -658,6 +658,7 @@ constexpr float kConfCutDefault = 0.02f;
 }  // namespace
 
 void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree) {
+  static const bool stage_trace = std::getenv("XEN_DF_STAGE") != nullptr;
   const int H = cfg_.hidden, rc = ns * ctx_rows, rb = ns * block_rows;
   if (const char *e = std::getenv("XEN_DRAFT_TRACE"); e && *e == '1')
     std::fprintf(stderr, "dflash submit: ns %d ctx_rows %d block_rows %d ctx_row0 %d tree %d -> cut %.4g%s\n", ns, ctx_rows, block_rows, ctx_row0, tree,
@@ -698,7 +699,7 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
     unsigned bad_here = 0;
     for (int r = 0; r < ns * block_rows; ++r) {
       if (ids[r] < 0 || static_cast<int64_t>(ids[r]) >= tgt_.vocab) {
-        if (std::getenv("XEN_DF_STAGE")) ++bad_here;
+        if (stage_trace) ++bad_here;
         ids[r] = static_cast<int32_t>(cfg_.mask_id);
       }
     }
@@ -708,7 +709,7 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
                    bad_here, static_cast<long long>(tgt_.vocab), static_cast<long long>(cfg_.mask_id), bad_ids);
     }
   }
-  const bool watch_input = rb > 0 && std::getenv("XEN_DF_STAGE");
+  const bool watch_input = rb > 0 && stage_trace;
   for (size_t c = 0; c < C; ++c) {
     Card &cd = cards_[c];
     auto &q = fab_.compute(c);
@@ -799,7 +800,7 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
       k::dense_gemm(q, rb, cd.xn, ly.aproj, cd.dyn);
       k::df_conv(q, rb, block_rows, H, cfg_.conv_group, cd.xn, cd.dyn, pn, 0, ly.abase, cd.xc);
     });
-    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+    if (stage_trace && rb > 0 && l == 0) {
       for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].xn, cards_[wc].nanw, 1u << 1);
       for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].xc, cards_[wc].nanw, 1u << 3);
     }
@@ -809,14 +810,14 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
     });
     each(4, [&](Card &cd, const Layer &ly, sycl::queue &q) {
       k::df_prep(q, rb, block_rows, cd.rec, hq_, hkv_, cd.yq, cd.ykv_b, ly.qn, ly.kn, eps, k::DfRope{cd.cos, cd.sin, rope.positions}, cd.qb, cd.kb, cd.vb, ly.ring);
-      if (std::getenv("XEN_DF_STAGE") && l == 0) {
+      if (stage_trace && l == 0) {
         k::df_nanwatch(q, rb * hq_ * k::kDfDim, cd.qb, cd.nanw, 1u << 10);
         k::df_nanwatch(q, rb * hkv_ * k::kDfDim, cd.kb, cd.nanw, 1u << 11);
         k::df_nanwatch(q, rb * hkv_ * k::kDfDim, cd.vb, cd.nanw, 1u << 12);
       }
       k::df_attn(q, rb, block_rows, cd.rec, hq_, hkv_, cd.qb, cd.kb, cd.vb, ly.ring, cfg_.window, cd.apart, cd.attn);
     });
-    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+    if (stage_trace && rb > 0 && l == 0) {
       for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * hq_ * k::kDfDim, cards_[wc].attn, cards_[wc].nanw, 1u << 4);
     }
     each(5, [&](Card &cd, const Layer &ly, sycl::queue &q) {
@@ -824,7 +825,7 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
       k::pair_reduce(q, rb, H, cd.part, wire_of(cd), pa, cd.mix);
       k::df_conv(q, rb, block_rows, H, cfg_.conv_group, cd.mix, cd.dyn, pn, 1, ly.abase + 2 * H, cd.xc);
     });
-    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+    if (stage_trace && rb > 0 && l == 0) {
       for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].mix, cards_[wc].nanw, 1u << 5);
     }
     // MLP sublayer
@@ -833,13 +834,13 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
       k::dense_gemm(q, rb, cd.xn, ly.mproj, cd.dyn);
       k::df_conv(q, rb, block_rows, H, cfg_.conv_group, cd.xn, cd.dyn, pn, 0, ly.mbase, cd.xc);
     });
-    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+    if (stage_trace && rb > 0 && l == 0) {
       for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].xn, cards_[wc].nanw, 1u << 6);
     }
     each(7, [&](Card &cd, const Layer &ly, sycl::queue &q) {
       gate_up(q, rb, cd.xc, ly, cd);
     });
-    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+    if (stage_trace && rb > 0 && l == 0) {
       for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].h, cards_[wc].nanw, 1u << 7);
     }
     each(8, [&](Card &cd, const Layer &ly, sycl::queue &q) {
@@ -847,7 +848,7 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
       k::pair_reduce(q, rb, H, cd.part, wire_of(cd), pm, cd.mix);
       k::df_conv(q, rb, block_rows, H, cfg_.conv_group, cd.mix, cd.dyn, pn, 1, ly.mbase + 2 * H, cd.mlp);
     });
-    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+    if (stage_trace && rb > 0 && l == 0) {
       for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].mlp, cards_[wc].nanw, 1u << 8);
     }
   }
@@ -904,6 +905,7 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
 }
 
 std::vector<std::vector<int32_t>> DFlash::pass(const std::vector<Seg> &segs, int ctx_rows, int block_rows, int ctx_row0, int step_seqs) {
+  static const bool stage_trace = std::getenv("XEN_DF_STAGE") != nullptr;
   if (const char *e = std::getenv("XEN_DRAFT_TRACE"); e && *e == '1')
     std::fprintf(stderr, "dflash pass: segs %zu ctx_rows %d block_rows %d ctx_row0 %d step_seqs %d\n", segs.size(), ctx_rows, block_rows, ctx_row0,
                  step_seqs);
@@ -1031,7 +1033,7 @@ std::vector<std::vector<int32_t>> DFlash::pass(const std::vector<Seg> &segs, int
         size_t hz = 0, hnan = 0;
         for (float v : hpp) { if (v == 0.f) ++hz; if (!(v == v)) ++hnan; }
         {
-          if (std::getenv("XEN_DF_STAGE") && !tgt_.gather) {
+          if (stage_trace && !tgt_.gather) {
             for (const int32_t token : {ids[0], ids[1]}) {
               const auto *row = tgt_.embed[0] + static_cast<size_t>(token) * cfg_.hidden;
               int nonfinite = 0;
@@ -1043,7 +1045,7 @@ std::vector<std::vector<int32_t>> DFlash::pass(const std::vector<Seg> &segs, int
                            token, nonfinite, bits[0], bits[1], bits[2], bits[3]);
             }
           }
-          if (std::getenv("XEN_DF_STAGE")) {
+          if (stage_trace) {
             const Seg &seg = segs.front();
             const size_t width = static_cast<size_t>(hkv_) * k::kDfDim;
             for (size_t c = 0; c < C; ++c) {

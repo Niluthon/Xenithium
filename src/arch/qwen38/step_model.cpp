@@ -182,7 +182,11 @@ std::vector<std::vector<int32_t>> StepModelAdapter::accept_dflash(const std::vec
       ++bad_anchor_logged;
       std::fprintf(stderr, "qwen38 adapter: sentinel anchor %d (n %d, depth %d): no drafts for this segment\n", anc, x.n, x.depth);
     }
-    if (const char *d = std::getenv("XEN_PASSDUMP"); d && *d == '1') {
+    static const bool pass_dump = [] {
+      const char *setting = std::getenv("XEN_PASSDUMP");
+      return setting && *setting == '1';
+    }();
+    if (pass_dump) {
       std::fprintf(stderr, "ACCEPTGEO seg %d n %d depth %d anchor %d next", k, x.n, x.depth, x.next[x.n - 1]);
       for (int r = 0; r < x.n && r < 8; ++r) std::fprintf(stderr, " %d", x.next[r]);
       std::fprintf(stderr, "\n");
