@@ -192,9 +192,11 @@ class DFlash {
     bf16 *t = nullptr, *tn = nullptr;
     float *part = nullptr, *ykv = nullptr;
     const kernels::PairRowsWire *wire = nullptr;
+    const kernels::PairSplit *split = nullptr;
+    sycl::queue *split_side = nullptr;
   };
   // row0: the m rows start at prefill_features row row0 (a chunk's context in two parts).
-  void prefill_ctx(int m, int64_t pos0, int slot, const std::vector<Lend> &lend, int parity, int row0 = 0);
+  void prefill_ctx(int m, int64_t pos0, int slot, const std::vector<Lend> &lend, int parity, int row0 = 0, uint32_t *split_seq = nullptr);
   // The slot's deferred context rows at positions < pos into its ring (one many-row pass), the rest dropped (rewritten
   // later or never read): pos = INT64_MAX before reading the ring, 0 before replacing it.
   void settle(int slot, int64_t pos);

@@ -1128,34 +1128,61 @@ std::vector<std::vector<int32_t>> DFlash::pass(const std::vector<Seg> &segs, int
   return out;
 }
 
-void DFlash::prefill_ctx(int m, int64_t pos0, int slot, const std::vector<Lend> &lend, int parity, int row0) {
+void DFlash::prefill_ctx(int m, int64_t pos0, int slot, const std::vector<Lend> &lend, int parity, int row0, uint32_t *split_seq) {
   if (m < 1 || row0 < 0 || row0 + m > opt_.prefill_rows || pos0 < 0 || pos0 + m > cap_ || slot < 0 || slot >= opt_.slots)
     throw std::invalid_argument("dflash: prefill rows");
   settle(slot, pos0);  // the slot's deferred rows below the chunk first
   const int H = cfg_.hidden;
   const float eps = static_cast<float>(cfg_.eps);
-  // Stage-major over the cards: every card's fc and sum are queued before any card's later work. A sum waits on the
-  // device for the peer card's partial, so a host wait after card 0's sum but before card 1's fc (pf_dense's oneDNN
-  // route checks a new shape with a read-back and frees a scratch: both wait for the queue) would stall card 0 until the
-  // sum's bounded wait gives up and leave a wrong context sum.
-  for (size_t c = 0; c < cards_.size(); ++c) {
-    Card &cd = cards_[c];
-    auto &q = fab_.compute(c);
-    // the record from kernel arguments: no pinned words a later chunk could rewrite before the copy runs (the 27B waits
-    // after every chunk; qwen38's next chunk may be submitted before this one ran)
-    k::df_rec_set(q, cd.pf_rec, pos0, slot);
-    k::pf_dense(q, m, cd.fc, cd.feat_pf + static_cast<size_t>(row0) * fcols_, fcols_, k::PfOut{lend[c].part, nullptr, H});
+  // Split copies avoid the per-element mailbox on the qwen38 TP4 prefill path.
+  // Keep each write within one ring revolution so no two rows overwrite the same slot in a kernel.
+  const char *seg_env = std::getenv("XEN_DF_PF_CHUNK");
+  const int seg = std::min({m, ring_, seg_env ? std::max(16, std::atoi(seg_env)) : split_seq ? ring_ : rows_});
+  sycl::queue *queues[k::kWireCardsMax], *side[k::kWireCardsMax];
+  const float *part[k::kWireCardsMax];
+  bf16 *out[k::kWireCardsMax];
+  k::PairSplit split[k::kWireCardsMax];
+  if (split_seq) {
+    for (size_t c = 0; c < cards_.size(); ++c) {
+      queues[c] = &fab_.compute(c);
+      side[c] = lend[c].split_side;
+      part[c] = lend[c].part;
+      out[c] = lend[c].t;
+      split[c] = *lend[c].split;
+    }
   }
-  for (size_t c = 0; c < cards_.size(); ++c) k::pair_reduce_rows(fab_.compute(c), m, H, lend[c].part, lend[c].wire, parity, lend[c].t);
-  for (size_t c = 0; c < cards_.size(); ++c) {
-    Card &cd = cards_[c];
-    const Lend &b = lend[c];
-    auto &q = fab_.compute(c);
-    k::rms_norm_plain(q, m, H, b.t, nullptr, cd.hnorm, eps, b.tn);
-    const k::DfRope rp{cd.cos, cd.sin, static_cast<int>(cap_)};
-    for (const Layer &ly : cd.layers) {
-      k::pf_dense(q, m, ly.kv, b.tn, H, k::PfOut{b.ykv, nullptr, ly.kv.n});
-      k::df_prep(q, m, 0, cd.pf_rec, hq_, hkv_, nullptr, b.ykv, ly.qn, ly.kn, eps, rp, nullptr, nullptr, nullptr, ly.ring);
+  for (int r = 0; r < m; r += seg) {
+    const int mm = std::min(seg, m - r);
+    const int64_t p0 = pos0 + r;
+    const int prow = row0 + r;
+    // Stage-major over the cards: every card's fc and sum are queued before any card's later work. A sum waits on the
+    // device for the peer card's partial, so a host wait after card 0's sum but before card 1's fc (pf_dense's oneDNN
+    // route checks a new shape with a read-back and frees a scratch: both wait for the queue) would stall card 0 until the
+    // sum's bounded wait gives up and leave a wrong context sum.
+    for (size_t c = 0; c < cards_.size(); ++c) {
+      Card &cd = cards_[c];
+      auto &q = fab_.compute(c);
+      // the record from kernel arguments: no pinned words a later chunk could rewrite before the copy runs
+      k::df_rec_set(q, cd.pf_rec, p0, slot);
+      k::pf_dense(q, mm, cd.fc, cd.feat_pf + static_cast<size_t>(prow) * fcols_, fcols_, k::PfOut{lend[c].part, nullptr, H});
+    }
+    if (split_seq) {
+      *split_seq = k::pair_split_next_seq(*split_seq);
+      k::pair_split_rows(queues, mm, H, part, out, split, *split_seq, nullptr, side);
+    } else {
+      for (size_t c = 0; c < cards_.size(); ++c)
+        k::pair_reduce_rows(fab_.compute(c), mm, H, lend[c].part, lend[c].wire, parity, lend[c].t);
+    }
+    for (size_t c = 0; c < cards_.size(); ++c) {
+      Card &cd = cards_[c];
+      const Lend &b = lend[c];
+      auto &q = fab_.compute(c);
+      k::rms_norm_plain(q, mm, H, b.t, nullptr, cd.hnorm, eps, b.tn);
+      const k::DfRope rp{cd.cos, cd.sin, static_cast<int>(cap_)};
+      for (const Layer &ly : cd.layers) {
+        k::pf_dense(q, mm, ly.kv, b.tn, H, k::PfOut{b.ykv, nullptr, ly.kv.n});
+        k::df_prep(q, mm, 0, cd.pf_rec, hq_, hkv_, nullptr, b.ykv, ly.qn, ly.kn, eps, rp, nullptr, nullptr, nullptr, ly.ring);
+      }
     }
   }
 }

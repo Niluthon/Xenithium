@@ -1006,15 +1006,24 @@ void Model::pf_finish() {
     // the chunk's bf16 rows (pf.xa / pf.xm) and pair wire are free after the layers and the head
     std::vector<arch::DFlash::Lend> lend(static_cast<size_t>(nc_));
     k::PairRowsWire pw[kMaxCards];
+    k::PairSplit sp[kMaxCards];
+    const bool drafter_split = nc_ == kMaxCards && cards_[0]->pf.split.flags &&
+                               !std::getenv("XEN_DF_PREFILL_MAILBOX");
     for (int c = 0; c < nc_; ++c) {
       Card &K = *cards_[static_cast<size_t>(c)];
       pw[c] = K.pf.pw;
       pw[c].split = false;
       pw[c].send = nullptr;
-      lend[static_cast<size_t>(c)] = {K.pf.xa, K.pf.xm, df_part_[c], df_ykv_[c], wire_of(pw[c])};
+      if (drafter_split) {
+        sp[c] = K.pf.split;
+        sp[c].bf16 = pw[c].bf16;
+      }
+      lend[static_cast<size_t>(c)] = {K.pf.xa, K.pf.xm, df_part_[c], df_ykv_[c], wire_of(pw[c]),
+                                      drafter_split ? &sp[c] : nullptr,
+                                      drafter_split && K.pf.side ? &*K.pf.side : nullptr};
     }
-    dflash_->prefill_ctx(m, pos0, R.slot, lend, pf_pair_parity_);
-    pf_pair_parity_ ^= 1;
+    dflash_->prefill_ctx(m, pos0, R.slot, lend, pf_pair_parity_, 0, drafter_split ? &pf_split_seq_ : nullptr);
+    if (!drafter_split) pf_pair_parity_ ^= 1;
     pf_mark(6);
   }
   for (int mc = 0; mc < nc_ && (prof || dprof); ++mc) {
