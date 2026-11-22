@@ -35,23 +35,40 @@ inline void mail_send(uint32_t *peer_slot, esimd::simd<uint32_t, N> words, uint3
   esimd::block_store<uint32_t, N>(peer_slot, words, kUc);
 }
 
+// How many times a message is re-read before a slot that never becomes every-word-confirmed is a hard error.
+inline constexpr int kTakeConfirmTries = 64;
+
+// Take one message. "No word is the empty pattern" is not enough on this host: a peer store can be taken as partly
+// visible -- some 64-byte lane runs reading as zeroes while the rest of the message is there -- and a caller that trusts
+// the first all-non-empty read sums a partial with a zero and never sees an error (probe wiremin; the fp32 pair_reduce
+// cases of the wire gate, 231 -> 71 of 303). So every word is acknowledged: the message is read again and the two reads
+// must agree word for word, up to kTakeConfirmTries times. A slot that never settles is error 2, a slot that never
+// fills is error 1. The clear is the take's last act, so this parity can be reused.
 template <int N>
 inline esimd::simd<uint32_t, N> mail_take(uint32_t *slot, uint32_t empty, uint64_t wait_cycles, uint32_t *error, uint32_t nan_word) SYCL_ESIMD_FUNCTION {
+  const uint64_t t0 = esimd::rdtsc();
   esimd::simd<uint32_t, N> got = esimd::block_load<uint32_t, N>(slot, kUc);
-  bool ok = !(got == empty).any();
-  if (!ok) {
-    const uint64_t t0 = esimd::rdtsc();
-    while (!ok) {
-      esimd::fence<esimd::memory_kind::global, esimd::fence_flush_op::none, esimd::fence_scope::system>();
-      got = esimd::block_load<uint32_t, N>(slot, kUc);
-      ok = !(got == empty).any();
-      if (!ok && esimd::rdtsc() - t0 > wait_cycles) break;
+  while ((got == esimd::simd<uint32_t, N>(empty)).any()) {
+    if (esimd::rdtsc() - t0 > wait_cycles) {
+      error[0] = 1u;
+      esimd::block_store<uint32_t, N>(slot, esimd::simd<uint32_t, N>(empty), kUc);
+      return esimd::simd<uint32_t, N>(nan_word);
     }
+    got = esimd::block_load<uint32_t, N>(slot, kUc);
   }
-  if (!ok) {
-    error[0] = 1u;
-    got = nan_word;
+  for (int t = 0; t < kTakeConfirmTries; ++t) {
+    // System scope is what the acknowledgement needs: a fence scope sweep on the wire gate measured none 238, group 138,
+    // local 142, system 71 of 303 failing. The fence is also why the acknowledgement loop must stay inside its spin:
+    // per message it costs the prefill rows wire time it does not have.
+    esimd::fence<esimd::memory_kind::global, esimd::fence_flush_op::none, esimd::fence_scope::system>();
+    const esimd::simd<uint32_t, N> again = esimd::block_load<uint32_t, N>(slot, kUc);
+    if (!(again != got).any()) {
+      esimd::block_store<uint32_t, N>(slot, esimd::simd<uint32_t, N>(empty), kUc);
+      return got;
+    }
+    got = again;
   }
+  error[0] = 2u;
   esimd::block_store<uint32_t, N>(slot, esimd::simd<uint32_t, N>(empty), kUc);
   return got;
 }
