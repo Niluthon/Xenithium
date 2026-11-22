@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Xenithium · the DFlash 2 drafter's own kernels (see dflash.hpp for the semantics).
 #include "xenithium/kernels/drafter/dflash.hpp"
 
@@ -366,7 +367,7 @@ sycl::event df_attn(sycl::queue &q, int rows, int seg_rows, const int32_t *rec, 
   const int sr = seg_rows > 0 ? seg_rows : rows, segs = (rows + sr - 1) / sr, grp = hq / hkv;
   if (rows < 1 || hkv < 1 || hq % hkv || grp > kDfMaxGroup || sr > kMaxRows || window < 2 || ring.ring < window + kMaxRows || ring.hkv != hkv)
     throw std::invalid_argument("df_attn: shape");
-  if (ring.ring % 16 == 0 && attn_al64(kb) && attn_al64(vb) && attn_al64(ring.k) && attn_al64(ring.v))
+  if (!std::getenv("XEN_DF_REFERENCE_ATTN") && ring.ring % 16 == 0 && attn_al64(kb) && attn_al64(vb) && attn_al64(ring.k) && attn_al64(ring.v))
     return attn_e(q, rows, sr, rec, hq, hkv, qb, kb, vb, ring, window, out, causal);
   const int D = kDfDim, NC = ctx_chunks(window) + 1, Q = sr * grp, R = ring.ring;
   // DSpine's 16-row block: queries past 32 per kv head go to further work-groups of 32 (query tiles)

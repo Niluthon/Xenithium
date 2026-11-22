@@ -857,16 +857,24 @@ sycl::event ring_tail(sycl::queue &q, int m, int ldi, const SegW &sw, const floa
   const int r0 = m > kQsaRing ? m - kQsaRing : 0;
   const int32_t *rec = sw.rec;
   const int rstride = sw.stride;
-  return q.parallel_for<QsaRingK>(sycl::nd_range<1>(static_cast<size_t>(m - r0) * kID, kID), [=](sycl::nd_item<1> it) {
+  sycl::event e = q.parallel_for<QsaRingK>(sycl::nd_range<1>(static_cast<size_t>(m - r0) * kID, kID), [=](sycl::nd_item<1> it) {
     const int r = r0 + static_cast<int>(it.get_group(0)), d = static_cast<int>(it.get_local_id(0));
     const SegRow srw = seg_row(rec, rstride, 0, r);  // one segment: the chunk
     bf16 *ring = ring0 + static_cast<size_t>(srw.slot) * kQsaRing * kID;
     ring[(srw.pos % kQsaRing) * kID + d] = bf16(bfr(yi[static_cast<size_t>(r) * ldi + kQsaIdxHeads * kID + d]));
   });
+  return e;
 }
 
 // Tiles per prefill attention work-group; XEN_QSA_PF_TILES=1 selects the decode's tiling (the bits of
 // qsa_rows == the decode path, test-qsa's contract).
+// XEN_PF_SKIP=ring|indexer|attn: drop one stage of the many-row prefill path to find which one the four-card
+// CCS/DEVICE_LOST fault comes from (the stage's output is then stale: survival is the only signal).
+bool pf_skip(const char *which) {
+  const char *e = std::getenv("XEN_PF_SKIP");
+  return e && std::strstr(e, which) != nullptr;
+}
+
 int pf_tiles() {
   const char *e = std::getenv("XEN_QSA_PF_TILES");  // read per call (host, once per layer): a test switches it
   return e && std::atoi(e) == 1 ? 1 : kQsaPfTiles;
@@ -1145,8 +1153,8 @@ QsaEvents qsa_rows(sycl::queue &q, const QsaShape &s, int m, const bf16 *x, cons
   // the chunk is one segment: slice 0's word (a record with word_stride >= kSegRec) names the slot
   const int rec_stride = word_stride >= kSegRec ? word_stride : 0;
   const SegW all{words, rec_stride, 0};
-  e.prep = traced(QsaStage::prep, prep_kv(q, s, m, w, c, rope, all, v, m));
-  traced(QsaStage::prep, ring_tail(q, m, w.idx.n, all, rs.yi, c.ring));
+  if (!pf_skip("qsa_prep")) e.prep = traced(QsaStage::prep, prep_kv(q, s, m, w, c, rope, all, v, m));
+  if (!pf_skip("ring")) traced(QsaStage::prep, ring_tail(q, m, w.idx.n, all, rs.yi, c.ring));
   // the batch's scratch: its rows of the per-row buffers, the shared per-batch ones
   auto batch_of = [&](int b) {
     QsaScratch u = v;
@@ -1175,7 +1183,7 @@ QsaEvents qsa_rows(sycl::queue &q, const QsaShape &s, int m, const bf16 *x, cons
     // prefill batches: one select launch up to kQsaPfChunk blocks (no merge launch); past it kQsaChunk-block chunks.
     // An exact top-k: the same bits either way.
     const int pf_chunk = blk_bound <= kQsaPfChunk ? kQsaPfChunk : kQsaChunk;
-    e.select = traced(QsaStage::select, qsa_select(q, rows, u.score, stride, u.nblk, blk_bound, u, &e.merge_sel, pf_chunk));
+    if (!pf_skip("indexer")) e.select = traced(QsaStage::select, qsa_select(q, rows, u.score, stride, u.nblk, blk_bound, u, &e.merge_sel, pf_chunk));
     if (e.merge_sel != e.select) traced(QsaStage::select, e.merge_sel);  // the chunked select's merge (direct: the same launch)
     return true;
   };
@@ -1195,7 +1203,7 @@ QsaEvents qsa_rows(sycl::queue &q, const QsaShape &s, int m, const bf16 *x, cons
     // the prefill walks pf_tiles() tiles per work-group (online softmax)
     const int tpw = pf_tiles();
     e.attn = traced(QsaStage::attention, attn_kv(q, s, rows, c, pos, u, tpw));
-    e.merge = traced(QsaStage::attention, merge(q, s, rows, w.qkv.n, pos, u, tpw));
+    if (!pf_skip("attn")) e.merge = traced(QsaStage::attention, merge(q, s, rows, w.qkv.n, pos, u, tpw));
   }
   if (wire && wire->split && wire->send) {
     // the peer's rows first, their copy beside the own rows

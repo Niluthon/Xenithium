@@ -208,6 +208,12 @@ class Backend final : public serve::Backend {
     // 16 (the default), 32 or 8 (--step-rows / XEN_STEP_ROWS)
     adapter_->set_step_rows(o_.step_rows_or(16));
     std::fprintf(stderr, "server: steps of up to %d rows\n", adapter_->max_rows());
+    if (const char *ds = std::getenv("XEN_STEPSTAT")) {  // diagnostic: what the depth path is handed
+      (void)ds;
+      std::fprintf(stderr, "DEPTHCFG depth_=%d seg_rows_max=%d draft_depth(1)=%d draft_depth(2)=%d layout_depth(1)=%d wide_depth=%d wide_from=%d max_rows=%d\n",
+                   adapter_->depth(), adapter_->seg_rows_max(), adapter_->draft_depth(1), adapter_->draft_depth(2),
+                   adapter_->layout_depth(1), adapter_->wide_depth(), adapter_->wide_from(), adapter_->max_rows());
+    }
     std::fprintf(stderr, "server: KV %s, %lld tokens (%.2f / %.2f GiB on the cards); one request up to %lld tokens (max_model_len)\n",
                  m.kv_shared() ? "pool shared by the slots" : "fixed per slot", static_cast<long long>(m.kv_pool_tokens()), m.kv_bytes(0) / 1073741824.0,
                  m.kv_bytes(m.cards() - 1) / 1073741824.0, static_cast<long long>(m.capacity()));

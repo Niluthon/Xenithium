@@ -1673,6 +1673,14 @@ BatchEngine::PcCand BatchEngine::pc_find(const std::vector<int32_t> &T, int tier
         break;
       }
   }
+  if (const char *e = std::getenv("XEN_PC_TRACE"); e && *e == '1') {
+    static int printed = 0;
+    if (printed < 8) {
+      ++printed;
+      std::fprintf(stderr, "PCLOOKUP tier %d prompt %zu -> src %d R %lld snap %d rank %d (R 0 = no match)\n", tier, T.size(), best.src,
+                   static_cast<long long>(best.R), best.snap, best.rank);
+    }
+  }
   return best;
 }
 
@@ -2412,6 +2420,8 @@ void BatchEngine::loop() {
             });
           });
         } else {
+          if (std::getenv("XEN_CHUNK_TRACE"))
+            std::fprintf(stderr, "PREFILL slot %d chunk %d base %zu of %zu\n", r.slot, n, r.prefilled, r.prompt.size());
           m_.prefill(r.slot, r.prompt.data() + r.prefilled, n, next);
         }
         complete(i, n, depth, rows_lp, fit, t0, dsec(clock::now() - t0).count() * 1e3, 1);

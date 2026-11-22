@@ -75,6 +75,7 @@ int Model::snap_save(int slot) {
   if (pf_run_slot() == slot) throw std::logic_error("qwen38 model: a snapshot with the slot's prefill call pending");
   const Seq &sq = seqs_[static_cast<size_t>(slot)];
   if (!sq.pf_committed || sq.pending) throw std::logic_error("qwen38 model: a snapshot is taken right after a prefill call");
+  const bool pct = [] { const char *e = std::getenv("XEN_PC_TRACE"); return e && *e == '1'; }();
   int id = -1;
   for (size_t i = 0; i < snaps_.size() && id < 0; ++i)
     if (!snaps_[i].used) id = static_cast<int>(i);
@@ -82,6 +83,7 @@ int Model::snap_save(int slot) {
     if (static_cast<int>(snaps_.size()) >= snap_cap_) return -1;
     snaps_.emplace_back();
     id = static_cast<int>(snaps_.size()) - 1;
+    if (pct) std::fprintf(stderr, "SNAPSAVE slot %d grew the store to %d ids\n", slot, static_cast<int>(snaps_.size()));
   }
   SnapRec &r = snaps_[static_cast<size_t>(id)];
   for (int c = 0; c < nc_; ++c)
@@ -90,6 +92,7 @@ int Model::snap_save(int slot) {
   r.gdn_par = sq.gdn_par;
   r.ple = sq.ple_ctx;
   r.used = true;
+  if (pct) std::fprintf(stderr, "SNAPSAVE slot %d -> id %d pos %lld (store %d ids)\n", slot, id, static_cast<long long>(r.pos), static_cast<int>(snaps_.size()));
   if (dflash_) dflash_->settle(slot, std::numeric_limits<int64_t>::max());  // its deferred rows into the rings first
   snap_copy(slot, r, true);
   return id;

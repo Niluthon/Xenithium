@@ -2013,6 +2013,14 @@ void Model::dec_finish() {
     }
     std::snprintf(b, sizeof b, " span %.3f / %.3f", d.span[0] / d.steps, d.span[1] / d.steps);
     std::fprintf(stderr, "%s%s\n", line.c_str(), b);
+    line = "decode stamps, MoE stages (ms per step, card 0 / 1):";
+    static constexpr const char *moe_stages[] = {"router", "route", "experts", "combine + all-reduce"};
+    static_assert(std::size(moe_stages) == kMoeStamped + 1);
+    for (int st = 0; st <= kMoeStamped; ++st) {
+      std::snprintf(b, sizeof b, " %s %.3f / %.3f;", moe_stages[st], d.moe[0][st] / d.steps, d.moe[1][st] / d.steps);
+      line += b;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
     line = "decode stamps, QSA stages (ms per step, card 0 / 1):";
     for (int st = 0; st < static_cast<int>(k::QsaStage::kCount); ++st) {
       std::snprintf(b, sizeof b, " %s %.3f / %.3f;", k::qsa_stage_name(static_cast<k::QsaStage>(st)), d.qsa[0][st] / d.steps, d.qsa[1][st] / d.steps);
