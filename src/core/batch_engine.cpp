@@ -697,8 +697,8 @@ void BatchEngine::spec_step(const std::vector<size_t> &dec_in, std::vector<std::
     while (accepted < a.n && accepted + 1 < rk && a.next[accepted] == t[accepted + 1]) ++accepted;
     return accepted;
   };
-  if (const char *ss = std::getenv("XEN_STEPSTAT")) {  // one line per request: its speculative accounting
-    (void)ss;
+  static const bool step_stats = std::getenv("XEN_STEPSTAT") != nullptr;
+  if (step_stats) {  // one line per request: its speculative accounting
     for (int k = 0; k < N; ++k) {
       if (dec[static_cast<size_t>(k)] < 0) continue;  // a row with no request
       Req &r = *active_[dec[static_cast<size_t>(k)]];
@@ -729,11 +729,7 @@ void BatchEngine::spec_step(const std::vector<size_t> &dec_in, std::vector<std::
     const int accepted = confirmed(k);
     if (!active_[dec[static_cast<size_t>(k)]]->lk_used) wide_acc = std::min(accepted, rk - 1);
     Req &r = *active_[dec[static_cast<size_t>(k)]];
-    static uint64_t d0_zero = 0, d0_nonzero = 0;
-    if (r.drafts.empty() || r.drafts[0] == 0) ++d0_zero; else ++d0_nonzero;
-    if (std::getenv("XEN_STEPSTAT") && r.st_steps % 50 == 0) std::fprintf(stderr, "STEPD0 zero %llu nonzero %llu\n",
-                                                                          static_cast<unsigned long long>(d0_zero), static_cast<unsigned long long>(d0_nonzero));
-    if (std::getenv("XEN_STEPSTAT") && r.st_steps % 50 == 0) {
+    if (step_stats && r.st_steps % 50 == 0) {
       std::fprintf(stderr, "STEPACC slot %d rk %d drafts %zu acc %d d0 %d d1 %d next0 %d next1 %d\n", r.slot, rk,
                    r.drafts.size(), accepted, r.drafts.empty() ? -1 : r.drafts[0],
                    r.drafts.size() < 2 ? -1 : r.drafts[1], a.n > 0 ? a.next[0] : -1, a.n > 1 ? a.next[1] : -1);
