@@ -1,5 +1,7 @@
 // xenithium-probe: hardware and kernel measurements on the cards.
 // devices Level Zero topology (cards, EU geometry, peer access)
+// peers [--mib M] [--iters I] the TP wire's peer path on this host, per ordered pair: the driver's peer answer and
+// P2P flags, then the store the wire issues into a peer mailbox against a host-staged copy of the same bytes
 // bw [--device N] [--mib M] [--iters I] plain VRAM read: the floor every kernel is judged by
 // w4 [--device N] [--n N] [--k K] [--iters I] [--ksplit S] int4 W4A16 M=4 GEMM vs its floor
 // dense [--device N] [--iters I] the dense decode GEMM (int8 W8A16 and bf16) on this model's
@@ -1677,6 +1679,14 @@ int cmd_store(const Options &o) {
 
 
 int main(int argc, char **argv) {
+  if (argc >= 2 && std::string(argv[1]) == "wiremin") {  // scratch: the two-card pair_reduce mismatch (wiremin.cpp)
+    try {
+      return cmd_wiremin(argc - 2, argv + 2);
+    } catch (const std::exception &e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      return 1;
+    }
+  }
   if (argc >= 2 && std::string(argv[1]) == "rank") {  // a hot-expert ranking for a MoE checkpoint (rank.cpp)
     try {
       return cmd_rank(argc - 2, argv + 2);
@@ -1686,7 +1696,7 @@ int main(int argc, char **argv) {
     }
   }
   if (argc < 2) {
-    std::fprintf(stderr, "usage: xenithium-probe devices|bw|w4|dense|pf|load|store|head|hc|moe|gdn|qsa|ple|model|mtp|seqs|serve [--model DIR] [--mtp DIR] [--prompt-len N] [--depth D] [--drafts-ref F] [--mtp-kv-bytes 1|2] [--ppl FILE] [--rows 1,4] [--generate N] [--layers L,L] [--context N] [--seqs N] [--kv-bytes 1|2] [--drafter 0|1] [--hot N] [--verify 0|1] [--routes-out F] [--hot-rank F] [--reserve GIB] [--lp-out DIR] [--lp-ref F,F] [--bf16 PAT,PAT] [--moe-down-bf16 0|1] [--moe-dn-ks N] [--graphs 0|1] [--moe-tp 0|1] [--hidden-out DIR] [--gen-out F] [--pf-chunk N] [--pf-moe-a8 0|1] [--pf-dense-a8 0|1|2] [--pf-wire fp32|bf16] [--dec-moe-a8 0|1] [--kv-pool N] [--kv-scramble 0|1] [--kv-lend 0|1] [--kv-lend-keep N] [--kv-lend-idle 0|1] [--moe-gu-ks N] [--gdn-scan 0|1] [--pf-cold-stage N] [--pf-route-trace F] [--pf-time-only 0|1] [--pf-sweep N,N] [--lp-time N] [--step-rows 4|8] [--two-deep 0|1] [--spec-cap F] [--bucket-gate N] [--bucket-pre 0|1] [--p1-kv-gate A,B] [--layer L] [--threads T] [--device N] [--mib M] [--iters I] [--n N] [--k K] [--ksplit S]\n");
+    std::fprintf(stderr, "usage: xenithium-probe devices|peers|bw|w4|dense|pf|load|store|head|hc|moe|gdn|qsa|ple|model|mtp|seqs|serve [--model DIR] [--mtp DIR] [--prompt-len N] [--depth D] [--drafts-ref F] [--mtp-kv-bytes 1|2] [--ppl FILE] [--rows 1,4] [--generate N] [--layers L,L] [--context N] [--seqs N] [--kv-bytes 1|2] [--drafter 0|1] [--hot N] [--verify 0|1] [--routes-out F] [--hot-rank F] [--reserve GIB] [--lp-out DIR] [--lp-ref F,F] [--bf16 PAT,PAT] [--moe-down-bf16 0|1] [--moe-dn-ks N] [--graphs 0|1] [--moe-tp 0|1] [--hidden-out DIR] [--gen-out F] [--pf-chunk N] [--pf-moe-a8 0|1] [--pf-dense-a8 0|1|2] [--pf-wire fp32|bf16] [--dec-moe-a8 0|1] [--kv-pool N] [--kv-scramble 0|1] [--kv-lend 0|1] [--kv-lend-keep N] [--kv-lend-idle 0|1] [--moe-gu-ks N] [--gdn-scan 0|1] [--pf-cold-stage N] [--pf-route-trace F] [--pf-time-only 0|1] [--pf-sweep N,N] [--lp-time N] [--step-rows 4|8] [--two-deep 0|1] [--spec-cap F] [--bucket-gate N] [--bucket-pre 0|1] [--p1-kv-gate A,B] [--layer L] [--threads T] [--device N] [--mib M] [--iters I] [--n N] [--k K] [--ksplit S]\n");
     return 2;
   }
   const std::string cmd = argv[1];
@@ -1849,6 +1859,7 @@ int main(int argc, char **argv) {
   }
   try {
     if (cmd == "devices") return cmd_devices();
+    if (cmd == "peers") return cmd_peers(o.mib, o.iters);
     if (cmd == "bw") return cmd_bw(o);
     if (cmd == "w4") return cmd_w4(o);
     if (cmd == "load") return cmd_load(o);

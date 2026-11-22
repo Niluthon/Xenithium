@@ -148,6 +148,10 @@ int cmd_serve_run(const std::string &model, const std::string &ppl, int nseq, in
                   bool graphs, const std::string &hot_rank, double reserve_gib, int threads, int kv_bytes, double stall_ms,
                   const std::string &mtp);  // serve.cpp
 int cmd_rank(int argc, char **argv);
+// peers.cpp: the TP wire's peer path per ordered pair (a peer store vs a host-staged copy)
+int cmd_peers(int mib, int iters);
+// wiremin.cpp (scratch): the two-card pair_reduce mismatch, per call
+int cmd_wiremin(int argc, char **argv);
 // The DFlash host-reference gate's view of a target (qwen35_dflash.cpp: qwen35's; dflash38.cpp: qwen38's).
 namespace xenithium::arch {
 class DFlash;

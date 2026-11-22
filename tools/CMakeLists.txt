@@ -66,7 +66,7 @@ target_compile_options(xenithium-lookahead PRIVATE -O3)
 
 # Benchmarks and gates on the cards: one subcommand per op / model (tools/probe/main.cpp lists them).
 xenithium_tool(xenithium-probe
-  SOURCES probe/main.cpp probe/flags.cpp probe/moe.cpp probe/gdn.cpp probe/qsa.cpp probe/ple.cpp probe/model.cpp probe/mtp.cpp probe/seqs.cpp probe/serve.cpp
+  SOURCES probe/main.cpp probe/peers.cpp probe/wiremin.cpp probe/flags.cpp probe/moe.cpp probe/gdn.cpp probe/qsa.cpp probe/ple.cpp probe/model.cpp probe/mtp.cpp probe/seqs.cpp probe/serve.cpp
           probe/prefix.cpp probe/qwen35.cpp probe/qwen35_gdn.cpp probe/qwen35_attn.cpp probe/qwen35_model.cpp probe/qwen35_dflash.cpp
           probe/qwen35_prefix.cpp probe/qwen35_select.cpp probe/qwen35_headx.cpp probe/llama.cpp probe/flint.cpp probe/rank.cpp probe/dflash38.cpp
   LIBS xenithium_kernels xenithium_arch xenithium_eval xenithium_gpu_engine)
