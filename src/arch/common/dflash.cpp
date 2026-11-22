@@ -248,6 +248,7 @@ DFlash::DFlash(Fabric &fab, const std::string &dir, const std::string &target_di
   if (opt.rows < 0 || opt.rows > kRows) throw std::invalid_argument("dflash: rows 0..kRows");
   rows_ = opt.rows > 0 ? opt.rows : kRows;
   const size_t R = static_cast<size_t>(rows_), NS = static_cast<size_t>(opt.slots);
+  const bool copy_wire = C == k::kWireCardsMax && opt.copy_wire;
   const bool ds = cfg_.kind == DFlashConfig::Kind::dspine;
   const int kvn = 2 * hkv_ * D, proj_n = ds ? 0 : 2 * cfg_.conv_taps * (H / cfg_.conv_group);
   for (int c = 0; c < C; ++c) {
@@ -409,6 +410,14 @@ DFlash::DFlash(Fabric &fab, const std::string &dir, const std::string &target_di
   }
   if (C == 4) {  // the four-card sums (recursive doubling, every inbox by the host), the top-k in two hops
     k::WireQuad dq, rq;
+    if (copy_wire) {
+      fab.alloc_step_copy(step_copy_, rows_, H, false, cards_[0].mem);
+      dq.copy = &step_copy_;
+      if (opt.ctx_defer > 0) {
+        fab.alloc_step_copy(flush_copy_, opt.ctx_defer, H, false, cards_[0].mem);
+        rq.copy = &flush_copy_;
+      }
+    }
     for (int c = 0; c < C; ++c) dq.inbox[c] = cards_[static_cast<size_t>(c)].wire.inbox, rq.inbox[c] = cards_[static_cast<size_t>(c)].fl_wire.inbox;
     for (int c = 0; c < C; ++c) {
       Card &cd = cards_[static_cast<size_t>(c)];

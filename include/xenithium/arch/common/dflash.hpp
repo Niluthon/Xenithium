@@ -95,6 +95,7 @@ struct DFlashOptions {
   int slots = 1;
   int rows = 0;  // block rows a pass holds (0 = kRows; the target's step rows, 16 unless 32-row steps)
   int prefill_rows = 2048;  // most prompt rows one prefill chunk captures features for
+  bool copy_wire = false;   // TP4: runtime copies for the drafter reductions
   bool profile = false;     // pass(): wait on both cards after every stage and add its wall time to stage_ms() (diagnostic)
   // A context-only pass (block_rows 0: no drafts, e.g. at depth 0 with many streams) only stashes its feature rows, up
   // to this many per slot; settle() runs them as one many-row context pass (prefill_ctx's kernels) before anything reads
@@ -288,6 +289,7 @@ class DFlash {
   int ring_ = 0, fcols_ = 0, ipc_ = 0, hq_ = 0, hkv_ = 0, par_ = 0;
   std::unique_ptr<load::DenseStore> dense_, head_store_;
   std::vector<Card> cards_;
+  kernels::StepCopy step_copy_{}, flush_copy_{};
   std::vector<size_t> bytes_;
   bf16 *codebook_ = nullptr;  // DSpine: the bridge's codebook bf16 [vocab][code], pinned host (anchor rows)
   void load_dspine(const std::string &dir, const std::string &target_dir);

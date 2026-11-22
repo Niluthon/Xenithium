@@ -50,7 +50,7 @@ template <int M, int KS, bool A8, bool FH, int MC, int PK, int TW>
 class MoeDownK;
 // How the combine's launch ends: the card's partial rounded (one card), the two-card exchange, the four-card two-hop
 // sum, or the four-card owner sum (comm/wire.hpp, rows by owner: the card's own rows only).
-enum class CombineSum { local, pair, quad, owner };
+enum class CombineSum { local, pair, quad, owner, copy };
 template <int M, CombineSum SUM>
 class MoeCombineK;
 
@@ -1254,6 +1254,7 @@ sycl::event combine(sycl::queue &q, const MoeShape &s, int rows, const MoeScratc
   const MoeRoute *rt = sc.route;
   const float *part = sc.partial;
   const mail::QuadPeers qp = SUM == CombineSum::quad ? mail::quad_peers(wire.quad) : mail::QuadPeers{};
+  float *copy_part = SUM == CombineSum::copy ? wire.quad.copy->partial[wire.quad.card] : nullptr;
   const size_t hop_words = 2ull * kMoeRows * static_cast<size_t>(H);  // (quad) hop 2's slot region after hop 1's
   const mail::OwnerBoxes boxes = SUM == CombineSum::owner ? mail::owner_boxes(wire.owner) : mail::OwnerBoxes{};
   const uint32_t opaque0 = static_cast<uint32_t>(rows < 0);  // 0: a kernel argument the compiler cannot know
@@ -1321,8 +1322,12 @@ sycl::event combine(sycl::queue &q, const MoeShape &s, int rows, const MoeScratc
           const esimd::simd<float, COLS> other = got.template bit_cast_view<float>();
           acc = acc + other;
         }
-        const esimd::simd<bf16, COLS> o = acc;
-        o.copy_to(out + static_cast<size_t>(r) * H + c0);
+        if constexpr (SUM == CombineSum::copy) {
+          acc.copy_to(copy_part + static_cast<size_t>(r) * H + c0);
+        } else {
+          const esimd::simd<bf16, COLS> o = acc;
+          o.copy_to(out + static_cast<size_t>(r) * H + c0);
+        }
       });
 }
 
@@ -1535,6 +1540,12 @@ template <int kM>
 sycl::event combine_by_wire(sycl::queue &q, const MoeShape &s, int rows, const MoeScratch &sc, const MoeWire *wire, int parity, bf16 *out) {
   if (!wire) return combine<kM, CombineSum::local>(q, s, rows, sc, MoeWire{}, 0, out);
   if (wire->owner.on()) return combine<kM, CombineSum::owner>(q, s, rows, sc, *wire, parity & 1, out);
+  if (wire->quad.copy) {
+    combine<kM, CombineSum::copy>(q, s, rows, sc, *wire, parity & 1, out);
+    const auto &copy = *wire->quad.copy;
+    return step_copy_reduce(q, rows, s.hidden, copy.partial[wire->quad.card], copy, wire->quad.card, parity, wire->error,
+                            wire->wait_cycles, out);
+  }
   if (wire->quad.on()) return combine<kM, CombineSum::quad>(q, s, rows, sc, *wire, parity & 1, out);
   return combine<kM, CombineSum::pair>(q, s, rows, sc, *wire, parity & 1, out);
 }

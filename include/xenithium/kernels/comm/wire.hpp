@@ -28,9 +28,24 @@ inline constexpr int kPairRows = kMaxRows;  // rows a decode step can carry (row
 // holds a slot region per hop (its words x kQuadHops, hop 2's region after hop 1's).
 inline constexpr int kWireCardsMax = 4;
 inline constexpr int kQuadHops = 2;
+struct StepCopy {
+  std::array<float *, kWireCardsMax> recv{}, partial{};
+  std::array<uint32_t *, kWireCardsMax> state{};
+  std::array<sycl::ext::oneapi::bfloat16 *, kWireCardsMax> shared{};
+  // If every rank supplies its fixed output, the split's second copy delivers rows there.
+  std::array<sycl::ext::oneapi::bfloat16 *, kWireCardsMax> outputs{};
+  uint32_t *shared_ready = nullptr;
+  int split_min_rows = 0;
+  uint32_t *ready = nullptr;
+  size_t stride = 0;  // fp32 elements in one source's slot
+};
+sycl::event step_copy_reduce(sycl::queue &q, int rows, int n, const float *part, const StepCopy &buffers, int card, int parity,
+                             uint32_t *error, uint64_t wait_cycles, sycl::ext::oneapi::bfloat16 *out);
+
 struct WireQuad {
   int card = -1;                                  // this card in [0, 4); -1 = off (the two-card wire: peer_inbox)
   std::array<uint32_t *, kWireCardsMax> inbox{};  // every card's inbox, this card's included
+  const StepCopy *copy = nullptr;
   bool on() const { return card >= 0; }
   // on, with this card in range and every card's inbox named (a null peer inbox would fault the device)
   bool complete() const {

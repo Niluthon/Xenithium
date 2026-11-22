@@ -733,7 +733,7 @@ class Model {
   static constexpr bool seg_key_replay(int key) { return (key & 8) != 0; }
   void submit_step(int rows, int seg_key, int bound);
   // A decode step's rows by owner (model.cpp, "a decode step's rows by owner")
-  bool dec_by_owner(int rows) const { return nc_ == kMaxCards && rows >= kDecOwnerMinRows; }
+  bool dec_by_owner(int rows) const;
   void dec_owner_init();  // the owner sums' and the shared buffers' mailboxes (four cards)
   struct DecMixer;        // one mixer of a step on one card: the block it combines, its weights, its output
   kernels::HcEvents dec_mixer(int c, int rows, const DecMixer &m);  // .up = the card's last launch of it
@@ -846,6 +846,7 @@ class Model {
   QsaSet qs_;
   PleSet ps_;
   std::vector<std::unique_ptr<Card>> cards_;
+  kernels::StepCopy attention_copy_{}, moe_copy_{};
   uint16_t *ple_pinned_ = nullptr;  // the step's PLE rows, bf16 [4][E]
   PfTrace *pf_trace_ = nullptr;
   MtpPrefill mtp_pf_ = MtpPrefill::rows;

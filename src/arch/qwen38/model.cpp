@@ -590,6 +590,18 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
       for (int d = 0; d < nc_; ++d) cards_[static_cast<size_t>(c)]->pf.sel[j].flags_of[d] = cards_[static_cast<size_t>(d)]->pf.sel[j].flags;
   if (nc_ == kMaxCards) {  // the four-card wires (TP4): every card's inbox in each, by the host
     k::WireQuad dq, mq, rq, mrq;  // decode pair / decode MoE / rows pair / rows MoE inboxes
+    if (util::env_flag("XEN_Q38_COPY_WIRE")) {
+      fab.alloc_step_copy(attention_copy_, step_cap_, H, false, cards_[0]->mem);
+      fab.alloc_step_copy(moe_copy_, step_cap_, H, true, cards_[0]->mem);
+      if (util::env_flag("XEN_Q38_COPY_DIRECT_OUT")) {
+        for (int c = 0; c < nc_; ++c) {
+          attention_copy_.outputs[c] = cards_[static_cast<size_t>(c)]->ya;
+          moe_copy_.outputs[c] = cards_[static_cast<size_t>(c)]->ym;
+        }
+      }
+      dq.copy = &attention_copy_;
+      mq.copy = &moe_copy_;
+    }
     for (int c = 0; c < nc_; ++c) {
       const Card &K = *cards_[static_cast<size_t>(c)];
       dq.inbox[c] = K.pw.inbox, mq.inbox[c] = K.mw.inbox, rq.inbox[c] = K.pf.pw.inbox, mrq.inbox[c] = K.pf.mw.inbox;
@@ -628,6 +640,7 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
     dop.prefill_rows = opt.prefill_chunk;
     dop.profile = opt.dflash_profile;
     dop.ctx_defer = opt.dflash_ctx_defer;
+    dop.copy_wire = attention_copy_.ready != nullptr;
     dop.conf_cut = opt.dflash_conf_cut;
     // draft trees (DDTree): trees of the 8-row block, verified on the tree rows of QSA / PLE / GDN; not beside the MTP
     // layer (its pass 1 writes KV over the verify's rows before the accept)
@@ -1528,6 +1541,10 @@ k::HcEvents Model::dec_mixer(int c, int rows, const DecMixer &m) {
   k::HcEvents e = k::hc_mixer_at(q, hs_.shape, k::owner_rows(c, rows), head_->state(c), m.block, *m.weights, head_->scratch(c), m.out);
   e.up = k::owner_share(q, rows, cfg_.hidden, m.out, *m.share, m.parity);
   return e;
+}
+
+bool Model::dec_by_owner(int rows) const {
+  return !attention_copy_.ready && nc_ == kMaxCards && rows >= kDecOwnerMinRows;
 }
 
 sycl::event Model::dec_ple_combine(int c, int rows, const bf16 *block) {

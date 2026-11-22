@@ -15,6 +15,8 @@
 
 namespace xenithium {
 
+namespace kernels { struct StepCopy; }
+
 class Fabric {
  public:
   // profiling: the compute queues record event timestamps (probes and tests read them). Servers pass false unless a
@@ -54,6 +56,7 @@ class Fabric {
   // on Battlemage. DMA buffers and separately sequenced flags still use
   // alloc_mailbox() so their device-resident transport is unchanged.
   void *alloc_kernel_mailbox(size_t bytes) { return alloc_host(bytes); }
+  void alloc_step_copy(kernels::StepCopy &buffers, int rows, int n, bool needs_partial, std::vector<void *> &owned);
   void release(void *ptr) { ctx_.free(ptr); }
 
   // Driver's answer, not a promise: a peer copy across VMM blocks can still hang

@@ -1,9 +1,14 @@
 #include "xenithium/rt/fabric.hpp"
 
+#include <charconv>
+#include <cstdlib>
+#include <cstring>
+
 #include <stdexcept>
 
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 
+#include "xenithium/kernels/comm/wire.hpp"
 #include "xenithium/rt/card.hpp"
 #include "xenithium/rt/device.hpp"
 
@@ -28,6 +33,31 @@ Fabric::Fabric(const l0::Loader &loader, std::vector<size_t> ranks, bool profili
   for (size_t r : ranks_) {
     devs_.push_back(loader.device(r));
     sdevs_.push_back(find_sycl_device(loader.device(r)));
+  }
+
+  // Report the driver's peer-access capability for the device-backed copy
+  // buffers. The fused kernel mailboxes are separately allocated in host USM.
+  if (devs_.size() > 1) {
+    static bool said = false;
+    std::string missing;
+    size_t no_link = 0, pairs = 0;
+    for (size_t i = 0; i < devs_.size(); ++i)
+      for (size_t j = 0; j < devs_.size(); ++j) {
+        if (i == j) continue;
+        ++pairs;
+        if (can_access(i, j)) continue;
+        ++no_link;
+        missing += " " + std::to_string(i) + "->" + std::to_string(j);
+      }
+    if (!said) {
+      said = true;
+      if (no_link == 0)
+        std::fprintf(stderr, "fabric: %zu cards, peer access on all %zu ordered pairs\n", devs_.size(), pairs);
+      else
+        std::fprintf(stderr,
+                     "fabric: %zu cards, %zu of %zu ordered pairs have no peer access (%s)\n",
+                     devs_.size(), no_link, pairs, missing.c_str());
+    }
   }
 
   // One SYCL context over all ranks (the only way a kernel may later touch a
@@ -68,6 +98,43 @@ void *Fabric::alloc_mailbox(size_t r, size_t bytes) {
     }
   }
   return p;
+}
+
+void Fabric::alloc_step_copy(kernels::StepCopy &buffers, int rows, int n, bool needs_partial, std::vector<void *> &owned) {
+  constexpr size_t C = kernels::kWireCardsMax;
+  if (size() != C || rows < 1 || n < 1) throw std::invalid_argument("fabric: step copy requires four cards and a positive shape");
+  buffers.stride = static_cast<size_t>(rows) * n;
+  constexpr size_t ready_bytes = 2 * C * 64;
+  buffers.ready = static_cast<uint32_t *>(alloc_host(ready_bytes));
+  owned.push_back(buffers.ready);
+  std::memset(buffers.ready, 0, ready_bytes);
+  if (const char *setting = std::getenv("XEN_Q38_COPY_SPLIT_ROWS")) {
+    const char *end = setting + std::strlen(setting);
+    int threshold = 0;
+    const auto parsed = std::from_chars(setting, end, threshold);
+    if (parsed.ec == std::errc{} && parsed.ptr == end) buffers.split_min_rows = threshold;
+  }
+  if (buffers.split_min_rows >= static_cast<int>(C) && buffers.split_min_rows <= rows) {
+    buffers.shared_ready = static_cast<uint32_t *>(alloc_host(ready_bytes));
+    owned.push_back(buffers.shared_ready);
+    std::memset(buffers.shared_ready, 0, ready_bytes);
+  }
+
+  for (size_t c = 0; c < C; ++c) {
+    buffers.recv[c] = static_cast<float *>(alloc_mailbox(c, 2 * C * buffers.stride * sizeof(float)));
+    owned.push_back(buffers.recv[c]);
+    if (buffers.shared_ready) {
+      buffers.shared[c] = static_cast<sycl::ext::oneapi::bfloat16 *>(alloc_mailbox(c, 2 * buffers.stride * sizeof(sycl::ext::oneapi::bfloat16)));
+      owned.push_back(buffers.shared[c]);
+    }
+    buffers.state[c] = static_cast<uint32_t *>(alloc(c, 64));
+    owned.push_back(buffers.state[c]);
+    compute(c).memset(buffers.state[c], 0, 64).wait();
+    if (needs_partial) {
+      buffers.partial[c] = static_cast<float *>(alloc(c, buffers.stride * sizeof(float)));
+      owned.push_back(buffers.partial[c]);
+    }
+  }
 }
 
 bool Fabric::can_access(size_t from, size_t to) const {

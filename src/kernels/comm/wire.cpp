@@ -693,6 +693,8 @@ sycl::event pair_reduce_rows(sycl::queue &q, int m, int n, const float *part, co
   if (wire->quad.on()) {
     check_quad(wire->quad, "pair_reduce_rows");
     if (wire->split) throw std::invalid_argument("pair_reduce_rows: the split form is two-card only");
+    if (wire->quad.copy && !wire->bf16)
+      return step_copy_reduce(q, m, n, part, *wire->quad.copy, wire->quad.card, p, wire->error, wire->wait_cycles, out);
     return reduce_rows_wire<true>(q, m, n, part, *wire, p, out);
   }
   return reduce_rows_wire<false>(q, m, n, part, *wire, p, out);
@@ -786,6 +788,118 @@ sycl::event owner_share(sycl::queue &q, int rows, int n, bf16 *buf, const OwnerS
   return share_rows<64>(q, rows, n, buf, share, p);
 }
 
+namespace {
+class StepCopyWait;
+class StepCopySum;
+constexpr auto kStepFlag = esimd::properties{esimd::cache_hint_L1<esimd::cache_hint::uncached>,
+                                               esimd::cache_hint_L2<esimd::cache_hint::uncached>, esimd::alignment<16>};
+class StepCopyShareWait;
+class StepCopyDirectWait;
+class StepCopyShareOut;
+
+template <bool SHARE, bool DIRECT = false>
+sycl::event step_copy_sync(sycl::queue &q, uint32_t *state, uint32_t *ready, int card, uint32_t *error, uint64_t wait_cycles,
+                           bf16 *out = nullptr, size_t items = 0) {
+  constexpr int C = kWireCardsMax, kFlagWords = 16;
+  using Wait = std::conditional_t<DIRECT, StepCopyDirectWait, std::conditional_t<SHARE, StepCopyShareWait, StepCopyWait>>;
+  return q.single_task<Wait>([=]() SYCL_ESIMD_KERNEL {
+    uint32_t seq = state[0];
+    if constexpr (!SHARE) {
+      state[0] = ++seq;
+      state[1] = 0;
+    }
+    esimd::fence<esimd::memory_kind::global, esimd::fence_flush_op::none, esimd::fence_scope::system>();
+    esimd::block_store<uint32_t, 4>(ready + card * kFlagWords, esimd::simd<uint32_t, 4>(seq), kStepFlag);
+    const uint64_t start = esimd::rdtsc();
+    constexpr auto poll = esimd::properties{esimd::cache_hint_L1<esimd::cache_hint::uncached>,
+                                             esimd::cache_hint_L2<esimd::cache_hint::uncached>, esimd::alignment<4>};
+    const esimd::simd<uint32_t, C> offsets(0, kFlagWords * sizeof(uint32_t));
+    while (true) {
+      const auto seen = esimd::gather<uint32_t, C>(ready, offsets, esimd::simd_mask<C>(1), poll);
+      if ((seen == seq).all()) break;
+      if (esimd::rdtsc() - start > wait_cycles) {
+        error[0] = state[1] = 1u;
+        break;
+      }
+      esimd::fence<esimd::memory_kind::global, esimd::fence_flush_op::none, esimd::fence_scope::system>();
+    }
+    if constexpr (DIRECT) {
+      if (state[1]) {
+        const esimd::simd<bf16, kCols> bad = bf16(__builtin_nanf(""));
+        for (size_t off = 0; off < items; off += kCols) bad.copy_to(out + off);
+      }
+    }
+  });
+}
+}  // namespace
+
+sycl::event step_copy_reduce(sycl::queue &q, int rows, int n, const float *part, const StepCopy &buffers, int card, int parity,
+                             uint32_t *error, uint64_t wait_cycles, bf16 *out) {
+  constexpr int C = kWireCardsMax, kFlagWords = 16;
+  const size_t items = static_cast<size_t>(rows) * n;
+  if (card < 0 || card >= C || rows < 1 || n < 1 || n % kCols || items > buffers.stride || !buffers.ready)
+    throw std::invalid_argument("step copy: mailbox shape");
+  // A rank cannot start reusing a parity until the other ranks have published
+  // the intervening operation, which follows their reads of this one.
+  const size_t base = static_cast<size_t>(parity & 1) * C * buffers.stride;
+  const size_t flag_base = static_cast<size_t>(parity & 1) * C * kFlagWords;
+  const bool split = buffers.shared_ready && rows >= buffers.split_min_rows;
+  const auto row_begin = [=](int rank) { return static_cast<size_t>(rows * rank / C) * n; };
+  for (int hop = 1; hop < C; ++hop) {
+    const int dest = (card + hop) % C;
+    const size_t start = split ? row_begin(dest) : 0;
+    const size_t count = split ? row_begin(dest + 1) - start : items;
+    q.memcpy(buffers.recv[dest] + base + card * buffers.stride + start, part + start, count * sizeof(float));
+  }
+  auto *state = buffers.state[card];
+  step_copy_sync<false>(q, state, buffers.ready + flag_base, card, error, wait_cycles);
+  const size_t begin = split ? row_begin(card) : 0;
+  const size_t count = split ? row_begin(card + 1) - begin : items;
+  const size_t shared_at = static_cast<size_t>(parity & 1) * buffers.stride;
+  bool direct = split && buffers.outputs[card] == out;
+  for (const auto *output : buffers.outputs) direct = direct && output != nullptr;
+  bf16 *const reduced = split && !direct ? buffers.shared[card] + shared_at : out;
+  const float *src[C];
+  for (int i = 0; i < C; ++i) src[i] = i == card ? part : buffers.recv[card] + base + i * buffers.stride;
+  const uint32_t zero = static_cast<uint32_t>(rows < 0);
+  auto sum = q.parallel_for<StepCopySum>(sycl::range<1>(count / kCols), [=](sycl::id<1> item) SYCL_ESIMD_KERNEL {
+    const size_t off = begin + item[0] * kCols;
+    esimd::simd<bf16, kCols> result;
+    if (state[1]) {
+      result = bf16(__builtin_nanf(""));
+    } else {
+      const auto p0 = esimd::block_load<float, kCols>(src[0] + off, mail::kUc);
+      const auto p1 = esimd::block_load<float, kCols>(src[1] + off, mail::kUc);
+      const auto p2 = esimd::block_load<float, kCols>(src[2] + off, mail::kUc);
+      const auto p3 = esimd::block_load<float, kCols>(src[3] + off, mail::kUc);
+      result = mail::opaque<kCols>(p0 + p1, zero) + mail::opaque<kCols>(p2 + p3, zero);
+    }
+    result.copy_to(reduced + off);
+  });
+  if (!split) return sum;
+  // Only the assigned rows are reduced on each rank, then shared at BF16.
+  // The second flag bank separates partial arrival from output arrival.
+  for (int hop = 1; hop < C; ++hop) {
+    const int dest = (card + hop) % C;
+    bf16 *const target = direct ? buffers.outputs[dest] : buffers.shared[dest] + shared_at;
+    q.memcpy(target + begin, reduced + begin, count * sizeof(bf16));
+  }
+  if (direct) {
+    // All peers passed the first barrier after their previous consumers of out.
+    // The second barrier publishes the BF16 copies before this rank consumes them.
+    return step_copy_sync<true, true>(q, state, buffers.shared_ready + flag_base, card, error, wait_cycles, out, items);
+  }
+  step_copy_sync<true>(q, state, buffers.shared_ready + flag_base, card, error, wait_cycles);
+  return q.parallel_for<StepCopyShareOut>(sycl::range<1>(items / kCols), [=](sycl::id<1> item) SYCL_ESIMD_KERNEL {
+    const size_t off = item[0] * kCols;
+    esimd::simd<bf16, kCols> result = bf16(__builtin_nanf(""));
+    if (!state[1]) result.copy_from(reduced + off, esimd::properties{esimd::cache_hint_L1<esimd::cache_hint::uncached>,
+                                                                     esimd::cache_hint_L2<esimd::cache_hint::cached>,
+                                                                     esimd::alignment<128>});
+    result.copy_to(out + off);
+  });
+}
+
 sycl::event pair_reduce(sycl::queue &q, int rows, int n, const float *part, const PairWire *wire, int parity, bf16 *out) {
   if (rows < 1 || rows > kM || n % kCols) throw std::invalid_argument("pair_reduce: rows 1..kPairRows (32), n % 64 == 0");
   if (!wire) return reduce<false, false, kCols>(q, rows, n, part, PairWire{}, 0, out);
@@ -799,6 +913,8 @@ sycl::event pair_reduce(sycl::queue &q, int rows, int n, const float *part, cons
   if (wire->quad.on()) {
     check_quad(wire->quad, "pair_reduce");
     if (wire->i8) throw std::invalid_argument("pair_reduce: the int8 wire is two-card only");
+    if (wire->quad.copy && !wire->bf16)
+      return step_copy_reduce(q, rows, n, part, *wire->quad.copy, wire->quad.card, p, wire->error, wire->wait_cycles, out);
     return reduce_wire<true>(q, rows, n, part, *wire, p, out);
   }
   if (wire->i8) {
