@@ -544,6 +544,26 @@ void test_select(xenithium::Device &dev, int segs, int sr, int sub_k) {
     }
   expect(got_n == want_n && argmax_kept && off > 0, "df_select " + std::to_string(segs) + " x " + std::to_string(sr) + " rows, coupled noise on even segments: drafts == the host walk (" +
                                                         std::to_string(off) + " picks moved), odd segments keep the argmax picks");
+  // The compact selector must use the same heaps and projections after
+  // dropping the anchor row from each segment.
+  const size_t packed_rows = static_cast<size_t>(segs) * (sr - 1);
+  std::vector<uint64_t> packed_keys;
+  std::vector<float> packed_hp;
+  packed_keys.reserve(packed_rows * k::kDfTopK);
+  packed_hp.reserve(packed_rows * rank);
+  for (int seg = 0; seg < segs; ++seg) {
+    const size_t first = static_cast<size_t>(seg) * sr + 1;
+    const size_t end = first + sr - 1;
+    packed_keys.insert(packed_keys.end(), keys.begin() + first * k::kDfTopK, keys.begin() + end * k::kDfTopK);
+    packed_hp.insert(packed_hp.end(), hp.begin() + first * rank, hp.begin() + end * rank);
+  }
+  auto *d_pk = up(dev, packed_keys);
+  auto *d_ph = up(dev, packed_hp);
+  k::df_select(dev.compute(), segs, sr, d_pk, d_ph, rank, reinterpret_cast<const bf16 *>(d_p), reinterpret_cast<const bf16 *>(d_s),
+               d_a, sub_k, sub_s0, d_o, d_n, true).wait_and_throw();
+  expect(down(dev, d_o, packed_rows) == got_n, "df_select: packed draft rows produce identical picks");
+  dev.release(d_pk);
+  dev.release(d_ph);
   dev.release(d_n);
   for (void *p : {(void *)d_p, (void *)d_s, (void *)d_h, (void *)d_k, (void *)d_a, (void *)d_o}) dev.release(p);
 }

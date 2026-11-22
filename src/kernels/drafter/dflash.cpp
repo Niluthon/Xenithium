@@ -689,9 +689,24 @@ void df_topk_ref(const float *row, int n, int col_base, uint64_t *keys) {
   std::copy(v.begin(), v.begin() + kDfTopK, keys);
 }
 
+class DfPackDraftRowsK;
+
+sycl::event df_pack_draft_rows(sycl::queue &q, int segs, int block, int hidden, const df_bf16 *src, df_bf16 *dst) {
+  constexpr int cols = 64;
+  const int depth = block - 1, tiles = hidden / cols;
+  if (segs < 1 || depth < 1 || hidden < 1 || hidden % cols) throw std::invalid_argument("df_pack_draft_rows: shape");
+  return q.parallel_for<DfPackDraftRowsK>(sycl::range<1>(static_cast<size_t>(segs) * depth * tiles), [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
+    const size_t row = id[0] / tiles, col = (id[0] % tiles) * cols;
+    const size_t source_row = row + row / depth + 1;
+    esimd::simd<df_bf16, cols> v;
+    v.copy_from(src + source_row * hidden + col);
+    v.copy_to(dst + row * hidden + col);
+  });
+}
+
 // ---- selector -------------------------------------------------------------------------------------
 sycl::event df_select(sycl::queue &q, int segs, int seg_rows, const uint64_t *keys, const float *hp, int rank, const df_bf16 *pred_cb, const df_bf16 *succ_cb,
-                      const int32_t *anchors, int sub_k, int sub_s0, int32_t *drafts, const DraftNoiseRec *noise) {
+                      const int32_t *anchors, int sub_k, int sub_s0, int32_t *drafts, const DraftNoiseRec *noise, bool compact) {
   constexpr int kParts = 16, kItems = kDfTopK * kParts;
   if (segs < 1 || seg_rows < 2 || segs * seg_rows > kMaxRows || rank % kParts) throw std::invalid_argument("df_select: shape");
   const int per = rank / kParts;
@@ -706,7 +721,7 @@ sycl::event df_select(sycl::queue &q, int segs, int seg_rows, const uint64_t *ke
       if (lid == 0) pred[0] = anchors[s];
       sycl::group_barrier(it.get_group());
       for (int j = 1; j < seg_rows; ++j) {
-        const int row = s * seg_rows + j;
+        const int row = compact ? s * (seg_rows - 1) + j - 1 : s * seg_rows + j;
         const uint64_t key = keys[static_cast<size_t>(row) * kDfTopK + b];
         const int32_t v = static_cast<int32_t>(0xFFFFFFFEu - static_cast<uint32_t>(key));
         const int32_t tok = sub_k > 0 && v >= sub_k ? v - sub_k + sub_s0 : v;

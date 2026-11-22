@@ -852,13 +852,18 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
     }
   }
   if (rb > 0) {
+    // A multi-segment chain never reads its anchor rows in the output head.
+    const bool compact = opt_.copy_wire && ns > 1 && tree == 0 && cfg_.kind == DFlashConfig::Kind::dflash2 &&
+                         !std::getenv("XEN_CHAIN_TRACE");
+    const int head_rows = compact ? rb - ns : rb;
     for (size_t c = 0; c < C; ++c) {
       Card &cd = cards_[c];
       auto &q = fab_.compute(c);
       k::rms_norm_plain(q, rb, H, cd.res, cfg_.kind == DFlashConfig::Kind::dspine ? nullptr : cd.mlp, cd.fnorm, eps, cd.hout);
       const LmMat &hw = head_w_.empty() ? tgt_.lm[c] : head_w_[c];
-      lm_gemm(q, rb, cd.hout, hw, cd.logits);
-      k::df_topk(q, cd.logits, hw.n, rb, hw.n, static_cast<int>(c) * hw.n, cd.topk_scratch, C > 1 ? &cd.tw : nullptr, cd.keys);
+      if (compact) k::df_pack_draft_rows(q, ns, block_rows, H, cd.hout, cd.xn);
+      lm_gemm(q, head_rows, compact ? cd.xn : cd.hout, hw, cd.logits);
+      k::df_topk(q, cd.logits, hw.n, head_rows, hw.n, static_cast<int>(c) * hw.n, cd.topk_scratch, C > 1 ? &cd.tw : nullptr, cd.keys);
     }
     // card 0 selects only after both cards' merges are queued: a device-to-host copy can block the submitting thread
     // until its queue drains, and card 0's merge waits on card 1's list (a 1 s mailbox timeout per pass)
@@ -873,22 +878,62 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
       else
         k::ds_select(q, ns, block_rows, cd.keys, cd.bpacked, cd.tsv, cd.tg, cd.bbias, tail, sub_k_, sub_s0_, cd.drafts, cd.noise);
     } else {
-      k::dense_gemm(q, rb, cd.hout, cd.sel, cd.hp);
+      k::dense_gemm(q, head_rows, compact ? cd.xn : cd.hout, cd.sel, cd.hp);
       q.memcpy(cd.anchors, anc, static_cast<size_t>(ns) * 4);
       if (tree > 0)  // the best-first tree (its words in the drafts' buffers)
         k::df_tree(q, ns, block_rows, cd.keys, cd.hp, cfg_.sel_rank, cd.pred_cb, cd.succ_cb, cd.anchors, sub_k_, sub_s0_, tree, static_cast<float>(opt_.tree_cut), cd.drafts,
                    static_cast<float>(1.0 / (opt_.tree_temp > 0 ? opt_.tree_temp : 1.0)));  // DFlash 2's auto 1
-      else
-        k::df_select(q, ns, block_rows, cd.keys, cd.hp, cfg_.sel_rank, cd.pred_cb, cd.succ_cb, cd.anchors, sub_k_, sub_s0_, cd.drafts, cd.noise);
+      else {
+        if (const char *d = std::getenv("XEN_CHAIN_TRACE"); d && *d == '1')
+          std::fprintf(stderr, "DFSEL card 0 ns %d block_rows %d rb %d keys %p drafts %p\n", ns, block_rows, rb,
+                       static_cast<void *>(cd.keys), static_cast<void *>(cd.drafts));
+        k::df_select(q, ns, block_rows, cd.keys, cd.hp, cfg_.sel_rank, cd.pred_cb, cd.succ_cb, cd.anchors, sub_k_, sub_s0_, cd.drafts, cd.noise, compact);
+      }
     }
     q.memcpy(host_ + kDraftOff, cd.drafts, static_cast<size_t>(tree > 0 ? ns * k::kDfTreeInts : ns * (block_rows - 1)) * 4);
-    q.memcpy(host_ + kKeysOff, cd.keys, static_cast<size_t>(rb) * k::kDfTopK * 8);  // the drafts' confidences
+    if (!compact) q.memcpy(host_ + kKeysOff, cd.keys, static_cast<size_t>(rb) * k::kDfTopK * 8);  // the drafts' confidences
+    if (const char *d = std::getenv("XEN_CHAIN_TRACE"); d && *d == '1') {
+      const uint64_t *kk = reinterpret_cast<const uint64_t *>(host_ + kKeysOff);
+      std::fprintf(stderr, "DFPOST drafts %d %d %d %d | keys %016llx %016llx %016llx %016llx | kind %d tree %d block_rows %d rb %d sub_k %d sub_s0 %d\n",
+                   host_[kDraftOff], host_[kDraftOff + 1], host_[kDraftOff + 2], host_[kDraftOff + 3], static_cast<unsigned long long>(kk[0]),
+                   static_cast<unsigned long long>(kk[1]), static_cast<unsigned long long>(kk[2]), static_cast<unsigned long long>(kk[3]),
+                   static_cast<int>(cfg_.kind), tree, block_rows, rb, sub_k_, sub_s0_);
+    }
   }
   mark(9);
 }
 
 std::vector<std::vector<int32_t>> DFlash::pass(const std::vector<Seg> &segs, int ctx_rows, int block_rows, int ctx_row0, int step_seqs) {
+  if (const char *e = std::getenv("XEN_DRAFT_TRACE"); e && *e == '1')
+    std::fprintf(stderr, "dflash pass: segs %zu ctx_rows %d block_rows %d ctx_row0 %d step_seqs %d\n", segs.size(), ctx_rows, block_rows, ctx_row0,
+                 step_seqs);
   const int ns = static_cast<int>(segs.size());
+  if (const char *d = std::getenv("XEN_PASSDUMP"); d && *d == '1') {
+    static bool allocs_done = false;
+    if (!allocs_done) {
+      allocs_done = true;
+      std::fprintf(stderr, "PASSALLOC host_=%p rows_=%d cap_=%d fcols_=%d ctx_defer=%d cards=%zu\\n", static_cast<void *>(host_), rows_, static_cast<int>(cap_), fcols_,
+                   opt_.ctx_defer, cards_.size());
+      for (size_t c = 0; c < cards_.size(); ++c) {
+        const Card &cd = cards_[c];
+        std::fprintf(stderr,
+                     "PASSALLOC card %zu feat_step=%p backlog=%p keys=%p drafts=%p rec=%p hp=%p hout=%p fl_part=%p fl_t=%p fl_tn=%p fl_rec=%p hnorm=%p\\n", c,
+                     static_cast<const void *>(cd.feat_step), static_cast<const void *>(cd.backlog), static_cast<const void *>(cd.keys),
+                     static_cast<const void *>(cd.drafts), static_cast<const void *>(cd.rec), static_cast<const void *>(cd.hp),
+                     static_cast<const void *>(cd.hout), static_cast<const void *>(cd.fl_part), static_cast<const void *>(cd.fl_t),
+                     static_cast<const void *>(cd.fl_tn), static_cast<const void *>(cd.fl_rec), static_cast<const void *>(cd.hnorm));
+      }
+    }
+    for (int i = 0; i < ns; ++i) {
+      const Seg &g = segs[static_cast<size_t>(i)];
+      const int64_t pend_p0 = (!pend_.empty() && g.slot >= 0 && g.slot < opt_.slots) ? pend_[static_cast<size_t>(g.slot)].p0 : -1;
+      const int pend_n = (!pend_.empty() && g.slot >= 0 && g.slot < opt_.slots) ? pend_[static_cast<size_t>(g.slot)].n : -1;
+      std::fprintf(stderr,
+                   "PASSGEOM slot %d start %lld ctx_p0 %lld anchor %d | ctx_rows %d ctx_row0 %d block_rows %d | pend p0 %lld n %d | ring par %d fl_par %d rows_ %d cap_ %d\\n",
+                   g.slot, static_cast<long long>(g.start), static_cast<long long>(g.ctx_p0), g.anchor, ctx_rows, ctx_row0, block_rows,
+                   static_cast<long long>(pend_p0), pend_n, par_, fl_par_, rows_, static_cast<int>(cap_));
+    }
+  }
   if (ns < 1 || ns > k::kMaxSegs || ctx_rows < 0 || block_rows < 0 || block_rows == 1 || ctx_row0 < 0 || ctx_row0 + ns * ctx_rows > rows_ || ns * block_rows > rows_ ||
       block_rows > cfg_.block || (ctx_rows == 0 && block_rows == 0))
     throw std::invalid_argument("dflash: pass segments / rows");

@@ -116,13 +116,16 @@ inline int64_t df_key_index(uint64_t key) { return static_cast<int64_t>(0xFFFFFF
 void df_topk_ref(const float *row, int n, int col_base, uint64_t *keys);
 uint64_t df_key(float logit, int64_t index);
 
+// Copy only the draft rows of each block, skipping the anchor row.
+sycl::event df_pack_draft_rows(sycl::queue &q, int segs, int block, int hidden, const df_bf16 *src, df_bf16 *dst);
+
 // Selector over the rows of `segs` segments of seg_rows rows: keys [rows][16] (best first), hp fp32 [rows][rank] (the hidden
 // projection; rounded to bf16 on use), codebooks bf16 [vocab][rank], anchors int32 [segs]; candidate index -> token =
 // v < sub_k ? v : v - sub_k + sub_s0 (sub_k 0: identity). drafts int32 [segs][seg_rows - 1].
 // noise (optional, device [segs]): segment i's record (key, the output position of its first draft, 1 / T);
 // inv_t 0 or a null table = the argmax pick, bit for bit.
 sycl::event df_select(sycl::queue &q, int segs, int seg_rows, const uint64_t *keys, const float *hp, int rank, const df_bf16 *pred_cb, const df_bf16 *succ_cb,
-                      const int32_t *anchors, int sub_k, int sub_s0, int32_t *drafts, const DraftNoiseRec *noise = nullptr);
+                      const int32_t *anchors, int sub_k, int sub_s0, int32_t *drafts, const DraftNoiseRec *noise = nullptr, bool compact = false);
 void df_select_ref(int seg_rows, const uint64_t *keys, const float *hp, int rank, const uint16_t *pred_cb, const uint16_t *succ_cb, int32_t anchor, int sub_k,
                    int sub_s0, int32_t *drafts, const DraftNoiseRec *noise = nullptr);
 
