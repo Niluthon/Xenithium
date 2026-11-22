@@ -129,7 +129,7 @@ struct PairRowsWire {
   uint32_t *peer_inbox = nullptr;
   uint32_t *error = nullptr;
   int rows_max = 0, n_max = 0;
-  uint64_t wait_cycles = 11200000000ull;  // >= 4 s at 2.8 GHz
+  uint64_t wait_cycles = 2800000000ull;  // 1 s at 2.8 GHz: the ring must fail loudly, not reach the 5 s xe job timeout
   bool split = false;  // see pair_reduce_rows
   const PairSplitSend *send = nullptr;  // (split only): see PairSplitSend
   // the bf16 wire (bf16(own) sent packed, bf16(own) + bf16(peer) summed in fp32), as
@@ -178,7 +178,7 @@ struct PairSplit {
   // stalls the compute queue behind the copy.
   const uint32_t *seq_tab = nullptr;
   int rows_max = 0, n_max = 0;
-  uint64_t wait_cycles = 11200000000ull;
+  uint64_t wait_cycles = 2800000000ull;
   // Diagnostic: null, or 4 words per split sum for the waits' own spans, as
   // GT-clock cycles (rdtsc): [0, 1] the wait for the peer's partial (entry, exit), [2, 3] the wait for
   // the peer's rows (pair_split_wait). Written by the wait kernels themselves: no events, no barriers.
