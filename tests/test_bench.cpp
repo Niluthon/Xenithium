@@ -474,9 +474,12 @@ void test_html() {
     const std::string user = pw->pw_name;
     b::Run leak = sample_run(200);
     leak.info.host = user;
-    leak.info.notes.push_back({"XEN_DRAFTER_MODEL", "/some/where/" + user + "/drafter"});
+    leak.info.notes.push_back({"XEN_DRAFTER_MODEL", "/some/where/login=" + user + "/drafter"});
     std::string masked = b::render_html(leak);
-    CHECK(masked.find(user) == std::string::npos && masked.find("$USER/drafter") != std::string::npos, "html: the login name is masked to $USER wherever it stands as its own word");
+    CHECK(masked.find("<dt>measured from</dt><dd>$USER</dd>") != std::string::npos &&
+              masked.find("/some/where/login=$USER/drafter") != std::string::npos &&
+              masked.find("/some/where/login=" + user + "/drafter") == std::string::npos,
+          "html: the login name is masked to $USER in the reported host and drafter path");
     if (const char *home = std::getenv("HOME"); home && std::strlen(home) > 1) {
       leak.info.notes.push_back({"XEN_MODEL", std::string(home) + "/models/qwen"});
       masked = b::render_html(leak);
