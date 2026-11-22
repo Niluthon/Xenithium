@@ -64,8 +64,10 @@ static void test_quad(const xenithium::l0::Loader &loader, bool copy = false) {
   for (int c = 0; c < kC; ++c) {
     auto &q = f.compute(c);
     part[c] = static_cast<float *>(f.alloc(c, size_t(kRowsMax) * kNMax * 4));
-    out[c] = static_cast<bf16 *>(f.alloc(c, size_t(kRowsMax) * kNMax * 2));
-    if (copy && std::getenv("XEN_Q38_COPY_DIRECT_OUT")) copy_buffers.outputs[c] = out[c];
+    const bool direct_out = copy && std::getenv("XEN_Q38_COPY_DIRECT_OUT");
+    const size_t output_bytes = size_t(kRowsMax) * kNMax * sizeof(bf16);
+    out[c] = static_cast<bf16 *>(direct_out ? f.alloc_mailbox(c, output_bytes) : f.alloc(c, output_bytes));
+    if (direct_out) copy_buffers.outputs[c] = out[c];
     err[c] = static_cast<uint32_t *>(f.alloc(c, 4096));
     q.memset(err[c], 0, 64).wait();
     dq.inbox[c] = static_cast<uint32_t *>(f.alloc_kernel_mailbox(words * sizeof(uint32_t)));

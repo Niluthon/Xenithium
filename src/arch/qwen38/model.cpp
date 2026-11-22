@@ -231,13 +231,15 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
   const k::QsaYarn yarn = k::qsa_yarn_for(cap_, cfg_.max_positions);
   yarn_factor_ = yarn.factor;
   const auto rope_h = k::qsa_rope_table(cap_, k::kQsaRot, cfg_.rope_theta, yarn);
+  const bool copy_wire = nc_ == kMaxCards && util::env_flag("XEN_Q38_COPY_WIRE");
+  const bool direct_out = copy_wire && util::env_flag("XEN_Q38_COPY_DIRECT_OUT");
   for (int c = 0; c < nc_; ++c) {
     auto card = std::make_unique<Card>();
     Card &K = *card;
     auto &q = fab.compute(c);
-    auto dev = [&](size_t bytes) {
+    auto dev = [&](size_t bytes, bool peer_copy = false) {
       bytes = std::max<size_t>(bytes, 64);
-      void *ptr = fab.alloc(c, bytes);
+      void *ptr = peer_copy ? fab.alloc_mailbox(c, bytes) : fab.alloc(c, bytes);
       q.memset(ptr, 0, bytes);
       K.mem.push_back(ptr);
       return ptr;
@@ -249,9 +251,9 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
     if (std::getenv("XEN_Q38_VERIFY_NAN"))
       K.nanwatch = static_cast<unsigned *>(dev(static_cast<size_t>(1 + (cfg_.layers + 7) / 8) * sizeof(unsigned)));
     K.xa = static_cast<bf16 *>(dev(act));
-    K.ya = static_cast<bf16 *>(dev(act));
+    K.ya = static_cast<bf16 *>(dev(act, direct_out));
     K.xm = static_cast<bf16 *>(dev(act));
-    K.ym = static_cast<bf16 *>(dev(act));
+    K.ym = static_cast<bf16 *>(dev(act, direct_out));
     K.seg = static_cast<int32_t *>(dev(sizeof(seg_words_)));
     K.rope = static_cast<bf16 *>(dev(rope_h.size() * 2));
     q.memcpy(K.rope, rope_h.data(), rope_h.size() * 2);
@@ -590,10 +592,10 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
       for (int d = 0; d < nc_; ++d) cards_[static_cast<size_t>(c)]->pf.sel[j].flags_of[d] = cards_[static_cast<size_t>(d)]->pf.sel[j].flags;
   if (nc_ == kMaxCards) {  // the four-card wires (TP4): every card's inbox in each, by the host
     k::WireQuad dq, mq, rq, mrq;  // decode pair / decode MoE / rows pair / rows MoE inboxes
-    if (util::env_flag("XEN_Q38_COPY_WIRE")) {
+    if (copy_wire) {
       fab.alloc_step_copy(attention_copy_, step_cap_, H, false, cards_[0]->mem);
       fab.alloc_step_copy(moe_copy_, step_cap_, H, true, cards_[0]->mem);
-      if (util::env_flag("XEN_Q38_COPY_DIRECT_OUT")) {
+      if (direct_out) {
         for (int c = 0; c < nc_; ++c) {
           attention_copy_.outputs[c] = cards_[static_cast<size_t>(c)]->ya;
           moe_copy_.outputs[c] = cards_[static_cast<size_t>(c)]->ym;
