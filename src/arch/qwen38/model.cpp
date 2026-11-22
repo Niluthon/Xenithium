@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <thread>
 #include <filesystem>
 #include <future>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -17,6 +19,7 @@
 
 #include "xenithium/util/env.hpp"
 #include "xenithium/kernels/comm/wire.hpp"
+#include "xenithium/kernels/drafter/dflash.hpp"
 #include "xenithium/kernels/residual/hc.hpp"
 #include "xenithium/kernels/head/logprob.hpp"
 #include "xenithium/kernels/pack.hpp"
@@ -243,6 +246,8 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
     // rows past a step's live rows stay finite.
     const size_t R8 = static_cast<size_t>(Head::kRows);  // a step's rows (Head::kRows)
     const size_t act = R8 * H * 2;
+    if (std::getenv("XEN_Q38_VERIFY_NAN"))
+      K.nanwatch = static_cast<unsigned *>(dev(static_cast<size_t>(1 + (cfg_.layers + 7) / 8) * sizeof(unsigned)));
     K.xa = static_cast<bf16 *>(dev(act));
     K.ya = static_cast<bf16 *>(dev(act));
     K.xm = static_cast<bf16 *>(dev(act));
@@ -1407,6 +1412,27 @@ void Model::verify_batch(const std::vector<SeqRows> &segs) {
     }
   }
   head_->wait();
+  if (cards_[0]->nanwatch) {
+    const char *names[] = {"attention input", "attention output", "MoE input", "MoE output"};
+    std::vector<unsigned> bits(static_cast<size_t>(1 + (cfg_.layers + 7) / 8));
+    static int reports = 0;
+    for (int c = 0; c < nc_ && reports < 32; ++c) {
+      const Card &K = *cards_[static_cast<size_t>(c)];
+      fab_.compute(c).memcpy(bits.data(), K.nanwatch, bits.size() * sizeof(unsigned)).wait_and_throw();
+      for (int l = 0; l < cfg_.layers; ++l) {
+        const unsigned stages = (bits[static_cast<size_t>(l / 8)] >> (4 * (l % 8))) & 15u;
+        if (!stages) continue;
+        uint32_t errors[2] = {};
+        fab_.compute(c).memcpy(errors, K.pw.error, sizeof(uint32_t)).wait_and_throw();
+        fab_.compute(c).memcpy(errors + 1, K.mw.error, sizeof(uint32_t)).wait_and_throw();
+        std::fprintf(stderr, "Q38NAN card %d rows %d layer %d %s (%s) attention wire %u MoE wire %u owner %d GDN0 local 0x%x\n",
+                     c, rows, l, names[std::countr_zero(stages)], cfg_.full_attention[l] ? "QSA" : "GDN",
+                     errors[0], errors[1], dec_by_owner(rows), bits.back());
+        ++reports;
+        break;
+      }
+    }
+  }
   for (int c = 0; c < nc_; ++c)
     if (__atomic_load_n(&ple_words_[32 + 16 * c], __ATOMIC_ACQUIRE) != 0u)
       throw std::runtime_error("qwen38 model: card " + std::to_string(c) + " timed out waiting for the step's PLE rows");
@@ -1555,6 +1581,17 @@ void Model::submit_step(int rows, int seg_key, int bound) {
   // tree rows (QSA / PLE / GDN tree instances); a replay of an accepted path (the GDN tree core)
   const bool tree = seg_key_tree(seg_key), gdn_tree = tree || seg_key_replay(seg_key);
   const bool by_owner = dec_by_owner(rows);  // the owner sums' wires (the mixers: dec_mixer)
+  const bool watch = cards_[0]->nanwatch != nullptr;
+  const auto trace = [&](int c, int l, int stage, const bf16 *out, bool owner_only) {
+    if (!watch) return;
+    const auto span = owner_only && by_owner ? k::owner_rows(c, rows) : k::RowRange{0, rows};
+    const int H = cfg_.hidden;
+    k::df_nanwatch(fab_.compute(c), span.rows() * H, out + static_cast<size_t>(span.lo) * H,
+                   cards_[static_cast<size_t>(c)]->nanwatch + l / 8, 1u << (4 * (l % 8) + stage));
+  };
+  if (watch)
+    for (int c = 0; c < nc_; ++c)
+      fab_.compute(c).memset(cards_[static_cast<size_t>(c)]->nanwatch, 0, static_cast<size_t>(1 + (L + 7) / 8) * sizeof(unsigned));
   marks_.clear();
   for (auto &m : dec_marks_) m.clear();
   for (auto &m : dec_nodes_) m.clear();
@@ -1592,6 +1629,7 @@ void Model::submit_step(int rows, int seg_key, int bound) {
       const auto he = dec_mixer(c, rows, {blk, &hs_.attn[c][l], K.xa, &K.own.xa, pair_parity_});
       mark(c, StepProfile::hc, he.norm, he.up);
       dec_stamp(c, StepProfile::hc);
+      trace(c, l, 0, K.xa, false);
       if (dflash_ && df_feat_at_[static_cast<size_t>(l)] >= 0)  // a drafter feature (the mixer combined the block)
         dec_feature(c, rows, df_feat_at_[static_cast<size_t>(l)]);
       const k::PairWire *pair_wire = by_owner ? &K.own.pw : wire_of(K.pw);
@@ -1619,9 +1657,16 @@ void Model::submit_step(int rows, int seg_key, int bound) {
         g.commit = gdn_commit;
         g.tree = gdn_tree, g.tree_S = K.tree_S;
         const auto e = k::gdn_decode(q, gs_.shape_of(c), rows, K.xa, gs_.w[c][l], g, step_parity_, K.gsc, pair_wire, pair_parity_, K.ya);
+        if (watch && l == 0) {
+          auto *flag = K.nanwatch + (L + 7) / 8;
+          k::df_nanwatch(q, rows * gs_.w[c][l].qkvz.n, K.gsc.y, flag, 1u, true);
+          k::df_nanwatch(q, rows * gs_.shape_of(c).val_w(), K.gsc.core, flag, 2u);
+          k::df_nanwatch(q, rows * cfg_.hidden, K.gsc.partial, flag, 4u, true);
+        }
         mark(c, StepProfile::gdn, e.qkvz, e.reduce);
         dec_stamp(c, StepProfile::gdn);
       }
+      trace(c, l, 1, K.ya, true);
     }
     if (gdn_cap_ && !cfg_.full_attention[l]) {  // calibration inputs (both cards submitted: safe to wait)
       const size_t H = static_cast<size_t>(cfg_.hidden), VWc = static_cast<size_t>(gs_.shape_of(0).val_w()), R = static_cast<size_t>(rows);
@@ -1640,6 +1685,7 @@ void Model::submit_step(int rows, int seg_key, int bound) {
       const auto he = dec_mixer(c, rows, {K.ya, &hs_.mlp[c][l], K.xm, &K.own.xm, moe_parity_});
       mark(c, StepProfile::hc, he.norm, he.up);
       dec_stamp(c, StepProfile::hc);
+      trace(c, l, 2, K.xm, false);
       k::MoeWeights w = ms_.w[c][l];
       w.blobs = K.tab + static_cast<size_t>(l) * per;
       k::MoeScratch sc = K.msc;
@@ -1651,6 +1697,7 @@ void Model::submit_step(int rows, int seg_key, int bound) {
                                     cpu_on_ ? &cpu_link_[c] : nullptr);
       mark(c, StepProfile::moe, me.router, me.combine);
       dec_stamp(c, StepProfile::moe);
+      trace(c, l, 3, K.ym, true);
       if (profiling_) moe_ev_[c][static_cast<size_t>(l)] = me;
     }
     moe_parity_ ^= 1;

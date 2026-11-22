@@ -341,6 +341,8 @@ DFlash::DFlash(Fabric &fab, const std::string &dir, const std::string &target_di
     q.memset(cd.h, 0, R * ipc_ * 2);
     q.memset(cd.rec, 0, k::kMaxSegs * k::kSegRec * 4);
     cd.wire.error = static_cast<uint32_t *>(dev(64));
+    cd.nanw = static_cast<unsigned *>(dev(64));
+    q.memset(cd.nanw, 0, 64);
     q.memset(cd.wire.error, 0, 64);
     if (C > 1) {  // TP1: no wire (the sums are the card's own partials, the top-k its own list)
       const size_t tw_words = C == 4 ? k::kDfTopkWireWords4 : k::kDfTopkWireWords;  // two hops at four cards
@@ -661,21 +663,30 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
     for (size_t c = 0; c < C; ++c) fab_.compute(c).wait();
     t_mark = std::chrono::steady_clock::now();
   }
+  const bool watch_input = rb > 0 && std::getenv("XEN_DF_STAGE");
   for (size_t c = 0; c < C; ++c) {
     Card &cd = cards_[c];
     auto &q = fab_.compute(c);
+    if (watch_input) q.memset(cd.nanw, 0, sizeof(unsigned));
     q.memcpy(cd.rec, rec, static_cast<size_t>(ns) * k::kSegRec * 4);
     // DSpine: every card's bridge reads the anchors (before the fc sum: a host copy behind a queued mailbox wait can hold
     // the submitting thread until the peer's 1 s wait gives up, eager / profile passes)
     if (rb > 0 && cfg_.kind == DFlashConfig::Kind::dspine) q.memcpy(cd.anchors, anc, static_cast<size_t>(ns) * 4);
     if (rc > 0) {
-      k::dense_gemm(q, rc, cd.feat_step + static_cast<size_t>(ctx_row0) * fcols_, cd.fc, cd.part);
+      const bf16 *features = cd.feat_step + static_cast<size_t>(ctx_row0) * fcols_;
+      if (watch_input) k::df_nanwatch(q, rc * fcols_, features, cd.nanw, 1u << 13);
+      k::dense_gemm(q, rc, features, cd.fc, cd.part);
       k::pair_reduce(q, rc, H, cd.part, wire_of(cd), pc, cd.t);
+      if (watch_input) k::df_nanwatch(q, rc * H, cd.t, cd.nanw, 1u << 14);
       k::rms_norm_plain(q, rc, H, cd.t, nullptr, cd.hnorm, eps, cd.tn);
     }
     if (rb > 0) {
       if (tgt_.gather) tgt_.gather(q, static_cast<int>(c), ids, rb, cd.res);  // the target's own gather (arch flint)
       else k::embed_gather(q, tgt_.embed[c], ids, rb, H, 1, cd.res);
+      if (watch_input) {
+        k::df_nanwatch(q, H, cd.res, cd.nanw, 1u << 0);
+        if (block_rows > 1) k::df_nanwatch(q, (block_rows - 1) * H, cd.res + H, cd.nanw, 1u << 9);
+      }
     }
   }
   mark(0);
@@ -743,33 +754,57 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
       k::dense_gemm(q, rb, cd.xn, ly.aproj, cd.dyn);
       k::df_conv(q, rb, block_rows, H, cfg_.conv_group, cd.xn, cd.dyn, pn, 0, ly.abase, cd.xc);
     });
+    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+      for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].xn, cards_[wc].nanw, 1u << 1);
+      for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].xc, cards_[wc].nanw, 1u << 3);
+    }
     each(3, [&](Card &cd, const Layer &ly, sycl::queue &q) {
       lm_gemm(q, rb, cd.xc, ly.q, cd.yq);
       k::dense_gemm(q, rb, cd.xc, ly.kv, cd.ykv_b);
     });
     each(4, [&](Card &cd, const Layer &ly, sycl::queue &q) {
       k::df_prep(q, rb, block_rows, cd.rec, hq_, hkv_, cd.yq, cd.ykv_b, ly.qn, ly.kn, eps, k::DfRope{cd.cos, cd.sin, rope.positions}, cd.qb, cd.kb, cd.vb, ly.ring);
+      if (std::getenv("XEN_DF_STAGE") && l == 0) {
+        k::df_nanwatch(q, rb * hq_ * k::kDfDim, cd.qb, cd.nanw, 1u << 10);
+        k::df_nanwatch(q, rb * hkv_ * k::kDfDim, cd.kb, cd.nanw, 1u << 11);
+        k::df_nanwatch(q, rb * hkv_ * k::kDfDim, cd.vb, cd.nanw, 1u << 12);
+      }
       k::df_attn(q, rb, block_rows, cd.rec, hq_, hkv_, cd.qb, cd.kb, cd.vb, ly.ring, cfg_.window, cd.apart, cd.attn);
     });
+    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+      for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * hq_ * k::kDfDim, cards_[wc].attn, cards_[wc].nanw, 1u << 4);
+    }
     each(5, [&](Card &cd, const Layer &ly, sycl::queue &q) {
       lm_gemm(q, rb, cd.attn, ly.o, cd.part);
       k::pair_reduce(q, rb, H, cd.part, wire_of(cd), pa, cd.mix);
       k::df_conv(q, rb, block_rows, H, cfg_.conv_group, cd.mix, cd.dyn, pn, 1, ly.abase + 2 * H, cd.xc);
     });
+    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+      for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].mix, cards_[wc].nanw, 1u << 5);
+    }
     // MLP sublayer
     each(6, [&](Card &cd, const Layer &ly, sycl::queue &q) {
       k::rms_norm_plain(q, rb, H, cd.res, cd.xc, ly.post_ln, eps, cd.xn);
       k::dense_gemm(q, rb, cd.xn, ly.mproj, cd.dyn);
       k::df_conv(q, rb, block_rows, H, cfg_.conv_group, cd.xn, cd.dyn, pn, 0, ly.mbase, cd.xc);
     });
+    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+      for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].xn, cards_[wc].nanw, 1u << 6);
+    }
     each(7, [&](Card &cd, const Layer &ly, sycl::queue &q) {
       gate_up(q, rb, cd.xc, ly, cd);
     });
+    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+      for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].h, cards_[wc].nanw, 1u << 7);
+    }
     each(8, [&](Card &cd, const Layer &ly, sycl::queue &q) {
       lm_gemm(q, rb, cd.h, ly.down, cd.part);
       k::pair_reduce(q, rb, H, cd.part, wire_of(cd), pm, cd.mix);
       k::df_conv(q, rb, block_rows, H, cfg_.conv_group, cd.mix, cd.dyn, pn, 1, ly.mbase + 2 * H, cd.mlp);
     });
+    if (std::getenv("XEN_DF_STAGE") && rb > 0 && l == 0) {
+      for (size_t wc = 0; wc < C; ++wc) k::df_nanwatch(fab_.compute(wc), rb * H, cards_[wc].mlp, cards_[wc].nanw, 1u << 8);
+    }
   }
   if (rb > 0) {
     for (size_t c = 0; c < C; ++c) {
@@ -885,7 +920,92 @@ std::vector<std::vector<int32_t>> DFlash::pass(const std::vector<Seg> &segs, int
     par_ = it->second.end_par;
   }
   for (size_t c = 0; c < C; ++c) fab_.compute(c).wait_and_throw();
+  if (const char *d = std::getenv("XEN_CHAIN_TRACE"); d && *d == '1' && rb > 0 && block_rows >= 2) {
+    // the same device buffer into a second landing zone: distinguishes an empty device buffer from a copy that
+    // never reached host_
+    static std::vector<int32_t> probe;
+    const size_t cnt = static_cast<size_t>(ns) * static_cast<size_t>(block_rows - 1);
+    probe.assign(cnt, -12345);
+    // the tail inputs: hp (selector hidden) and logits, is this pass writing them at all?
+    {
+      static std::vector<float> hpp, lgp;
+      static int in_prints = 0;
+      const char *limit = std::getenv("XEN_DF_TRACE_PASSES");
+      if (in_prints < (limit ? std::max(0, std::atoi(limit)) : 6)) {
+        ++in_prints;
+        const size_t hpn = static_cast<size_t>(ns) * static_cast<size_t>(block_rows) * static_cast<size_t>(cfg_.sel_rank);
+        hpp.assign(hpn, -99.f);
+        lgp.assign(32, -99.f);
+        fab_.compute(0).memcpy(hpp.data(), cards_[0].hp, hpn * sizeof(float)).wait();
+        fab_.compute(0).memcpy(lgp.data(), cards_[0].logits, lgp.size() * sizeof(float)).wait();
+        size_t hz = 0, hnan = 0;
+        for (float v : hpp) { if (v == 0.f) ++hz; if (!(v == v)) ++hnan; }
+        {
+          if (std::getenv("XEN_DF_STAGE") && !tgt_.gather) {
+            for (const int32_t token : {ids[0], ids[1]}) {
+              const auto *row = tgt_.embed[0] + static_cast<size_t>(token) * cfg_.hidden;
+              int nonfinite = 0;
+              for (int col = 0; col < cfg_.hidden; ++col)
+                nonfinite += !std::isfinite(static_cast<float>(row[col]));
+              uint16_t bits[4];
+              std::memcpy(bits, row, sizeof(bits));
+              std::fprintf(stderr, "DFTABLE token %d nonfinite %d bits %04x %04x %04x %04x\n",
+                           token, nonfinite, bits[0], bits[1], bits[2], bits[3]);
+            }
+          }
+          if (std::getenv("XEN_DF_STAGE")) {
+            const Seg &seg = segs.front();
+            const size_t width = static_cast<size_t>(hkv_) * k::kDfDim;
+            for (size_t c = 0; c < C; ++c) {
+              const auto &ring = cards_[c].layers.front().ring;
+              std::vector<uint16_t> vals(static_cast<size_t>(ring_) * width);
+              for (const auto *ptr : {ring.k, ring.v}) {
+                fab_.compute(c).memcpy(vals.data(), ptr + static_cast<size_t>(seg.slot) * vals.size(),
+                                      vals.size() * sizeof(uint16_t)).wait();
+                int first = -1, last = -1, bad = 0;
+                for (int64_t pos = std::max<int64_t>(0, seg.start - cfg_.window); pos < seg.start; ++pos) {
+                  const auto at = vals.begin() + static_cast<size_t>(pos % ring_) * width;
+                  if (std::any_of(at, at + width, [](uint16_t v) { return (v & 0x7f80u) == 0x7f80u; })) {
+                    if (first < 0) first = static_cast<int>(pos);
+                    last = static_cast<int>(pos);
+                    ++bad;
+                  }
+                }
+                std::fprintf(stderr, "DFRING card %zu %s start %lld bad_rows %d first %d last %d\n", c,
+                             ptr == ring.k ? "key" : "value", static_cast<long long>(seg.start), bad, first, last);
+              }
+            }
+          }
+          unsigned nw[8] = {0,0,0,0,0,0,0,0};
+          for (size_t c = 0; c < C; ++c) fab_.compute(c).memcpy(&nw[c], cards_[c].nanw, sizeof(unsigned)).wait();
+          std::fprintf(stderr, "DFNANW card bits %08x %08x %08x %08x\n", nw[0], nw[1], nw[2], nw[3]);
+          if (rb > 0 && ns > 0) std::fprintf(stderr, "DFIDS block anchor %d mask %lld rows %d (vocab %lld)\n", ids[0], static_cast<long long>(cfg_.mask_id), block_rows, static_cast<long long>(tgt_.vocab));
+        }
+        {
+          static std::vector<uint16_t> fb, rb_, hb;
+          fb.assign(8, 0), rb_.assign(8, 0), hb.assign(8, 0);
+          fab_.compute(0).memcpy(fb.data(), cards_[0].feat_step, 8 * sizeof(uint16_t)).wait();
+          fab_.compute(0).memcpy(rb_.data(), cards_[0].res, 8 * sizeof(uint16_t)).wait();
+          fab_.compute(0).memcpy(hb.data(), cards_[0].hout, 8 * sizeof(uint16_t)).wait();
+          std::fprintf(stderr, "DFSRC feat_step %04x %04x %04x %04x | res %04x %04x %04x %04x | hout %04x %04x %04x %04x\n",
+                       fb[0], fb[1], fb[2], fb[3], rb_[0], rb_[1], rb_[2], rb_[3], hb[0], hb[1], hb[2], hb[3]);
+        }
+        std::fprintf(stderr, "DFIN hp %.4g %.4g %.4g %.4g rank %d n %zu zeros %zu nan %zu | logits %.4g %.4g %.4g %.4g\n",
+                     static_cast<double>(hpp[0]), static_cast<double>(hpp[1]), static_cast<double>(hpp[2]), static_cast<double>(hpp[3]),
+                     cfg_.sel_rank, hpn, hz, hnan, static_cast<double>(lgp[0]), static_cast<double>(lgp[1]),
+                     static_cast<double>(lgp[2]), static_cast<double>(lgp[3]));
+      }
+    }
+    fab_.compute(0).memcpy(probe.data(), cards_[0].drafts, cnt * sizeof(int32_t)).wait();
+    std::fprintf(stderr, "DFPROBE device %d %d %d | host_ %d %d %d | ns %d block_rows %d\n", probe[0], cnt > 1 ? probe[1] : -1,
+                 cnt > 2 ? probe[2] : -1, host_[kDraftOff], host_[kDraftOff + 1], host_[kDraftOff + 2], ns, block_rows);
+  }
+  if (const char *d = std::getenv("XEN_CHAIN_TRACE"); d && *d == '1' && rb > 0)
+    std::fprintf(stderr, "DFIDS host_drafts %d %d %d %d\n", host_[kDraftOff], host_[kDraftOff + 1], host_[kDraftOff + 2], host_[kDraftOff + 3]);
   std::vector<std::vector<int32_t>> out(static_cast<size_t>(ns));
+  if (const char *e = std::getenv("XEN_DRAFT_TRACE"); e && *e == '1' && rb > 0)
+    std::fprintf(stderr, "dflash verify shape: ns %d block_rows %d tree %d rb %d | kTreeRows %d kDfTopK %d kStepRows16 %d\n", ns, block_rows, tree, rb,
+                 k::kTreeRows, k::kDfTopK, k::kStepRows16);
   if (rb > 0 && tree > 0) {  // the tree's nodes (join order) as verify rows (preorder), per segment
     for (int s = 0; s < ns; ++s) {
       const int32_t *w = host_ + kDraftOff + s * k::kDfTreeInts;

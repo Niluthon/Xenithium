@@ -990,3 +990,21 @@ sycl::event df_rec_set(sycl::queue &q, int32_t *rec, int64_t ctx_p0, int slot) {
 }
 
 }  // namespace xenithium::kernels
+
+namespace xenithium::kernels {
+// XEN_DF_STAGE witness: set bit `bit` in *flag if any of the n halves is non-finite
+sycl::event df_nanwatch(sycl::queue &q, int n, const void *p, unsigned *flag, unsigned bit, bool fp32) {
+  const auto *h = static_cast<const uint16_t *>(p);
+  const auto *f = static_cast<const uint32_t *>(p);
+  return q.parallel_for<class DfNanWatch>(sycl::range<1>(256), [=](sycl::id<1> i) {
+    for (int k = static_cast<int>(i[0]); k < n; k += 256) {
+      const uint32_t magnitude = fp32 ? f[k] & 0x7fffffffu : h[k] & 0x7fffu;
+      if (magnitude >= (fp32 ? 0x7f800000u : 0x7f80u)) {
+        sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device>(*flag).fetch_or(bit);
+        return;
+      }
+    }
+  });
+}
+
+}  // namespace xenithium::kernels

@@ -251,6 +251,7 @@ class DFlash {
     bf16 *cos = nullptr, *sin = nullptr;
     void *topk_scratch = nullptr;
     uint64_t *keys = nullptr;
+    unsigned *nanw = nullptr;  // XEN_DF_STAGE witness: bit s set = stage s went non-finite
     int32_t *rec = nullptr, *pf_rec = nullptr, *anchors = nullptr, *drafts = nullptr;
     kernels::DraftNoiseRec *noise = nullptr;  // card 0's selector: the segments' noise records
     const bf16 *pred_cb = nullptr, *succ_cb = nullptr;  // card 0

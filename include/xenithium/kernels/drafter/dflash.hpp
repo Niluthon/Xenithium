@@ -152,4 +152,6 @@ sycl::event df_rows_gather(sycl::queue &q, int n, int cols, const df_bf16 *src, 
 // rec[0 .. kSegRec) = a context-only record (kDfRecCtx = ctx_p0, kDfRecSlot = slot, the rest 0), from kernel arguments.
 sycl::event df_rec_set(sycl::queue &q, int32_t *rec, int64_t ctx_p0, int slot);
 
+// XEN_DF_STAGE witness
+sycl::event df_nanwatch(sycl::queue &q, int n, const void *p, unsigned *flag, unsigned bit, bool fp32 = false);
 }  // namespace xenithium::kernels

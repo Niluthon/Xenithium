@@ -36,6 +36,7 @@ struct GraphRecordError : std::runtime_error {
 struct Model::Card {
   using bf16 = sycl::ext::oneapi::bfloat16;
   bf16 *xa = nullptr, *ya = nullptr, *xm = nullptr, *ym = nullptr;  // [4][hidden]: mixer outputs, block outputs
+  unsigned *nanwatch = nullptr;
   int32_t *seg = nullptr;                                           // the step's segment records [kMaxSegs][kSegRec]
   bf16 *rope = nullptr;                                             // [capacity][64]
   kernels::PairWire pw;                                             // GDN / QSA two-card sums
