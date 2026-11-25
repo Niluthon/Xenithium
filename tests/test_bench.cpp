@@ -534,9 +534,20 @@ void test_html() {
     const std::string user = pw->pw_name;
     b::Run leak = sample_run(200);
     leak.info.host = user;
-    leak.info.notes.push_back({"XEN_DRAFTER_MODEL", "/some/where/" + user + "/drafter"});
+    leak.info.notes.push_back({"XEN_DRAFTER_MODEL", user + "/drafter"});  // relative: as root, "/root" would be the home directory
     std::string masked = b::render_html(leak);
-    CHECK(masked.find(user) == std::string::npos && masked.find("$USER/drafter") != std::string::npos, "html: the login name is masked to $USER wherever it stands as its own word");
+    // the page's own stylesheet and script may hold the name as a word (`root`: `:root{...}`), so compare with the same
+    // page rendered without the name anywhere in the run
+    auto hits = [&](const std::string &s) {
+      size_t n = 0;
+      for (size_t at = s.find(user); at != std::string::npos; at = s.find(user, at + user.size())) ++n;
+      return n;
+    };
+    b::Run clean = sample_run(200);
+    clean.info.host = "host";
+    clean.info.notes.push_back({"XEN_DRAFTER_MODEL", "someone/drafter"});
+    CHECK(hits(masked) == hits(b::render_html(clean)) && masked.find("$USER/drafter") != std::string::npos,
+          "html: the login name is masked to $USER wherever it stands as its own word");
     if (const char *home = std::getenv("HOME"); home && std::strlen(home) > 1) {
       leak.info.notes.push_back({"XEN_MODEL", std::string(home) + "/models/qwen"});
       masked = b::render_html(leak);
