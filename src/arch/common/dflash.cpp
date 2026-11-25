@@ -52,7 +52,7 @@ bool DFlashConfig::is_dflash(const std::string &dir) {
   try {
     const auto mc = ModelConfig::load(dir);
     for (const auto &a : mc.architectures())
-      if (a == "DFlash2DraftModel" || a == "DFlashDraftModel") return true;
+      if (a == "DFlash2DraftModel" || a == "DFlashDraftModel" || a == "DSpineDraftModel") return true;
   } catch (const std::exception &) {
   }
   return false;
@@ -61,8 +61,8 @@ bool DFlashConfig::is_dflash(const std::string &dir) {
 DFlashConfig DFlashConfig::load(const std::string &dir, int max_block) {
   const auto mc = ModelConfig::load(dir);
   bool arch = false, ds = false;
-  for (const auto &a : mc.architectures()) arch |= a == "DFlash2DraftModel", ds |= a == "DFlashDraftModel";
-  need(arch || ds, "architectures does not name DFlash2DraftModel or DFlashDraftModel (" + dir + ")");
+  for (const auto &a : mc.architectures()) arch |= a == "DFlash2DraftModel", ds |= a == "DFlashDraftModel" || a == "DSpineDraftModel";  // DSpine b16 renamed itself (2026-11-14)
+  need(arch || ds, "architectures does not name DFlash2DraftModel, DFlashDraftModel or DSpineDraftModel (" + dir + ")");
   const json::Value &t = mc.root();
   DFlashConfig c;
   c.kind = ds && !arch ? Kind::dspine : Kind::dflash2;

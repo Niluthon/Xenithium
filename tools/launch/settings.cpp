@@ -36,7 +36,8 @@ bool is_dflash_dir(const std::string &dir) {
   std::stringstream ss;
   ss << f.rdbuf();
   const std::string s = ss.str();
-  return s.find("\"DFlash2DraftModel\"") != std::string::npos || s.find("\"DFlashDraftModel\"") != std::string::npos;
+  return s.find("\"DFlash2DraftModel\"") != std::string::npos || s.find("\"DFlashDraftModel\"") != std::string::npos ||
+         s.find("\"DSpineDraftModel\"") != std::string::npos;
 }
 }  // namespace
 
@@ -2409,7 +2410,7 @@ std::string check_value(const Spec &s, const std::string &v, std::string_view ar
       if (s.key == "XEN_MODEL" && !is_file(join_path(p, "config.json"))) return "no config.json in this directory";
       if (s.key == "XEN_DRAFTER_MODEL" && !is_dflash_dir(p)) {
         if (warn_only) *warn_only = true;
-        return "config.json names neither DFlash2DraftModel nor DFlashDraftModel: not a block drafter?";
+        return "config.json names none of DFlash2DraftModel, DFlashDraftModel or DSpineDraftModel: not a block drafter?";
       }
       if (s.key == "XEN_MTP" && !is_file(join_path(p, "mtp-dense.safetensors"))) {
         if (warn_only) *warn_only = true;

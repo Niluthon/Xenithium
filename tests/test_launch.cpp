@@ -802,12 +802,13 @@ void test_app(const std::string &root) {
     return;
   }
   const std::string t = tdir;
-  // Fake checkpoints, an MTP drafter, a DFlash 2 drafter and a DSpine drafter (DFlashDraftModel).
+  // Fake checkpoints, an MTP drafter, a DFlash 2 drafter and two DSpine drafters (DFlashDraftModel, and DSpineDraftModel:
+  // the name the DSpine b16 checkpoint took on 2026-11-14).
   const std::string models = t + "/models";
   mkdir(models.c_str(), 0755);
   for (const auto &[name, type] : std::vector<std::pair<std::string, std::string>>{
            {"moe-a", "qwen4_exp"}, {"dense-b", "qwen3_5"}, {"other-c", "gemma3"}, {"moe-a-mtp", "qwen4_exp"},
-           {"moe-a-dflash2", "DFlash2DraftModel"}, {"dense-b-dspine", "DFlashDraftModel"}}) {
+           {"moe-a-dflash2", "DFlash2DraftModel"}, {"dense-b-dspine", "DFlashDraftModel"}, {"dense-b-dspine-renamed", "DSpineDraftModel"}}) {
     mkdir((models + "/" + name).c_str(), 0755);
     write(models + "/" + name + "/config.json", "{\"model_type\": \"" + type + "\"}");
   }
@@ -821,13 +822,14 @@ void test_app(const std::string &root) {
     else if (m.arch == "qwen35") ++q35;
     else if (m.arch.empty()) ++none;
   }
-  expect(q38 == 1 && q35 == 1 && none == 1 && drafters == 1 && dflashes == 2, "model scan: arch from the registry, MTP and DFlash drafters told apart");
+  expect(q38 == 1 && q35 == 1 && none == 1 && drafters == 1 && dflashes == 3, "model scan: arch from the registry, MTP and DFlash drafters told apart");
   const auto dr = drafters_for(models + "/moe-a");
   expect(dr.size() == 1 && dr[0] == models + "/moe-a-mtp", "drafters: <target>-mtp* siblings");
   const auto df = dflash_drafters(models);
-  bool df2 = false, dsp = false;
-  for (const auto &d : df) df2 |= d.path == models + "/moe-a-dflash2" && d.bytes > 0, dsp |= d.path == models + "/dense-b-dspine" && d.bytes > 0;
-  expect(df.size() == 2 && df2 && dsp, "dflash drafters: DFlash2DraftModel and DFlashDraftModel (DSpine) checkpoints under the models directory");
+  bool df2 = false, dsp = false, dsr = false;
+  for (const auto &d : df) df2 |= d.path == models + "/moe-a-dflash2" && d.bytes > 0, dsp |= d.path == models + "/dense-b-dspine" && d.bytes > 0,
+                           dsr |= d.path == models + "/dense-b-dspine-renamed" && d.bytes > 0;
+  expect(df.size() == 3 && df2 && dsp && dsr, "dflash drafters: DFlash2DraftModel, DFlashDraftModel and DSpineDraftModel (DSpine) checkpoints under the models directory");
   write(models + "/dense-b/config.json", "{\"model_type\": \"qwen3_5\", \"text_config\": {\"max_position_embeddings\": 262144}}");
   const ModelInfo db = probe_model(models + "/dense-b");
   expect(db.max_positions == 262144 && trained_positions_of(db) == 262144 && max_context_of(db) == 1048576,
@@ -994,9 +996,10 @@ void test_app(const std::string &root) {
   expect(!has(app.preview(), "--hot-rank"), "a qwen38-only setting is left at its default (no --hot-rank) for qwen35");
   // The DFlash drafter is picked, not typed: Enter lists the DFlash 2 checkpoints under the models directory.
   s = run({ch('/'), ch('f'), ch('l'), ch('a'), Key::of(Key::Enter), Key::of(Key::Enter)});
-  expect(app.selected_key() == "XEN_DRAFTER_MODEL" && app.popup_open() && has(s, "MTP layer") && has(s, "moe-a-dflash2") && has(s, "dense-b-dspine"),
-         "DFlash drafter: Enter lists the DFlash 2 and DSpine checkpoints");
-  s = run({Key::of(Key::Down), Key::of(Key::Down), Key::of(Key::Enter)});  // MTP layer, dense-b-dspine, moe-a-dflash2
+  expect(app.selected_key() == "XEN_DRAFTER_MODEL" && app.popup_open() && has(s, "MTP layer") && has(s, "moe-a-dflash2") && has(s, "dense-b-dspine") &&
+             has(s, "dense-b-dspine-renamed"),
+         "DFlash drafter: Enter lists the DFlash 2 and DSpine checkpoints (both DSpine names)");
+  s = run({Key::of(Key::Down), Key::of(Key::Down), Key::of(Key::Down), Key::of(Key::Enter)});  // MTP layer, dense-b-dspine, dense-b-dspine-renamed, moe-a-dflash2
   expect(!app.popup_open() && app.values().at("XEN_DRAFTER_MODEL") == models + "/moe-a-dflash2", "picking one sets XEN_DRAFTER_MODEL");
   expect(has(app.preview(), "--drafter-model"), "the preview gains --drafter-model");
   s = run({Key::of(Key::Right)});
