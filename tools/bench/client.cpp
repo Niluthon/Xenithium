@@ -406,6 +406,14 @@ std::optional<std::string> Client::get(std::string_view path, std::string *err) 
   return std::nullopt;
 }
 
+util::Machine machine_from(const json::Value &obj) {
+  util::Machine m;
+  auto text = [&](const char *key) { const std::string *v = obj.get_string(key); return v ? *v : std::string(); };
+  auto count = [&](const char *key) { const json::Value *v = obj.get(key); return v && v->is_number() ? static_cast<int>(v->num) : 0; };
+  m.os = text("os"), m.kernel = text("kernel"), m.cpu = text("cpu"), m.cpu_threads = count("cpu_threads"), m.memory_gib = count("memory_gib");
+  return m;
+}
+
 std::optional<ModelInfo> served_model(const Endpoint &endpoint, std::string_view wanted, double timeout_s, std::string &err) {
   const auto reply = exchange(endpoint, "GET", api_path(endpoint, "models"), {}, timeout_s, err);
   if (!reply) return std::nullopt;
@@ -419,9 +427,36 @@ std::optional<ModelInfo> served_model(const Endpoint &endpoint, std::string_view
   for (const json::Value &entry : data->arr) {
     const std::string *id = entry.get_string("id");
     if (!id || (!wanted.empty() && *id != wanted)) continue;
-    ModelInfo info{*id, 0, 0};
+    ModelInfo info;
+    info.id = *id;
     if (const json::Value *len = entry.get("max_model_len"); len && len->is_number()) info.max_model_len = static_cast<int64_t>(len->num);
     if (const json::Value *pool = entry.get("kv_pool_tokens"); pool && pool->is_number()) info.kv_pool_tokens = static_cast<int64_t>(pool->num);
+    if (const std::string *owner = entry.get_string("owned_by")) info.owned_by = *owner;
+    if (const std::string *build = entry.get_string("build")) info.build = *build;
+    if (const std::string *oneapi = entry.get_string("oneapi")) info.oneapi = *oneapi;
+    if (const std::string *drafter = entry.get_string("drafter")) info.drafter = *drafter;
+    if (const json::Value *machine = entry.get_object("machine")) info.machine = machine_from(*machine);
+    if (const json::Value *launch = entry.get_object("launch")) {
+      if (const json::Value *args = launch->get_array("args"))
+        for (const json::Value &a : args->arr)
+          if (a.is_string()) info.launch_args.push_back(a.str);
+      if (const json::Value *env = launch->get_object("env"))
+        for (const auto &[k, v] : env->obj)
+          if (v.is_string()) info.launch_env.push_back({k, v.str});
+    }
+    if (const json::Value *tp = entry.get("tensor_parallel"); tp && tp->is_number()) info.tensor_parallel = static_cast<int>(tp->num);
+    if (const json::Value *devices = entry.get_array("devices"))
+      for (const json::Value &d : devices->arr) {
+        const std::string *name = d.get_string("name");
+        if (!name) continue;
+        Device device;
+        device.name = *name;
+        if (const json::Value *mem = d.get("memory_bytes"); mem && mem->is_number() && mem->num > 0) device.memory_bytes = static_cast<uint64_t>(mem->num);
+        if (const json::Value *gb = d.get("memory_gb"); gb && gb->is_number() && gb->num > 0) device.memory_gb = static_cast<int>(gb->num);
+        if (const std::string *pci = d.get_string("pci")) device.pci = *pci;
+        if (const std::string *driver = d.get_string("driver")) device.driver = *driver;
+        info.devices.push_back(std::move(device));
+      }
     return info;
   }
   return err = "the endpoint does not list a model \"" + std::string(wanted) + "\"", std::nullopt;

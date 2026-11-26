@@ -88,12 +88,17 @@ struct PowerUse {
 struct PowerCard {
   std::string name;  // "card0"
   double cap_watts = 0;  // the driver's sustained power limit (power1_cap); 0 = not readable
+  double max_mhz = 0;  // the clock's hardware maximum (xe: rp0_freq); 0 = not readable
+  bool reads_temp = false;  // its GPU package temperature is readable (hwmon "pkg")
+  bool reads_throttle = false;  // its throttle reasons are readable (xe: freq0/throttle/reasons)
 };
 // A point of the power-over-time trace kept in the run file.
 struct PowerPoint {
   double at_s = 0;  // since the run's first scenario began
   std::vector<double> watts;  // per card, mean since the previous point
   double mhz = 0;  // actual GPU clock, mean over the cards
+  double temp_c = 0;  // the hottest card's GPU package since the previous point (0 = not readable)
+  std::string throttle = {};  // what limited a card's clock since the previous point ("pl1 thermal"); empty = nothing (or not readable)
 };
 // The run's power record.
 struct RunPower {

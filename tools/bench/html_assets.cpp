@@ -38,6 +38,26 @@ h1{font:650 34px/1.15 var(--sans);letter-spacing:-.02em;margin:22px 0 12px;overf
 .chips{display:flex;flex-wrap:wrap;gap:6px 8px;margin:0;padding:0;list-style:none;font:12px var(--mono);color:var(--mute)}
 .chips li{border:1px solid var(--rule);border-radius:999px;padding:2px 10px;background:var(--panel);overflow-wrap:anywhere}
 .chips b{color:var(--ink);font-weight:500}.chips .bad b{color:var(--bad)}
+/* the run's facts: a label per row (engine, model, KV cache, ...), its facts as chips; the launch folded below */
+.facts{display:grid;grid-template-columns:max-content 1fr;gap:8px 22px;margin:20px 0 0;align-items:start}
+.facts dt{font:11px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--mute);padding-top:4px}
+.facts dd{margin:0}.facts .chips{color:var(--ink)}
+details.launch{margin-top:18px;border:1px solid var(--rule);border-radius:12px;background:var(--panel);padding:10px 16px}
+details.launch summary{font:600 13.5px var(--sans);color:var(--ink)}
+details.launch pre{margin:10px 0 0;padding:8px 10px;border-radius:8px;background:var(--bg);font:12px/1.45 var(--mono);color:var(--mute);white-space:pre-wrap;overflow-wrap:anywhere}
+details.launch p{color:var(--mute);margin:10px 0 2px}
+details.rerun{border-color:var(--acc)}
+details.rerun p.intro{margin:10px 0 4px;font:13px/1.5 var(--sans);color:var(--ink)}details.rerun p.intro b{font-weight:600}
+details.rerun ol{margin:6px 0 4px;padding-left:22px}details.rerun ol>li{margin-top:16px}
+details.rerun li p{margin:0;font:13px/1.45 var(--sans);color:var(--ink)}details.rerun li p b{color:var(--bad);font-weight:600}
+details.rerun li p b.step{color:var(--ink);font-weight:650}
+details.rerun li p.hint{margin-top:6px;color:var(--mute)}
+details.rerun ul.files{margin:6px 0 0;padding-left:18px;font:13px/1.5 var(--sans);color:var(--ink)}
+details.rerun a{color:var(--acc)}
+details.rerun code{font:12px var(--mono);color:var(--acc)}
+.cmdbox{position:relative}.cmdbox .copy{position:absolute;top:16px;right:8px}
+details.rerun pre.cmd{color:var(--ink);padding-right:70px}
+@media (max-width:640px){.facts{grid-template-columns:1fr;gap:4px}.facts dd{margin-bottom:8px}}
 
 /* the section navigation: sticks to the top, marks the section in view */
 nav{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:6px;margin:22px -8px 0;padding:7px 8px;background:var(--bg);
@@ -391,6 +411,37 @@ constexpr std::string_view kScript = R"JS(
       else fallback();
     });
     bar.appendChild(copy);
+  });
+})();
+(() => {
+  // ---- the "run this yourself" commands: a copy button on each ----
+  const put = (text, done) => {
+    const fallback = () => {
+      const area = document.createElement('textarea');
+      area.value = text; area.style.position = 'fixed'; area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      area.remove();
+      done(ok);
+    };
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(() => done(true), fallback);
+    else fallback();
+  };
+  document.querySelectorAll('pre.cmd').forEach(pre => {
+    const box = document.createElement('div');
+    box.className = 'cmdbox';
+    pre.replaceWith(box);
+    box.appendChild(pre);
+    const copy = document.createElement('button');
+    copy.type = 'button'; copy.className = 'btn copy'; copy.textContent = 'copy';
+    copy.title = 'copy the command';
+    copy.addEventListener('click', () => put(pre.textContent, ok => {
+      copy.textContent = ok ? 'copied' : 'copy failed';
+      setTimeout(() => { copy.textContent = 'copy'; }, 1200);
+    }));
+    box.appendChild(copy);
   });
 })();
 )JS";

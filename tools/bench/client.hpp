@@ -12,6 +12,9 @@
 #include <string_view>
 #include <vector>
 
+#include "xenithium/util/json.hpp"
+#include "xenithium/util/machine.hpp"
+
 namespace xenithium::bench {
 
 using Clock = std::chrono::steady_clock;
@@ -135,12 +138,34 @@ class Client {
   double timeout_s_;
 };
 
-// A model the endpoint lists (GET models): its id, and its max_model_len and kv_pool_tokens where reported (0 = not).
+// A card the endpoint's model runs on (xenithium-server lists them in GET models; --gpu names them otherwise).
+struct Device {
+  std::string name;
+  uint64_t memory_bytes = 0;  // as the driver reports it; 0 = not known
+  int memory_gb = 0;  // the nominal size (a 32 GB card reports about 30.3 GiB); 0 = not known
+  std::string pci = {};  // PCI address; empty = not known
+  std::string driver = {};  // the GPU driver's version; empty = not known
+};
+
+// A model the endpoint lists (GET models): its id, and its max_model_len and kv_pool_tokens where reported (0 = not),
+// and the cards it runs on and its tensor-parallel width where reported (empty / 0 = not).
 struct ModelInfo {
   std::string id;
   int64_t max_model_len = 0;
   int64_t kv_pool_tokens = 0;
+  int tensor_parallel = 0;
+  std::vector<Device> devices;
+  std::string owned_by;  // the engine as the endpoint names it ("xenithium", "vllm", "llamacpp"); empty = not reported
+  // What the server runs (xenithium-server: build, oneapi, drafter) and, when it was started with --report-launch, how
+  // (launch.args, launch.env); empty = not reported.
+  std::string build, oneapi, drafter;
+  util::Machine machine;  // the server's machine (xenithium-server: machine); an empty kernel = not reported
+  std::vector<std::string> launch_args;
+  std::vector<std::pair<std::string, std::string>> launch_env;
 };
+// A machine as GET models (machine) and the run file (env.machine, env.bench_machine) write it: os, kernel, cpu,
+// cpu_threads, memory_gib; missing fields stay empty / 0.
+util::Machine machine_from(const json::Value &obj);
 // The model to bench: the listed entry named `wanted, or the list's first entry when `wanted` is empty. nullopt + err
 // when the endpoint does not answer, refuses the key, lists nothing, or does not list `wanted.
 std::optional<ModelInfo> served_model(const Endpoint &endpoint, std::string_view wanted, double timeout_s, std::string &err);

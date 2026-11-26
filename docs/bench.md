@@ -53,6 +53,8 @@ same binary against the server it started ([launcher.md](launcher.md)).
 | `--reply-length fixed\|natural` | the mode's: `fixed` for hard and medium, `natural` for easy | The sampled scenarios' replies. `fixed` sends `ignore_eos`: every reply runs to its `max_tokens`, so two builds are timed over the same number of tokens. `natural` lets the model end its reply, as a chat client sees it (rates then cover only the tokens that came). Greedy checks stay fixed. Recorded in the run file; `compare` warns when two runs differ in it. Read below why the two give different decode rates. |
 | `--context TOKENS` | the endpoint's `max_model_len` | The longest prompt to send. Depths past it are skipped and named in the report. An endpoint that does not report its context needs this, or every depth is tried. |
 | `--kv-pool TOKENS` | the endpoint's `kv_pool_tokens` | Tokens of context the endpoint holds for all requests at once. `long-agents` sizes its documents from it; this server reports it in `/v1/models`. |
+| `--gpu NAME` | the endpoint's `devices` | A card the endpoint runs on; give it once per card. Shown in the hardware row of the HTML report's facts, the "runs on" line of the text report, and recorded in the run file. This server lists its cards (name, memory as the driver reports it and the nominal GB from its card table, PCI address) in `/v1/models`; the report shows the nominal size (a B65: 32 GB). Other engines need this flag. |
+| `--tp N` | the endpoint's `tensor_parallel` (with `--gpu`: the number of cards) | The endpoint's tensor-parallel width, shown in the parallel row of the HTML report's facts. This server reports it in `/v1/models`. |
 | `--timeout SECONDS` | `1800` | Per request. |
 | `--corpus hard\|medium\|DIR` | the mode's: `hard` for hard, `medium` for medium and easy | The text long prompts are cut from: `hard` = this engine's own code and documentation, `medium` = conventional template-made code and prose, `DIR` = another corpus (`DIR/<kind>/<files>`). The set, its version and hash are recorded; runs on different corpora do not compare. |
 | `--power auto\|on\|off` | `auto` | Sample the GPUs' board power and clock while the run goes (below). `auto` = on when the URL is this machine's loopback address; `on` for a server on this machine reached by another address. |
@@ -74,6 +76,10 @@ requests to find out which of these the endpoint takes, uses the ones it does an
 | `stream_options.include_usage` | the server's own token counts | completion tokens are counted as one per streamed update and prompt lengths are estimated from characters: rates are approximate and the tool says so |
 | `GET /metrics` (this engine's counters) | accepted tokens per speculative step, prefix-cache hit tokens and preemptions per scenario | those notes are absent |
 | `max_model_len` in `/v1/models` | skipping depths past the context | pass `--context` |
+| `devices`, `tensor_parallel` in `/v1/models` | the GPU and TP in the page's facts | pass `--gpu`, `--tp` |
+| `machine` in `/v1/models` (OS, kernel, CPU and its threads, host memory) | the page's machine row | the bench's own machine when it measured the cards here (power sampling: the same machine); else no row |
+| `build`, `oneapi`, `drafter` in `/v1/models` | the engine row (revision, oneAPI version), the speculation row (DSpine, DFlash 2, MTP or off) and the build step of "Run this yourself" | the launcher's `engine_rev` note; the drafter as the settings name it |
+| `launch` (`args`, `env`) in `/v1/models`: xenithium-server with `--report-launch` (`XEN_REPORT_LAUNCH=1`) | the server step of "Run this yourself": its command line with its `XEN_` variables, exact | a launcher run: `scripts/start-server.sh` with its settings; else `--note server_cmd="..."`; else the page says the server was not recorded |
 
 Prompt lengths are given in tokens, but the tool has no tokenizer (the endpoint's is unknown). On first use of a text
 kind it sends one prompt of known length, reads `usage.prompt_tokens` and uses that ratio; every row reports the prompt
@@ -152,13 +158,16 @@ mean) and the report reads it as such.
 ## Power and clock
 
 With `--power` on, the tool reads every GPU's board energy counter (`energy1_input` of the card's hwmon directory,
-cumulative microjoules) and its actual clock (`act_freq`) four times a second from `/sys/class/drm`. No root is needed.
+cumulative microjoules), its actual clock (`act_freq`), its GPU package temperature (the hwmon input labelled `pkg`)
+and what limits its clock (`freq0/throttle/reasons`) four times a second from `/sys/class/drm`, and once its maximum
+clock (`rp0_freq`). No root is needed.
 
 - Each scenario reports the mean power per card, the energy, the generated tokens per joule and the clock's mean and
   lowest value. `concurrency`, `arrivals` and `prefill` also report power and tokens per joule per row, so the most
   efficient stream count is visible. Tokens per joule is the same number as tok/s per watt.
 - The run file keeps a trace of power over time and the power before the first scenario (`idle_watts`); the HTML page
-  draws it under the run's timeline with the cards' power limit.
+  draws it under the run's timeline with the cards' power limit. Beside it, per trace point, the hottest card's
+  package temperature (`trace_temp_c`) and every throttle reason seen since the point before (`trace_throttle`).
 - The counters cover the whole card: anything else running on it is counted, an idle second card too. The host's CPU
   and the rest of the machine are not counted, so this is not the wall-socket figure.
 - It says nothing about an endpoint on another machine; `auto` leaves it off there.
@@ -167,7 +176,23 @@ cumulative microjoules) and its actual clock (`act_freq`) four times a second fr
 
 `report.html` in the run directory (`xenithium-bench html RUN` writes it again): the headline figures, a strip of
 yes / no checks, the run over time with the power trace, a diagram of one request with the run's own medians, then
-every scenario with its charts, its table and its notes, and the setup with every recorded note.
+every scenario with its charts, its table and its notes, and everything the run recorded.
+
+Under the title, the run's facts as labelled rows (engine, model, KV cache, parallel, speculation, hardware,
+sampling, during run, machine) and **Run this yourself** (folded): the run repeated from a fresh machine, for someone who has
+never run the engine, each command with a copy button. What is needed (Linux, the `xe` driver, the run's cards), then:
+clone the repository at the server's revision (`git describe` of its build; a `-dirty` build is flagged), install the
+dependencies (`scripts/install-deps.sh`, then `sycl-ls` to see the cards), build, the model files the server read
+(model, drafter, sidecar, with the paths the run used and an `ls -d` to check them), start the server as it was started
+(with `--report-launch`: its arguments and `XEN_` variables as it reports them, values of key- or token-like names
+hidden; a launcher run: `scripts/start-server.sh` with its settings), run the benchmark as it was typed (`--api-key`
+hidden; runs from before are rebuilt from their settings), and open or `compare` the result. With power sampling (the cards are this
+machine's), the hardware row also shows the GPU package temperature (mean and peak), how much of the run the clock was
+throttled and why (the driver's reasons: `pl1` power limit, `thermal`, `prochot`...) or "never throttled", and the
+clock's maximum. The settings the rows show come from the
+server's own report first, then the launcher's notes, then a `server_cmd` note. The last section, **Everything the run
+recorded**, holds what the rows leave out (endpoint, suite, replies, the API extensions taken or not, power limits,
+PCI addresses) and every note and `XEN_` variable as recorded.
 
 It is one file with inline style, inline SVG and one small inline script: no font, no request to anywhere. It opens
 offline, prints (light theme), and follows the reader's light or dark setting; the switch at the top overrides it.
