@@ -19,7 +19,9 @@ constexpr int kD = kGdnDim;  // 128
 constexpr int kVR = 4;
 constexpr int kOutKSplit = 8;  // out_proj [hidden][val_w]: its k split
 
-template <int VR, bool SWISH, int NR, int NP, int ABI, int KM, bool TREE>
+// LIB: the device library the instance is compiled into (0: its own file's, 1: the 128-GRF gdn_core_v2.cpp). A kernel
+// name in two device images is ambiguous: the runtime runs one of them
+template <int VR, bool SWISH, int NR, int NP, int ABI, int KM, bool TREE, int LIB>
 class GdnCoreK;
 
 template <int N>
@@ -77,7 +79,7 @@ inline esimd::simd<float, VR> conv4(esimd::simd<float, VR * kGdnTaps> wt, const 
   return esimd::simd<float, VR>(__builtin_elementwise_fma(w3.data(), u.data(), r.data()));
 }
 
-template <int VR, bool SWISH, int NR, int NP, int ABI, int KM, bool TREE = false>
+template <int VR, bool SWISH, int NR, int NP, int ABI, int KM, bool TREE = false, int LIB = 0>
 sycl::event core(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, const GdnWeights &w, const GdnState &st, int parity, const float *ystep,
                  bf16 *core_out) {
   constexpr int kItems = kD / VR;
@@ -86,7 +88,9 @@ sycl::event core(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, con
   constexpr int kStageF = 2 * kM * 3 * kD, kConvF = kTMax * 3 * kD, kOF = kM * kD, kAbF = kItems * 2 * kM;
   // TREE: + one saved state of the head (aux bit 48: a tree's only saved row) after the rest. Not
   // in the 16-row instance (its stage and conv rows fill the shared local memory: every saved state goes to tree_S)
-  constexpr bool kSaveSlm = TREE && KM <= 8;
+  // not in the 128-GRF library's instances either: its 64 KB would hold the 8-row tree core to one work-group per
+  // Xe core (two waves); its one saved state goes to tree_S (L2) like the rest
+  constexpr bool kSaveSlm = TREE && KM <= 8 && LIB == 0;
   constexpr int kSaveF = kSaveSlm ? kD * kD : 0;
   constexpr int kSlm = (kStageF + kConvF + kOF + kAbF + kSaveF) * static_cast<int>(sizeof(float));
   constexpr int kConvBase = kStageF, kOBase = kStageF + kConvF, kAbBase = kStageF + kConvF + kOF, kSaveBase = kAbBase + kAbF;  // floats
@@ -108,7 +112,7 @@ sycl::event core(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, con
   const int seg_code = st.seg_rows;  // seg_het = unequal segments (records give each one's rows)
   const bf16 *conv = w.conv, *alog = w.a_log, *dtb = w.dt_bias, *nw = w.norm, *wa = w.a, *wb = w.b;
   float *treeS = st.tree_S;
-  return q.parallel_for<GdnCoreK<VR, SWISH, NR, NP, ABI, KM, TREE>>(
+  return q.parallel_for<GdnCoreK<VR, SWISH, NR, NP, ABI, KM, TREE, LIB>>(
       sycl::nd_range<2>({static_cast<size_t>(nseg), static_cast<size_t>(vh) * kItems}, {1, kItems}), [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
         esimd::slm_init<kSlm>();
         // a (segment, value head) grid: the ids come from the launch, not from a division by the run-time head count in every item
@@ -180,13 +184,28 @@ sycl::event core(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, con
           const bf16 *pwa = wa + static_cast<size_t>(hv) * H, *pwb = wb + static_cast<size_t>(hv) * H;
           if constexpr (ABI > 0) {  // every load first, then the FMAs in the loop's order
             esimd::simd<bf16, ABI * kAbW> la, lb, lx[NR];
+            if constexpr (KM == 8) {  // a / b rows first, then the x rows (the 8-row core at 128 GRF 30 % faster)
 #pragma unroll
-            for (int j = 0; j < ABI; ++j) {
-              const int k0 = i * kAbW + j * kItems * kAbW;
-              la.template select<kAbW, 1>(j * kAbW) = esimd::block_load<bf16, kAbW>(pwa + k0);
-              lb.template select<kAbW, 1>(j * kAbW) = esimd::block_load<bf16, kAbW>(pwb + k0);
+              for (int j = 0; j < ABI; ++j) {
+                const int k0 = i * kAbW + j * kItems * kAbW;
+                la.template select<kAbW, 1>(j * kAbW) = esimd::block_load<bf16, kAbW>(pwa + k0);
+                lb.template select<kAbW, 1>(j * kAbW) = esimd::block_load<bf16, kAbW>(pwb + k0);
+              }
 #pragma unroll
-              for (int r = 0; r < NR; ++r) lx[r].template select<kAbW, 1>(j * kAbW) = esimd::block_load<bf16, kAbW>(x + (r0 + crow(r)) * H + k0);
+              for (int j = 0; j < ABI; ++j) {
+                const int k0 = i * kAbW + j * kItems * kAbW;
+#pragma unroll
+                for (int r = 0; r < NR; ++r) lx[r].template select<kAbW, 1>(j * kAbW) = esimd::block_load<bf16, kAbW>(x + (r0 + crow(r)) * H + k0);
+              }
+            } else {
+#pragma unroll
+              for (int j = 0; j < ABI; ++j) {
+                const int k0 = i * kAbW + j * kItems * kAbW;
+                la.template select<kAbW, 1>(j * kAbW) = esimd::block_load<bf16, kAbW>(pwa + k0);
+                lb.template select<kAbW, 1>(j * kAbW) = esimd::block_load<bf16, kAbW>(pwb + k0);
+#pragma unroll
+                for (int r = 0; r < NR; ++r) lx[r].template select<kAbW, 1>(j * kAbW) = esimd::block_load<bf16, kAbW>(x + (r0 + crow(r)) * H + k0);
+              }
             }
 #pragma unroll
             for (int j = 0; j < ABI; ++j) {
@@ -445,25 +464,36 @@ sycl::event core(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, con
 }
 
 // The core's compile-time shape for this call: NR / NP 1 or kM, ABI = hidden / 512 when it is 8 or 10.
-template <bool SWISH, int NR, int NP, int KM, bool TREE = false>
+template <bool SWISH, int NR, int NP, int KM, bool TREE = false, int VR = kVR, int LIB = 0>
 sycl::event core_abi(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, const GdnWeights &w, const GdnState &st, int parity, const float *ystep,
                      bf16 *core_out) {
-  constexpr int kPerIter = (kD / kVR) * 16;  // a / b elements per iteration of the work-group
-  if (s.hidden == 10 * kPerIter) return core<kVR, SWISH, NR, NP, 10, KM, TREE>(q, s, rows, x, w, st, parity, ystep, core_out);
-  if (s.hidden == 8 * kPerIter) return core<kVR, SWISH, NR, NP, 8, KM, TREE>(q, s, rows, x, w, st, parity, ystep, core_out);
-  return core<kVR, SWISH, NR, NP, 0, KM, TREE>(q, s, rows, x, w, st, parity, ystep, core_out);
+  constexpr int kPerIter = (kD / VR) * 16;  // a / b elements per iteration of the work-group
+  if constexpr (VR == kVR) {
+    if (s.hidden == 10 * kPerIter) return core<VR, SWISH, NR, NP, 10, KM, TREE, LIB>(q, s, rows, x, w, st, parity, ystep, core_out);
+    if (s.hidden == 8 * kPerIter) return core<VR, SWISH, NR, NP, 8, KM, TREE, LIB>(q, s, rows, x, w, st, parity, ystep, core_out);
+  }
+  return core<VR, SWISH, NR, NP, 0, KM, TREE, LIB>(q, s, rows, x, w, st, parity, ystep, core_out);
 }
-template <bool SWISH, int KM>
+template <bool SWISH, int KM, int VR = kVR, int LIB = 0>
 sycl::event core_launch_km(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, const GdnWeights &w, const GdnState &st, int parity, const float *ystep,
                            bf16 *core_out) {
   const int sr = st.seg ? seg_size(rows, st.seg_rows) : rows;
   const bool r1 = sr == 1, p1 = st.accept_max <= 1;
-  if (r1 && p1) return core_abi<SWISH, 1, 1, KM>(q, s, rows, x, w, st, parity, ystep, core_out);
-  if (r1) return core_abi<SWISH, 1, KM, KM>(q, s, rows, x, w, st, parity, ystep, core_out);
-  if (p1) return core_abi<SWISH, KM, 1, KM>(q, s, rows, x, w, st, parity, ystep, core_out);
-  return core_abi<SWISH, KM, KM, KM>(q, s, rows, x, w, st, parity, ystep, core_out);
+  if (r1 && p1) return core_abi<SWISH, 1, 1, KM, false, VR, LIB>(q, s, rows, x, w, st, parity, ystep, core_out);
+  if (r1) return core_abi<SWISH, 1, KM, KM, false, VR, LIB>(q, s, rows, x, w, st, parity, ystep, core_out);
+  if (p1) return core_abi<SWISH, KM, 1, KM, false, VR, LIB>(q, s, rows, x, w, st, parity, ystep, core_out);
+  return core_abi<SWISH, KM, KM, KM, false, VR, LIB>(q, s, rows, x, w, st, parity, ystep, core_out);
 }
 
+// the 8-row shapes from the 128-GRF library (gdn_core_v2.cpp; XEN_GDN_CORE128=0: off). VR is a template
+// parameter; a VR 2 build (64 items) miscompiled (wrong outputs, intact state), so it is not built
+#define XEN_GDN_V2_DECL(name)                                                                                                         \
+  template <bool SWISH>                                                                                                               \
+  sycl::event name(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, const GdnWeights &w, const GdnState &st, int parity, \
+                   const float *ystep, bf16 *core_out);
+XEN_GDN_V2_DECL(core_launch8_v2)
+XEN_GDN_V2_DECL(core_launch8_tree_v2)
+#undef XEN_GDN_V2_DECL
 // The 8-row instances (gdn_core8.cpp, 256 GRF).
 template <bool SWISH>
 sycl::event core_launch8(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, const GdnWeights &w, const GdnState &st, int parity, const float *ystep,

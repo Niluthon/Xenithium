@@ -2062,6 +2062,18 @@ void Model::verify_batch(const std::vector<SeqRows> &segs) {
       Seq &sq = seqs_[static_cast<size_t>(g.slot)];
       sq.tree = k::tree_word(g.parent, g.rows);
       sq.tree_aux = k::tree_aux_word(g.parent, g.rows);
+      // XEN_DIAG_TREES=N: every N-th tree's shape to stderr (diag)
+      static const int diag_trees = [] { const char *e = std::getenv("XEN_DIAG_TREES"); return e ? std::atoi(e) : 0; }();
+      if (diag_trees > 0) {
+        static int ntree = 0;
+        if (ntree++ % diag_trees == 0) {
+          const uint64_t ax = sq.tree_aux;
+          std::string pr;
+          for (int r = 0; r < g.rows; ++r) pr += std::to_string(g.parent[r]) + (r + 1 < g.rows ? "," : "");
+          std::fprintf(stderr, "DIAG_TREE rows=%d segs=%d saves=%d side=%d one_save=%d par=%s\n", g.rows, ns, __builtin_popcountll((ax >> 16) & 0xffffull),
+                       __builtin_popcountll(ax & 0xffffull), static_cast<int>((ax >> 48) & 1u), pr.c_str());
+        }
+      }
     }
   for (const auto &g : segs) kv_need(g.slot, seqs_[static_cast<size_t>(g.slot)].pos + g.rows);  // the rows' pages
   std::vector<int64_t> pos_before(static_cast<size_t>(ns));

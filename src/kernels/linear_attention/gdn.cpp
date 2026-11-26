@@ -11,6 +11,8 @@
 #include "xenithium/kernels/pack.hpp"
 #include "xenithium/kernels/rows.hpp"
 
+#include <cstdlib>
+
 namespace xenithium::kernels {
 namespace {
 
@@ -21,6 +23,15 @@ template <bool SWISH>
 sycl::event core_launch(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, const GdnWeights &w, const GdnState &st, int parity, const float *ystep,
                         bf16 *core_out) {
   const int sr = st.seg ? seg_size(rows, st.seg_rows) : rows;
+  // the 8-row cores from the 128-GRF library (gdn_core_v2.cpp): two work-groups per Xe core, so a card's value
+  // heads run in one wave; same code and bits as the 256-GRF instances. XEN_GDN_CORE128=0: the 256-GRF ones. The
+  // 16-row core stays in the XL library: it spills at 128 GRF and its 114 KB of SLM fit one work-group per Xe core anyway
+  // (preloading its a / b x rows 4 at a time removes the spill: still 107 -> 166 µs).
+  static const bool c128 = [] { const char *e = std::getenv("XEN_GDN_CORE128"); return !(e && e[0] == '0'); }();
+  if (c128 && sr <= kGdnMaxRows && st.accept_max <= kGdnMaxRows) {
+    if (st.tree) return core_launch8_tree_v2<SWISH>(q, s, rows, x, w, st, parity, ystep, core_out);
+    if (sr > kGdnRows || st.accept_max > kGdnRows) return core_launch8_v2<SWISH>(q, s, rows, x, w, st, parity, ystep, core_out);
+  }
   // segments or replays past 8 rows (a 16-row tree, the step after one)
   if (sr > kGdnMaxRows || st.accept_max > kGdnMaxRows) return core_launch16_tree<SWISH>(q, s, rows, x, w, st, parity, ystep, core_out);
   if (st.tree) return core_launch8_tree<SWISH>(q, s, rows, x, w, st, parity, ystep, core_out);

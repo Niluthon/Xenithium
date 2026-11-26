@@ -14,7 +14,7 @@ xenithium_kernel_family(attention
   XL      gqa_rows.cpp gqa_staged.cpp gqa_fa.cpp gqa_seg.cpp gqa_sdpa.cpp
   REF     qsa_ref.cpp)
 xenithium_kernel_family(linear_attention
-  SOURCES gdn.cpp gdn_rows.cpp
+  SOURCES gdn.cpp gdn_rows.cpp gdn_core_v2.cpp
   XL      gdn_scan.cpp gdn_core8.cpp gdn_core16.cpp)
 xenithium_kernel_family(moe
   SOURCES moe.cpp moe_rows.cpp moe_aff.cpp
