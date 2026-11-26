@@ -22,6 +22,7 @@
 // leaves after them and the reserve. Cold experts stay in pinned host memory, read in place.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -868,6 +869,10 @@ class Model {
   void pf_lane_attention(int lane, int layer);   // GDN or QSA over the lane's rows; its sum stays pending
   void pf_lanes_moe(int lane0, int count, int layer);  // one MoE call over `count` lanes' rows; each lane's sum stays pending
   void pf_lane_sum(int lane);                    // the lane's pending sum, each card's own rows
+  // The MoE input by owner (PfRun::moe_routed): card c's routing and int8 rows [lo, hi) of the MLP mixer's output, and the
+  // buffers its share copies instead of the bf16 rows.
+  sycl::event pf_moe_route_own(int c, int lo, int hi, int layer);
+  std::array<PfShared, 4> pf_moe_route_sets();
   // each card's own rows of the lane to the other cards; written: per card the event of its last kernel that writes them
   // (empty = the copies follow everything on the card's queue so far)
   void pf_lane_share(int lane, std::span<const PfShared> sets, std::span<const sycl::event> written = {});

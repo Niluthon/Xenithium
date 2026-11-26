@@ -235,6 +235,8 @@ void Model::pf_start(const int32_t *tokens, int m, int row_base, const std::func
       R.lanes.push_back(ln);
     }
     R.moe_lanes = static_cast<int>(m < kPfMoeTwoCallRows ? R.lanes.size() : (R.lanes.size() + 1) / 2);
+    const Card &K0 = *cards_[0];
+    R.moe_routed = opt_.prefill_moe_a8 && K0.pf.moe.blk && K0.pf.moe.blk_n && k::moe_rows_blk8_shape(ms_.shape_of(0));
   }
   const int32_t *tk = R.tokens.data();
 
@@ -552,12 +554,39 @@ void Model::pf_lane_mixers(int layer, PfMixer which) {
         written[c] = k::df_mean_cols(fab_.compute(c), own.rows(), st.residual() + static_cast<size_t>(own.lo) * W, hs_.shape.streams, H, 0,
                                      K.pf.ya + static_cast<size_t>(own.lo) * H, H, 0, H);
     }
+    if (!attention && R.moe_routed) {
+      for (int c = 0; c < nc_; ++c) {
+        const RowRange own = lane_own_rows(c, nc_, ln.r0, ln.m);
+        written[c] = pf_moe_route_own(c, own.lo, own.hi, layer);
+      }
+      const std::array<PfShared, 4> sets = pf_moe_route_sets();
+      pf_lane_share(j, sets, std::span<const sycl::event>(written, static_cast<size_t>(nc_)));
+      continue;
+    }
     const size_t row_bytes = static_cast<size_t>(H) * sizeof(bf16);
     const PfShared sets[] = {attention ? pf_shared([](Card &K) { return K.pf.xa; }, row_bytes) : pf_shared([](Card &K) { return K.pf.xm; }, row_bytes),
                              pf_shared([](Card &K) { return K.pf.ya; }, row_bytes)};
     pf_lane_share(j, std::span(sets).first(feature >= 0 ? 2 : 1), std::span<const sycl::event>(written, static_cast<size_t>(nc_)));
   }
   for (int c = 0; c < nc_; ++c) k::hc_mixer_rows_flip(R.cs[static_cast<size_t>(c)], weights_of(c));
+}
+
+// The MoE's routing and int8 input of the card's own rows (the rows' places in the chunk-sized scratch: pf_lanes_moe
+// reads them there). Returns the last launch's event (what pf_lane_share copies after).
+sycl::event Model::pf_moe_route_own(int c, int lo, int hi, int layer) {
+  Card &K = *cards_[static_cast<size_t>(c)];
+  const k::MoeEvents e = k::moe_rows_route(fab_.compute(c), ms_.shape_of(c), lo, hi, K.pf.xm, ms_.w[c][layer], K.pf.moe, true);
+  return e.route;
+}
+
+// What a row's owner shares of the MoE input instead of its bf16 row: the int8 row and its group scales, the top-k ids
+// and weights (the shared expert's gate stays with the owner, which alone adds the shared term).
+std::array<Model::PfShared, 4> Model::pf_moe_route_sets() {
+  const int H = cfg_.hidden, K = cfg_.topk;
+  return {pf_shared([](Card &C) { return C.pf.moe.xq; }, static_cast<size_t>(H)),
+          pf_shared([](Card &C) { return C.pf.moe.xs; }, static_cast<size_t>(H / k::kMoeXGroup) * sizeof(float)),
+          pf_shared([](Card &C) { return C.pf.moe.ids; }, static_cast<size_t>(K) * sizeof(int32_t)),
+          pf_shared([](Card &C) { return C.pf.moe.topw; }, static_cast<size_t>(K) * sizeof(float))};
 }
 
 void Model::pf_lane_attention(int lane, int layer) {
@@ -669,10 +698,19 @@ void Model::pf_lanes_moe(int lane0, int count, int layer) {
       parts[c][i] = {ln.r0 - r0, ln.m, &send[c][i]};
     }
     mw.parts = std::span<const k::MoeSplitPart>(parts[c], static_cast<size_t>(count));
-    k::MoeRowsScratch sc = K.pf.moe;  // what the lanes' sums read later keeps its own rows: the partial and the shared term
+    mw.routed = R.moe_routed;
+    // Per-row buffers at the rows' places in the chunk: what the lanes' sums read later (the partial, the shared term)
+    // and what the rows' owners routed and shared before the call (pf_lane_mixers).
+    k::MoeRowsScratch sc = K.pf.moe;
+    const size_t rows = static_cast<size_t>(r0);
     sc.part += at;
     sc.sy += at;
-    sc.sg += r0;
+    sc.sg += rows;
+    sc.logits += rows * ms_.w[c][layer].router.n;
+    sc.ids += rows * cfg_.topk;
+    sc.topw += rows * cfg_.topk;
+    sc.xq += at;
+    sc.xs += rows * (cfg_.hidden / k::kMoeXGroup);
     k::moe_rows(fab_.compute(c), ms_.shape_of(c), m, K.pf.xm + at, w, sc, wire_of(mw), pf_moe_parity_, K.pf.ym + at, opt_.prefill_moe_a8);
   }
   pf_moe_parity_ ^= 1;

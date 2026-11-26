@@ -23,6 +23,7 @@ using bf16 = moe_bf16;
 constexpr int kW = 16;  // columns per tile
 constexpr int kKCall = 16;
 constexpr int kGroup = 128;
+static_assert(kGroup == kMoeXGroup, "the x quantiser's groups are the weights' 128-k groups");
 constexpr int kSeg = kMoeSegRows;  // 16
 constexpr int kHalf = 64, kHalfBytes = kW4BlockBytes / 2;
 constexpr int kLanes = 16;  // top-k sub-group
@@ -671,6 +672,9 @@ MoeEvents moe_rows(sycl::queue &q, const MoeShape &s, int m, const bf16 *x, cons
     covered += p.m;
   }
   if (!parts.empty() && covered != m) throw std::invalid_argument("moe_rows: the split's parts cover every row");
+  const bool routed = wire && wire->routed;
+  if (routed && (parts.empty() || !wire->shared_own_rows || !blocks8))
+    throw std::invalid_argument("moe_rows: routed rows need the split's parts, the shared expert on own rows and the W4A8 blocks");
   const int max_segs = moe_rows_max_segs(s, m);
   MoeEvents ev;
   // Split mode with a send: the peer's rows of the expert sum first, their copy to the peer
@@ -684,7 +688,9 @@ MoeEvents moe_rows(sycl::queue &q, const MoeShape &s, int m, const bf16 *x, cons
   const bool shared_early = !overlap && pf_dense_pairable(m, w.router, w.shared_gu, false, sc.da8.q != nullptr);
   // Under rot the early quantiser rotates first (rot_quant.hpp), so it rides the launch too.
   const bool quant_early = shared_early && a8 && fuse;
-  if (shared_early) {
+  if (routed) {
+    // (moe_rows_route ran on each row's owner)
+  } else if (shared_early) {
     const PfRowQuant rq{x, s.hidden, sc.xq, sc.xs, s.rot};
     ev.router = pf_dense_pair(q, m, w.router, x, s.hidden, PfOut{sc.logits, nullptr, w.router.n}, w.shared_gu, x, s.hidden, PfOut{sc.sgu, nullptr, 2 * SI}, true,
                               quant_early ? &rq : nullptr, nullptr, sc.da8.on());  // the shared gate|up on W8A8 when set
@@ -692,7 +698,7 @@ MoeEvents moe_rows(sycl::queue &q, const MoeShape &s, int m, const bf16 *x, cons
     ev.router = pf_dense(q, m, w.router, x, s.hidden, PfOut{sc.logits, nullptr, w.router.n});
   }
   const bool swiglu_early = shared_early && fuse && m > 0;
-  ev.topk = swiglu_early ? topk_swiglu<32>(q, s, m, sc.logits, w.router.n, sc) : topk<32>(q, s, m, sc.logits, w.router.n, sc);
+  if (!routed) ev.topk = swiglu_early ? topk_swiglu<32>(q, s, m, sc.logits, w.router.n, sc) : topk<32>(q, s, m, sc.logits, w.router.n, sc);
   ev.route = group(q, s, m, sc);
   // The multi-segment cold experts read from a VRAM copy (the same bytes)
   MoeWeights ws = w;
@@ -706,7 +712,7 @@ MoeEvents moe_rows(sycl::queue &q, const MoeShape &s, int m, const bf16 *x, cons
   // a8 + rot: rotation and quantiser in one launch each (moe_rot_quant_rows: the same bits as
   // moe_hadamard_rows then quant_rows, without the bf16 round trip); no rotated x copy is needed.
   if (a8) {
-    if (!quant_early) {
+    if (!quant_early && !routed) {
       if (s.rot) moe_rot_quant_rows(q, m, s.hidden, s.hidden, x, sc.xq, sc.xs, kGroup, true);
       else quant_rows<kGroup>(q, m, s.hidden, x, sc.xq, sc.xs);
     }
@@ -791,6 +797,25 @@ MoeEvents moe_rows(sycl::queue &q, const MoeShape &s, int m, const bf16 *x, cons
     else if (wire->quad.on()) ev.combine = combine<true, false, true>(q, s, 0, m, r0, r1, sc, *wire, parity & 1, out);
     else ev.combine = combine<true>(q, s, 0, m, r0, r1, sc, *wire, parity & 1, out);
   }
+  return ev;
+}
+
+MoeEvents moe_rows_route(sycl::queue &q, const MoeShape &s, int lo, int hi, const bf16 *x, const MoeWeights &w, const MoeRowsScratch &sc, bool a8) {
+  if (lo < 0 || hi < lo) throw std::invalid_argument("moe_rows_route: rows");
+  if (a8 && (!sc.xq || !sc.xs || s.rot)) throw std::invalid_argument("moe_rows_route: W4A8 without its scratch, or rotated experts");
+  MoeEvents ev;
+  const int m = hi - lo;
+  if (m == 0) return ev;
+  const size_t r = static_cast<size_t>(lo);
+  MoeRowsScratch at = sc;  // the scratch from row lo on
+  at.logits += r * w.router.n;
+  at.ids += r * s.topk;
+  at.topw += r * s.topk;
+  at.sg += r;
+  const bf16 *xr = x + r * s.hidden;
+  ev.router = pf_dense(q, m, w.router, xr, s.hidden, PfOut{at.logits, nullptr, w.router.n});
+  ev.topk = ev.route = topk<32>(q, s, m, at.logits, w.router.n, at);
+  if (a8) ev.route = quant_rows<kGroup>(q, m, s.hidden, xr, sc.xq + r * s.hidden, sc.xs + r * (s.hidden / kGroup));
   return ev;
 }
 

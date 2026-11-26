@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <random>
 #include <thread>
+#include <type_traits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1177,6 +1178,36 @@ void rows_blocks(xenithium::Fabric &f, int c, const k::MoeShape &s, int M, int r
   mem.push_back(rs.blk_n);
 }
 
+// The routing by row owner (moe_rows_route on each card's own rows of a split call, then shared) against what the
+// last W4A8 moe_rows call on the whole call left in rs: ids, top-k weights, shared gates, int8 x and its scales, bit for
+// bit. The routing steps run on one card here: their bits do not depend on the card.
+bool route_by_owner_same(xenithium::Fabric &f, const k::MoeShape &s, int M, const bf16 *x, const k::MoeWeights &w, const k::MoeRowsScratch &rs) {
+  auto &q = f.compute(0);
+  const auto z = k::moe_rows_sizes(s, M, w.router.n);
+  const size_t A = static_cast<size_t>(M) * s.topk, xs_n = static_cast<size_t>(M) * (s.hidden / k::kMoeXGroup);
+  auto read = [&](const auto *p, size_t n) {
+    std::vector<std::remove_const_t<std::remove_pointer_t<decltype(p)>>> v(n);
+    q.memcpy(v.data(), p, n * sizeof(v[0])).wait();
+    return v;
+  };
+  const auto ids = read(rs.ids, A);
+  const auto xq = read(rs.xq, static_cast<size_t>(M) * s.hidden);
+  const auto topw = read(rs.topw, A), sg = read(rs.sg, static_cast<size_t>(M)), xs = read(rs.xs, xs_n);  // (all float)
+  q.memset(rs.ids, 0xff, z.ids * 4);
+  q.memset(rs.topw, 0xff, z.ids * 4);
+  q.memset(rs.sg, 0xff, z.sg * 4);
+  q.memset(rs.xq, 0x55, z.xq);
+  q.memset(rs.xs, 0xff, z.xs * 4).wait();
+  for (int c = 0; c < k::kWireCardsMax; ++c) {
+    int lo = 0, hi = 0;
+    k::pair_split_owner_rows(c, M, &lo, &hi, k::kWireCardsMax);
+    k::moe_rows_route(q, s, lo, hi, x, w, rs, true);
+  }
+  q.wait_and_throw();
+  return read(rs.ids, A) == ids && read(rs.topw, A) == topw && read(rs.sg, static_cast<size_t>(M)) == sg &&
+         read(rs.xq, static_cast<size_t>(M) * s.hidden) == xq && read(rs.xs, xs_n) == xs;
+}
+
 // moe_rows on four cards (32-k quarter down pieces, the four-card MoeRowsWire) against
 // moe_decode on four cards over 4-row slices of the same rows (the decode's grouping of the sum differs: the bound of
 // test_rows), every card's rows identical, a second run identical; W4A8 on the block kernels; W4A8 without the block
@@ -1282,6 +1313,7 @@ void test_rows_quad(xenithium::Fabric &f, const Model &m0, const char *tag, int 
   // W4A8 on the block kernels (int8 x per 128-k group, int8 h per segment of the card's k): within int8 rounding of
   // the W4A16 rows, every card the same rows, a rerun identical
   bool a8_ok = k::moe_rows_blk8_shape(s[0]);
+  bool route_ok = !a8_ok;  // (nothing to compare without the W4A8 blocks)
   double a8_rel = -1;
   if (a8_ok) {
     for (int c = 0; c < C; ++c) rows_blocks(f, c, s[c], M, m.router_n, mem[c], rs[c]);
@@ -1301,8 +1333,11 @@ void test_rows_quad(xenithium::Fabric &f, const Model &m0, const char *tag, int 
     }
     a8_rel = std::sqrt(se / std::max(sr, 1e-30));
     a8_ok &= a8_rel < 2e-2;
+    route_ok = route_by_owner_same(f, s[0], M, x[0], d[0].w, rs[0]);
     for (int c = 0; c < C; ++c) rs[c].blk = nullptr, rs[c].blk_n = nullptr;
   }
+  expect(route_ok, std::string(tag) + " four cards, rows " + std::to_string(M) +
+                       ": moe_rows_route over each card's own rows == the whole call's routing and int8 x, bit for bit");
   {
     char w8[220];
     std::snprintf(w8, sizeof w8, "%s four cards, rows %d: W4A8 blocks vs W4A16 relative rms %.2e (int8 rounding: < 2e-2); every card the same rows; a rerun identical", tag,

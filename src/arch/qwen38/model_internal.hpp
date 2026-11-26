@@ -251,6 +251,9 @@ struct Model::PfRun {
   };
   std::vector<Lane> lanes;
   int moe_lanes = 1;           // the lanes one MoE call spans (pf_lanes_moe)
+  // The MoE input by owner (W4A8 blocks): each row's owner routes it and quantises it to int8 after its MLP mixer, and
+  // shares the routing and the int8 row instead of the bf16 one (pf_lane_mixers, kernels::moe_rows_route).
+  bool moe_routed = false;
   // XEN_PF_PROFILE (see pf_mark)
   std::vector<std::pair<int, sycl::event>> dmarks;
   std::chrono::steady_clock::time_point t_sub0, tick;

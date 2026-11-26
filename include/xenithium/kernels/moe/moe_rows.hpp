@@ -43,6 +43,8 @@ inline constexpr int kMoeSegRows = 16;  // list rows per segment (DPAS M = 2 x 8
 // List rows per block of the work-group-per-block W4A16 gate_up / down (MoeRowsScratch blk): four 8-row DPAS blocks per
 // thread.
 inline constexpr int kMoeBlkRows = 32;
+// W4A8: x columns per int8 scale (MoeRowsScratch:xs holds hidden / kMoeXGroup scales per row).
+inline constexpr int kMoeXGroup = 128;
 
 struct MoeRowsScratch {
   float *logits = nullptr;  // [rows_max][router.n]
@@ -120,6 +122,10 @@ struct MoeRowsWire {
   // several callers' row ranges (the routed experts are cheaper per row the more rows a call has), each range's partial
   // sent as its own (its rows at part + r0 * hidden).
   std::span<const MoeSplitPart> parts{};
+  // With parts (W4A8 blocks only): every row's routing (ids, topw, sg) and int8 x (xq, xs) are already in the scratch -
+  // moe_rows_route on the row's owner, which shares them with the other cards - so the router, topk and the x quantiser
+  // are skipped. x is then read on the card's own rows only (the shared expert).
+  bool routed = false;
   // TP4: four cards (comm/wire.hpp WireQuad; not with split): ((e0 + e1) + (e2 + e3)) on every card, the inbox a slot
   // region per hop (moe_rows_wire_words with MoeShape:cards 4). inbox / peer_inbox unused.
   WireQuad quad{};
@@ -135,6 +141,13 @@ sycl::event moe_rows_wire_init(sycl::queue &q, const MoeShape &s, int rows_max, 
 // the launches. The same bits either way (tests compare them).
 MoeEvents moe_rows(sycl::queue &q, const MoeShape &s, int m, const moe_bf16 *x, const MoeWeights &w, const MoeRowsScratch &sc,
                    const MoeRowsWire *wire, int parity, moe_bf16 *out, bool a8 = false, bool fuse = true);
+
+// The routing steps of moe_rows on rows [lo, hi) of x only - router, topk and (a8) the x quantiser - into the same rows
+// of sc's logits, ids, topw, sg, xq and xs. Four cards run it on each card's own rows of a split call and copy those rows
+// of ids / topw / xq / xs to the other cards (int8 x: about half the bytes of the bf16 rows), then moe_rows with
+// MoeRowsWire:routed. Every step is per row, so a row gets the bits the whole call's steps give it. Returns the last
+// launch's event in `route` (the router's in `router`, topk's in `topk`).
+MoeEvents moe_rows_route(sycl::queue &q, const MoeShape &s, int lo, int hi, const moe_bf16 *x, const MoeWeights &w, const MoeRowsScratch &sc, bool a8);
 
 // Internal to moe_rows: the W4A16 gate_up launch -> sc.h, in moe_rows_gu.cpp. It spills at 128 GRF, so it is built in
 // the 256-GRF library (CMake xenithium_kernels_xl). The other moe_rows kernels do not spill and stay at 128.
