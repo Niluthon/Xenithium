@@ -55,6 +55,9 @@ struct PfA8 {
   // one int32 accumulator, no per-group fold, and out = float(sum) x s[r] x w_scale[col] - the same bits whatever the
   // body, the tiles per work-group or the rows of the call. Not with split-K (the many-row HC down keeps per group).
   bool row = false;
+  // q / s already hold the call's rows quantised (pf_a8_quantize, or another card's copy of its rows): the GEMM skips
+  // its quantiser. Per row only (a row's scale does not depend on the call; the group scales' stride does).
+  bool ready = false;
   const PfA8 *on() const { return q ? this : nullptr; }
 };
 inline constexpr int pf_a8_ld(int m) { return (m + 15) / 16 * 16; }

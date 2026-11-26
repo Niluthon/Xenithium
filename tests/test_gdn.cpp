@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "xenithium/kernels/linear_attention/gdn.hpp"
+#include "xenithium/kernels/gemm/pf_dense.hpp"
 #include "xenithium/kernels/linear_attention/gdn_rows.hpp"
 #include "xenithium/kernels/pack.hpp"
 #include "xenithium/kernels/rows.hpp"
@@ -727,6 +728,35 @@ void test_rows(xenithium::Fabric &f, const Model &m, const char *tag, int M) {
     expect(ya.scaled <= 1.0 / 64 && oa.scaled <= 1.0 / 64 && s_err <= 1e-4 * s_max && s_max > 0, what);
     std::snprintf(what, sizeof what, "%s gdn_rows %d rows: run-to-run bit-identical (out, next step, S)", tag, M);
     expect(b2.out == b.out && b2.out_after == b.out_after && b2.S == b.S, what);
+    {  // The projections' input made outside gdn_rows, as four cards' row owners make it (W8A8 per row): x quantised by
+       // pf_a8_quantize (PfA8::ready) and the a | b dots by gdn_rows_ab into one card's columns of a four-card row (row
+       // stride 4 ab_n, at ab_n): out, the next step and S == gdn_rows quantising and dotting x itself, bit for bit.
+      const int abn = d[0].s.ab_n(), W = std::max(H, VW);  // the scratch's widest activations (qkvz: H, out: val_w)
+      auto dev = [&](size_t bytes) {
+        void *p = f.alloc(0, std::max<size_t>(bytes, 64));
+        mem[0].push_back(p);
+        return p;
+      };
+      const k::PfA8 own{static_cast<int8_t *>(dev(size_t(M) * W)), static_cast<float *>(dev(k::pf_a8_scales(M, W) * 4)), true};
+      const k::PfA8 given{static_cast<int8_t *>(dev(size_t(M) * H)), static_cast<float *>(dev(k::pf_a8_scales(M, H) * 4)), true, true};
+      auto *ab4 = static_cast<float *>(dev(size_t(M) * 4 * abn * 4));
+      k::GdnRowsScratch self = rs[0];
+      self.a8 = own;
+      k::GdnRowsScratch made = self;
+      made.x8 = given;
+      made.ab_in = ab4 + abn;
+      made.ab_ld = 4 * abn;
+      const RowsRun r_self = run_path(f, d, 1, M, false, &self, rw, xd, xap, xnp);
+      k::pf_a8_quantize(f.compute(0), M, xd[0], H, H, given);
+      k::gdn_rows_ab(f.compute(0), d[0].s, M, xd[0], d[0].w, ab4 + abn, made.ab_ld);
+      f.compute(0).wait_and_throw();
+      const RowsRun r_made = run_path(f, d, 1, M, false, &made, rw, xd, xap, xnp);
+      std::snprintf(what, sizeof what,
+                    "%s gdn_rows %d rows, W8A8 per row: x quantised and a | b dotted by the rows' owner (four-card a | b row) == by gdn_rows itself, bit for bit "
+                    "(out, next step, S)",
+                    tag, M);
+      expect(!r_self.out.empty() && r_made.out == r_self.out && r_made.out_after == r_self.out_after && r_made.S == r_self.S, what);
+    }
     // The chunked scan (full 64-row chunks at absolute multiples of 64, the rest on the row
     // core). Its numerics differ (S enters as a bf16 operand): bounded against the decode path, run-to-run
     // bit-identical. pos 3: row 0 (3 replayed rows) at position 0, chunks from row 0; pos 40: row 0 at

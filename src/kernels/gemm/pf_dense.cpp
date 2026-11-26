@@ -48,6 +48,7 @@ struct Args {
   const float *as = nullptr;
   int lds = 0;
   bool row = false;  // as = one scale per row (PfA8:row)
+  bool a8_ready = false;  // aq / as hold the rows already (PfA8::ready): no quantiser
 };
 
 // SLM bytes of the SLM kernel's work-group with NT tiles (double-buffered widened groups).
@@ -897,6 +898,8 @@ Args base(int m, const DenseWeights &w, const bf16 *a, int lda, const PfA8 *a8 =
   if (a8 && w.kind == DenseKind::i8) {  // W8A8 (bf16 weights keep the bf16 path)
     if (w.k % 32) throw std::invalid_argument("pf_dense: W8A8 needs k % 32 == 0");
     if (!a8->q || !a8->s) throw std::invalid_argument("pf_dense: W8A8 scratch");
+    if (a8->ready && !a8->row) throw std::invalid_argument("pf_dense: quantised activations given per row only (PfA8::ready)");
+    A.a8_ready = a8->ready;
     A.aq = a8->q;
     A.as = a8->s;
     A.lds = pf_a8_ld(m);
@@ -907,6 +910,7 @@ Args base(int m, const DenseWeights &w, const bf16 *a, int lda, const PfA8 *a8 =
 
 // The W8A8 quantiser of A's activations into its scratch (before the GEMM that reads them).
 sycl::event quant_a8(sycl::queue &q, const Args &A) {
+  if (A.a8_ready) return {};  // (the caller's rows: pf_a8_quantize)
   if (A.row) return launch_a8_quant_row(q, A.a, A.lda, A.m, A.full * kGroup + A.tail * 16, const_cast<int8_t *>(A.aq), const_cast<float *>(A.as));
   return launch_a8_quant(q, A.a, A.lda, A.m, A.full * kGroup + A.tail * 16, const_cast<int8_t *>(A.aq), const_cast<float *>(A.as));
 }
@@ -1189,6 +1193,11 @@ sycl::event run_one(sycl::queue &q, const Args &A, DenseKind kind, int nt = 0) {
 }
 
 }  // namespace
+
+sycl::event pf_a8_quantize(sycl::queue &q, int m, const bf16 *a, int lda, int k, const PfA8 &a8) {
+  if (m < 1 || k < 32 || k % 32 || lda < k || !a || !a8.q || !a8.s) throw std::invalid_argument("pf_a8_quantize: rows / k / buffers");
+  return a8.row ? launch_a8_quant_row(q, a, lda, m, k, a8.q, a8.s) : launch_a8_quant(q, a, lda, m, k, a8.q, a8.s);
+}
 
 sycl::event pf_dense(sycl::queue &q, int m, const DenseWeights &w, const bf16 *a, int lda, const PfOut &out, const PfA8 *a8) {
   Args A = base(m, w, a, lda, a8);

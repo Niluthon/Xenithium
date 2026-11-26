@@ -237,6 +237,7 @@ void Model::pf_start(const int32_t *tokens, int m, int row_base, const std::func
     R.moe_lanes = static_cast<int>(m < kPfMoeTwoCallRows ? R.lanes.size() : (R.lanes.size() + 1) / 2);
     const Card &K0 = *cards_[0];
     R.moe_routed = opt_.prefill_moe_a8 && K0.pf.moe.blk && K0.pf.moe.blk_n && k::moe_rows_blk8_shape(ms_.shape_of(0));
+    R.gdn_owner = K0.pf.gx_q != nullptr;
   }
   const int32_t *tk = R.tokens.data();
 
@@ -564,9 +565,19 @@ void Model::pf_lane_mixers(int layer, PfMixer which) {
       continue;
     }
     const size_t row_bytes = static_cast<size_t>(H) * sizeof(bf16);
-    const PfShared sets[] = {attention ? pf_shared([](Card &K) { return K.pf.xa; }, row_bytes) : pf_shared([](Card &K) { return K.pf.xm; }, row_bytes),
-                             pf_shared([](Card &K) { return K.pf.ya; }, row_bytes)};
-    pf_lane_share(j, std::span(sets).first(feature >= 0 ? 2 : 1), std::span<const sycl::event>(written, static_cast<size_t>(nc_)));
+    std::vector<PfShared> sets;
+    if (attention && R.gdn_owner && !cfg_.full_attention[layer]) {  // a GDN layer: its input by owner
+      for (int c = 0; c < nc_; ++c) {
+        const RowRange own = lane_own_rows(c, nc_, ln.r0, ln.m);
+        if (own.rows() > 0) written[c] = pf_gdn_owner_inputs(c, own.lo, own.hi, layer);
+      }
+      const std::array<PfShared, 3> gx = pf_gdn_owner_sets();
+      sets.assign(gx.begin(), gx.end());
+    } else {
+      sets.push_back(attention ? pf_shared([](Card &K) { return K.pf.xa; }, row_bytes) : pf_shared([](Card &K) { return K.pf.xm; }, row_bytes));
+    }
+    if (feature >= 0) sets.push_back(pf_shared([](Card &K) { return K.pf.ya; }, row_bytes));
+    pf_lane_share(j, sets, std::span<const sycl::event>(written, static_cast<size_t>(nc_)));
   }
   for (int c = 0; c < nc_; ++c) k::hc_mixer_rows_flip(R.cs[static_cast<size_t>(c)], weights_of(c));
 }
@@ -577,6 +588,37 @@ sycl::event Model::pf_moe_route_own(int c, int lo, int hi, int layer) {
   Card &K = *cards_[static_cast<size_t>(c)];
   const k::MoeEvents e = k::moe_rows_route(fab_.compute(c), ms_.shape_of(c), lo, hi, K.pf.xm, ms_.w[c][layer], K.pf.moe, true);
   return e.route;
+}
+
+// The GDN layers' input by owner: card c's own rows [lo, hi) of the attention mixer's output (pf.xa), quantised per row
+// as the qkvz GEMM's W8A8 would (pf_a8_quantize) and dotted with every card's a | b (gdn_rows_ab over the stacked
+// weights, card s's heads at columns s ab_n of a row), at the rows' places in the chunk. A row's bits depend neither on
+// the card that makes them nor on the rows beside it, so each card's gdn_rows reads the bits it would have made.
+// Returns the last launch's event.
+sycl::event Model::pf_gdn_owner_inputs(int c, int lo, int hi, int layer) {
+  Card &K = *cards_[static_cast<size_t>(c)];
+  auto &q = fab_.compute(c);
+  const int H = cfg_.hidden, rows = hi - lo, abn = gs_.shape_of(0).ab_n();
+  const size_t r = static_cast<size_t>(lo);
+  const bf16 *x = K.pf.xa + r * H;
+  k::PfA8 a8{K.pf.gx_q + r * H, K.pf.gx_s + r, true};
+  k::pf_a8_quantize(q, rows, x, H, H, a8);
+  // every card's heads in one launch: the stacked weights as one card's of all heads (a = the stack, b = its second
+  // half: row j of either at j x hidden); a dot's bits do not depend on its neighbours
+  k::GdnShape all = gs_.shape;
+  all.cards = 1, all.card = 0;
+  k::GdnWeights w;
+  w.a = K.pf.gx_w[static_cast<size_t>(layer)];
+  w.b = w.a + static_cast<size_t>(all.vh()) * H;
+  return k::gdn_rows_ab(q, all, rows, x, w, K.pf.gx_ab + r * nc_ * abn, nc_ * abn);
+}
+
+// What a row's owner shares of a GDN layer's input instead of its bf16 row: the int8 row and its scale, every card's
+// a | b dots.
+std::array<Model::PfShared, 3> Model::pf_gdn_owner_sets() {
+  const size_t H = static_cast<size_t>(cfg_.hidden), abn = static_cast<size_t>(gs_.shape_of(0).ab_n());
+  return {pf_shared([](Card &C) { return C.pf.gx_q; }, H), pf_shared([](Card &C) { return C.pf.gx_s; }, sizeof(float)),
+          pf_shared([](Card &C) { return C.pf.gx_ab; }, static_cast<size_t>(nc_) * abn * sizeof(float))};
 }
 
 // What a row's owner shares of the MoE input instead of its bf16 row: the int8 row and its group scales, the top-k ids
@@ -628,6 +670,12 @@ void Model::pf_lane_attention(int lane, int layer) {
       k::GdnRowsScratch sc = K.pf.gdn;
       sc.partial += at;  // the lane's own rows of the partial: its sum runs after the other lanes' modules
       sc.trace = stage_trace(fab_, c, R.gdn_trace);
+      if (R.gdn_owner) {  // the lane's rows as their owners made them (pf_gdn_owner_inputs): x is not read
+        const int abn = gs_.shape_of(c).ab_n();
+        sc.x8 = k::PfA8{K.pf.gx_q + at, K.pf.gx_s + ln.r0, true, true};
+        sc.ab_in = K.pf.gx_ab + (static_cast<size_t>(ln.r0) * nc_ + static_cast<size_t>(c)) * abn;
+        sc.ab_ld = nc_ * abn;
+      }
       k::gdn_rows(fab_.compute(c), gs_.shape_of(c), ln.m, K.pf.xa + at, gs_.w[c][layer], rs, sc, wire_of(pw), pf_pair_parity_, K.pf.ya + at);
     } else {
       k::QsaRowsScratch sc = K.pf.qsa;

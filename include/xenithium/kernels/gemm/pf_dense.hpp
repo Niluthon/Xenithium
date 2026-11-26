@@ -39,6 +39,10 @@ struct PfOut {
 // owns the scratch (dense.hpp's PfA8: q [m][k] int8, s [m][ceil(k / 128)] fp32; one per queue). Only
 // int8 weights with k % 32 == 0 take it; bf16 weights ignore it (the bf16 path).
 
+// The quantiser a W8A8 GEMM runs on its m rows of a (row stride lda, k columns) into a8.q / a8.s (a8.row: one scale per
+// row, else per 128-k group): the same bits, so a GEMM given a8 with PfA8::ready takes them as its own.
+sycl::event pf_a8_quantize(sycl::queue &q, int m, const sycl::ext::oneapi::bfloat16 *a, int lda, int k, const PfA8 &a8);
+
 // C = A W^T. A: m rows of stride lda (multiple of 8 elements; 64-byte aligned base).
 sycl::event pf_dense(sycl::queue &q, int m, const DenseWeights &w, const sycl::ext::oneapi::bfloat16 *a, int lda,
                      const PfOut &out, const PfA8 *a8 = nullptr);

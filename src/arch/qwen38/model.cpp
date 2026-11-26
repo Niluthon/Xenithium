@@ -659,6 +659,7 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
     }
     dec_owner_init();  // after the four-card wires: the owner sums' wires start as copies of them
   }
+  pf_gdn_owner_init();
   // ---- the MTP drafter: before the placement (its weights, experts and KV come out of the VRAM
   // the target's hot experts would get) ----
   // both drafters only with the step count that hands the steps to the MTP layer
@@ -1017,6 +1018,45 @@ void Model::begin_sequence() {
   sq.ple_ctx.reset(ple_tab_->layout());
   if (dflash_) dflash_->settle(slot_, 0);  // a fresh sequence drops the slot's deferred drafter rows
   kvp_.release(slot_);  // a fresh sequence holds no pages of a shared pool (the fixed layout keeps its own)
+}
+
+// The GDN layers' attention input by owner (prefill.cpp pf_gdn_owner_inputs): where a prompt's rows live on their
+// owners (four cards, expert TP: pf_lane_count) and the qkvz runs W8A8 per row (a row's int8 form does not depend on the call), each card gets
+// every card's a | b weights stacked per layer (bf16 [card][a | b][hidden]: ~0.5 MB a layer) and the chunk-row buffers
+// the owners' shares land in (~13 MB a card at 4,096-row chunks). Otherwise off (null buffers).
+void Model::pf_gdn_owner_init() {
+  if (nc_ != 4 || !ms_.shape.tp || !opt_.prefill_dense_a8 || !opt_.prefill_dense_a8_row || opt_.calib) return;
+  for (int l : gs_.layers)
+    for (int c = 0; c < nc_; ++c)
+      if (gs_.w[c][l].qkvz4.w || gs_.w[c][l].qkvz.kind != k::DenseKind::i8) return;  // an int4 qkvz reads bf16 x
+  const int H = cfg_.hidden, abn = gs_.shape_of(0).ab_n(), vh = gs_.shape_of(0).vh();
+  const size_t rows = static_cast<size_t>(opt_.prefill_chunk) + 4, head = static_cast<size_t>(vh) * H;
+  for (int c = 0; c < nc_; ++c) {
+    Card &K = *cards_[static_cast<size_t>(c)];
+    auto &q = fab_.compute(c);
+    auto zeroed = [&](size_t bytes) {
+      void *p = fab_.alloc(static_cast<size_t>(c), bytes);
+      q.memset(p, 0, bytes);
+      K.mem.push_back(p);
+      return p;
+    };
+    K.pf.gx_q = static_cast<int8_t *>(zeroed(rows * H));
+    K.pf.gx_s = static_cast<float *>(zeroed(static_cast<size_t>(k::pf_a8_ld(static_cast<int>(rows))) * sizeof(float)));
+    K.pf.gx_ab = static_cast<float *>(zeroed(rows * nc_ * abn * sizeof(float)));
+    K.pf.gx_w.assign(static_cast<size_t>(cfg_.layers), nullptr);
+    for (int l : gs_.layers) {
+      auto *w = static_cast<bf16 *>(fab_.alloc(static_cast<size_t>(c), nc_ * 2 * head * sizeof(bf16)));
+      K.mem.push_back(w);
+      for (int s = 0; s < nc_; ++s) {  // card s's a | b, copied on card s's queue
+        const k::GdnWeights &from = gs_.w[s][l];
+        auto &cq = fab_.compute(s);
+        cq.memcpy(w + (2 * s) * head, from.a, head * sizeof(bf16));
+        cq.memcpy(w + (2 * s + 1) * head, from.b, head * sizeof(bf16));
+      }
+      K.pf.gx_w[static_cast<size_t>(l)] = w;
+    }
+  }
+  for (int c = 0; c < nc_; ++c) fab_.compute(c).wait_and_throw();
 }
 
 bool Model::kv_reserve(int slot, int64_t tokens) {

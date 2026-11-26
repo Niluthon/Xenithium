@@ -873,6 +873,12 @@ class Model {
   // buffers its share copies instead of the bf16 rows.
   sycl::event pf_moe_route_own(int c, int lo, int hi, int layer);
   std::array<PfShared, 4> pf_moe_route_sets();
+  // The GDN layers' attention input by owner (PfRun::gdn_owner): card c's rows [lo, hi) of the attention mixer's output
+  // quantised per row and dotted with every card's a | b; the buffers its share copies instead of the bf16 rows; the
+  // setup (every card's a | b weights on each card, the buffers).
+  sycl::event pf_gdn_owner_inputs(int c, int lo, int hi, int layer);
+  std::array<PfShared, 3> pf_gdn_owner_sets();
+  void pf_gdn_owner_init();
   // each card's own rows of the lane to the other cards; written: per card the event of its last kernel that writes them
   // (empty = the copies follow everything on the card's queue so far)
   void pf_lane_share(int lane, std::span<const PfShared> sets, std::span<const sycl::event> written = {});

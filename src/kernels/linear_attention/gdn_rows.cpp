@@ -80,10 +80,10 @@ inline float rsqrt_ieee(float v) SYCL_ESIMD_FUNCTION {
 
 // a | b dots for R rows x J heads per sub-group (see gdn_rows, step 2). J divides the heads per card.
 template <int R, int J>
-sycl::event launch_ab(sycl::queue &q, const GdnShape &s, int m, const bf16 *x, const GdnWeights &w, float *ab) {
-  const int H = s.hidden, vh = s.vh(), ldab = s.ab_n();
+sycl::event launch_ab(sycl::queue &q, const GdnShape &s, int m, const bf16 *x, const GdnWeights &w, float *ab, int ldab) {
+  const int H = s.hidden, vh = s.vh();
   const bf16 *wa = w.a, *wb = w.b;
-  const int rb = (m + R - 1) / R, jb = ldab / J;
+  const int rb = (m + R - 1) / R, jb = s.ab_n() / J;
   return q.parallel_for<GrAb<R, J>>(sycl::nd_range<1>(static_cast<size_t>(rb) * jb * 16, 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
     const int g = static_cast<int>(it.get_group(0)), r0 = (g / jb) * R, j0 = (g % jb) * J, lane = static_cast<int>(it.get_local_id(0));
     const bf16 *wr[J];
@@ -212,6 +212,18 @@ const char *gdn_stage_name(GdnStage s) {
   return i >= 0 && i < static_cast<int>(GdnStage::kCount) ? n[i] : "?";
 }
 
+// One 16-lane sub-group per (R rows, J of the a | b dots' heads). Each dot keeps the one-dot form's order (lane l sums
+// k = l, l + 16... then the sub-group reduction), so R and J change no bits; they cut the x / weight re-reads (8 rows x
+// 8 heads from 1,024 rows).
+sycl::event gdn_rows_ab(sycl::queue &q, const GdnShape &s, int m, const bf16 *x, const GdnWeights &w, float *ab, int ld) {
+  if (m < 1 || ld < s.ab_n() || !x || !w.a || !w.b || !ab) throw std::invalid_argument("gdn_rows_ab: rows / stride / buffers");
+  const int vh = s.vh();
+  if (vh % kAbJ) return launch_ab<1, 1>(q, s, m, x, w, ab, ld);
+  if (m >= kAbBigRows && vh % kAbJBig == 0) return launch_ab<kAbRowsBig, kAbJBig>(q, s, m, x, w, ab, ld);
+  if (m >= kAbManyRows) return launch_ab<kAbRowsMany, kAbJ>(q, s, m, x, w, ab, ld);
+  return launch_ab<1, kAbJ>(q, s, m, x, w, ab, ld);
+}
+
 GdnEvents gdn_rows(sycl::queue &q, const GdnShape &s, int m, const bf16 *x, const GdnWeights &w, const GdnRowsState &st, const GdnRowsScratch &sc,
                    const PairRowsWire *wire, int wire_parity, bf16 *out) {
   if (m < 1) throw std::invalid_argument("gdn_rows: rows");
@@ -232,23 +244,15 @@ GdnEvents gdn_rows(sycl::queue &q, const GdnShape &s, int m, const bf16 *x, cons
     return e;
   };
 
+  if (sc.x8.ready && (w4q || !sc.x8.row || sc.qkvz_ready)) throw std::invalid_argument("gdn_rows: owner-quantised x is for the int8 qkvz on W8A8 per row");
+  if (sc.ab_in && sc.ab_ld < ldab) throw std::invalid_argument("gdn_rows: the owners' a | b rows' stride");
   // 1 qkvz (raw fp32)
   if (!sc.qkvz_ready)
     ev.qkvz = traced(GdnStage::projections, w4q ? w4a16_gemm_pf(q, m, x, H, w.qkvz4.w, w.qkvz4.scales, sc.yq, ldy, w.qkvz4.n, H)
-                                                : pf_dense(q, m, w.qkvz, x, H, PfOut{sc.yq, nullptr, ldy}, sc.a8.on()));
+                                                : pf_dense(q, m, w.qkvz, x, H, PfOut{sc.yq, nullptr, ldy}, sc.x8.ready ? &sc.x8 : sc.a8.on()));
 
-  // 2 a | b dots (bf16 values): one 16-lane sub-group per (R rows, kAbJ heads). Each dot keeps the
-  // one-dot form's order (lane l sums k = l, l + 16... then the sub-group reduction), so R and kAbJ
-  // change no bits; they cut the x / weight re-reads (8 rows x 8 heads from 1,024 rows).
-  if (vh % kAbJ) {
-    traced(GdnStage::projections, launch_ab<1, 1>(q, s, m, x, w, sc.ab));
-  } else if (m >= kAbBigRows && vh % kAbJBig == 0) {
-    traced(GdnStage::projections, launch_ab<kAbRowsBig, kAbJBig>(q, s, m, x, w, sc.ab));
-  } else if (m >= kAbManyRows) {
-    traced(GdnStage::projections, launch_ab<kAbRowsMany, kAbJ>(q, s, m, x, w, sc.ab));
-  } else {
-    traced(GdnStage::projections, launch_ab<1, kAbJ>(q, s, m, x, w, sc.ab));
-  }
+  // 2 a | b dots (gdn_rows_ab), unless the rows' owners made them
+  if (!sc.ab_in) traced(GdnStage::projections, gdn_rows_ab(q, s, m, x, w, sc.ab, ldab));
 
   // 3+4 conv, prep and gate in one launch. Three item kinds:
   // q / k one item per (16 rows, one 128-channel head): the conv slides over the rows in registers,
@@ -263,7 +267,8 @@ GdnEvents gdn_rows(sycl::queue &q, const GdnShape &s, int m, const bf16 *x, cons
   // seq[t.. t + 3]; c = bf16(silu(taps, oldest first)).
   {
     const StateAt sa(st);
-    const float *yq = sc.yq, *ab = sc.ab;
+    const float *yq = sc.yq, *ab = sc.ab_in ? sc.ab_in : sc.ab;
+    const int ldab_new = sc.ab_in ? sc.ab_ld : ldab;  // the new rows' a | b (the replayed log keeps ldab)
     const bf16 *conv = w.conv, *alog = w.a_log, *dtb = w.dt_bias;
     float *cv = sc.cv, *qn = sc.qn, *kn = sc.kn, *gate = sc.gate, *lgate = sc.lgate;
     const int tblocks = (Tmax + kCvRows - 1) / kCvRows;
@@ -338,7 +343,7 @@ GdnEvents gdn_rows(sycl::queue &q, const GdnShape &s, int m, const bf16 *x, cons
         for (int e = idx * kGateRun; e < (idx + 1) * kGateRun; ++e) {
           const int t = e / vh, hv = e % vh;
           if (t >= T) return;
-          const float *src = t < A ? lab + static_cast<size_t>(t) * ldab : ab + static_cast<size_t>(t - A) * ldab;
+          const float *src = t < A ? lab + static_cast<size_t>(t) * ldab : ab + static_cast<size_t>(t - A) * ldab_new;
           const float av = src[hv], bv = src[vh + hv];
           const esimd::simd<float, 1> xx(av + static_cast<float>(dtb[hv]));
           esimd::simd<float, 1> sp = esimd::log(esimd::simd<float, 1>(1.f) + esimd::exp(xx));
@@ -359,7 +364,7 @@ GdnEvents gdn_rows(sycl::queue &q, const GdnShape &s, int m, const bf16 *x, cons
       for (int e = idx * kGateRun; e < (idx + 1) * kGateRun; ++e) {
         const int t = e / vh, hv = e % vh;
         if (t >= T) return;
-        const float *src = t < A ? lab + static_cast<size_t>(t) * ldab : ab + static_cast<size_t>(t - A) * ldab;
+        const float *src = t < A ? lab + static_cast<size_t>(t) * ldab : ab + static_cast<size_t>(t - A) * ldab_new;
         const esimd::simd<float, 1> xx(src[hv] + static_cast<float>(dtb[hv]));
         esimd::simd<float, 1> sp = esimd::log(esimd::simd<float, 1>(1.f) + esimd::exp(xx));
         sp.merge(xx, xx > 20.f);

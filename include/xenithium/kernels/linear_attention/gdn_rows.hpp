@@ -57,12 +57,23 @@ struct GdnRowsScratch {
   PfA8 a8;  // set = the qkvz and out GEMMs run W8A8 (pf_dense.hpp)
   bool qkvz_ready = false;  // yq already holds x's qkvz projection (the caller ran it in row parts)
   bool out_later = false;  // gdn_rows stops with the gated rows in y; the caller runs gdn_rows_out
+  // The projections' input prepared by the rows' owners (four cards' rows by owner): x8 = x quantised per row for the
+  // W8A8 qkvz (PfA8::ready, row: q / s at this call's rows; pf_a8_quantize), ab_in = the a | b dots of this card's heads
+  // (gdn_rows_ab's [a | b] per row, the call's rows at row stride ab_ld). With both set gdn_rows reads x for neither.
+  PfA8 x8{};
+  const float *ab_in = nullptr;
+  int ab_ld = 0;
   GdnTrace *trace = nullptr;  // prefill profiling: every launch's event by stage (stage_trace.hpp); null = none
 };
 struct GdnRowsSizes {
   size_t yq, ab, cv, qk, gate, lgate, o, partial;
 };
 GdnRowsSizes gdn_rows_sizes(const GdnShape &s, int qkvz_n, int rows_max);
+
+// Step 2 of gdn_rows alone: the a | b dots of shape s's heads (s.card's) over m rows of x into ab (row stride ld >=
+// s.ab_n(), [a | b] per row), the bits gdn_rows writes into its scratch. The rows' owner runs it with every card's
+// weights for the GdnRowsScratch::ab_in of the others.
+sycl::event gdn_rows_ab(sycl::queue &q, const GdnShape &s, int m, const gdn_bf16 *x, const GdnWeights &w, float *ab, int ld);
 
 // x bf16 [m][hidden]; out bf16 [m][hidden]. The state's committed S and window win_in, plus the
 // pending log (log_y / log_ab rows [0, *accept)) of the previous decode step, are the history.

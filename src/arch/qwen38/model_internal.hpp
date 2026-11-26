@@ -100,6 +100,14 @@ struct Model::Card {
     std::vector<std::vector<const uint8_t *>> hsrc;  // [layers]
     kernels::QsaRowsScratch qsa;         // QSA's chunk projections (stage A)
     kernels::PleRowsScratch ple;         // the many-row PLE block
+    // The GDN layers' attention input by owner (prefill.cpp pf_gdn_owner_inputs; null = off): each row's x quantised per
+    // row for the W8A8 qkvz ([rows][hidden] int8, [rows] scales) and the a | b dots of every card's heads ([rows][card]
+    // [ab_n]), at the rows' places in the chunk; and every card's a | b weights stacked per layer ([card][a | b][hidden]
+    // bf16, the dots' column order).
+    int8_t *gx_q = nullptr;
+    float *gx_s = nullptr;
+    float *gx_ab = nullptr;
+    std::vector<const sycl::ext::oneapi::bfloat16 *> gx_w;
     kernels::PfA8 a8;                    // W8A8 scratch for every many-row int8 dense GEMM (ModelOptions:prefill_dense_a8;
                                          // q [rows][hc width] int8, s [rows][width / 128]; the rows-scratch structs above point at it)
     // Prompt logprobs, many-row head: a group of lp_rows rows at a time; the group's bf16 logits live in moe.y (dead
@@ -254,6 +262,9 @@ struct Model::PfRun {
   // The MoE input by owner (W4A8 blocks): each row's owner routes it and quantises it to int8 after its MLP mixer, and
   // shares the routing and the int8 row instead of the bf16 one (pf_lane_mixers, kernels::moe_rows_route).
   bool moe_routed = false;
+  // The GDN layers' attention input by owner: each row's owner quantises it for the W8A8 qkvz and dots it with every
+  // card's a | b, and shares those instead of the bf16 row (pf_gdn_owner_inputs).
+  bool gdn_owner = false;
   // XEN_PF_PROFILE (see pf_mark)
   std::vector<std::pair<int, sycl::event>> dmarks;
   std::chrono::steady_clock::time_point t_sub0, tick;
