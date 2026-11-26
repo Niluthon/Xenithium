@@ -1260,6 +1260,24 @@ void test_rows_quad(xenithium::Fabric &f, const Model &m0, const char *tag, int 
     f.compute(c).memcpy(&e, d[c].wire.error, 4).wait();
     err |= e;
   }
+  // MoeShape:w4_bias (the block gate_up's widen offset outside the DPAS operand, a numerics choice) against the exact
+  // blocks: its one-ulp h flips (~0.2 % of h) reach every output column of their row through down and the sums, so the
+  // bound is the four-card rows' two ulps with up to 5 % of elements moved; every card the same rows
+  bool bias_ok = k::moe_rows_blk_shape(s[0]);
+  std::string bias_text = "no block shape";
+  if (bias_ok) {
+    for (int c = 0; c < C; ++c) rows_blocks(f, c, s[c], M, m.router_n, mem[c], rs[c]), s[c].w4_bias = true;
+    const auto aw = run_rows(next_parity ^ 1);
+    for (int c = 1; c < C; ++c) bias_ok &= read16(f.compute(c), orow[c], aw.size()) == aw;
+    std::vector<float> af(a.size());
+    for (size_t i = 0; i < af.size(); ++i) af[i] = k::bf16_value(a[i]);
+    const Cmp wc = compare(aw, af, H);
+    bias_ok &= wc.scaled <= 2.0 / 128 && wc.off * 20 <= wc.n;
+    bias_text = cmp_text(wc);
+    for (int c = 0; c < C; ++c) s[c].w4_bias = false, rs[c].blk = nullptr, rs[c].blk_n = nullptr;
+  }
+  expect(bias_ok, std::string(tag) + " four cards, rows " + std::to_string(M) + ": the block gate_up with w4_bias vs the exact rows (<= 2 ulps, <= 5 %) " + bias_text +
+                      "; every card the same rows");
   auto refused = [&](bool a8, bool rot) {
     k::MoeShape sr = s[0];
     sr.rot = rot;

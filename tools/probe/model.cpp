@@ -172,6 +172,7 @@ int cmd_model_run(const std::string &model, const std::string &ppl, const std::s
   q38::ModelOptions mo;
   mo.kv_split = g_kv_tokens ? xenithium::kernels::QsaKvSplit::tokens : xenithium::kernels::QsaKvSplit::heads;
   mo.prefill_moe_a8 = g_pf_moe_a8;
+  mo.prefill_moe_bias = g_pf_moe_fast;
   mo.prefill_dense_a8 = g_pf_dense_a8 != 0;
   mo.prefill_dense_a8_row = g_pf_dense_a8 == 2;
   mo.prefill_wire_bf16 = g_q38_pf_wire_bf16;

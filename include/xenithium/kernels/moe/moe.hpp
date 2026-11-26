@@ -85,6 +85,10 @@ struct MoeShape {
   // h's rotate + quantise in gate_up's epilogue (a work-group per 64-column group: 4 tiles x gate|up x the k split),
   // no h launch and no routed bf16 h. Takes precedence over a8_h_in_down.
   bool a8_h_in_gate_up = true;
+  // moe_rows' W4A16 work-group-per-block gate_up (prefill) widens the int4 codes as 128 + q in two bitwise ops and starts
+  // each group's chain from -136 x the row's sum of x over the group, instead of widening q - 8 exactly. Fewer
+  // instructions; not the same bits as the segment kernels (fp32 sums of larger terms): a numerics choice.
+  bool w4_bias = false;
   // The most rows a step of this model carries, 1..kMoeRows. It sizes h and the partials (moe_h_elems,
   // moe_partial_elems: [slot][row] blocks, so 64 rows take four times the bytes of 32); moe_decode refuses more rows.
   // Above kStepRows32: bf16 x only (no rot, no a8), no CPU path.

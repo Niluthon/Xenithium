@@ -203,6 +203,7 @@ Model::Model(const l0::Loader &loader, Fabric &fab, const std::string &dir, cons
   ms_ = MoeSet::from(*dense_, cfg_, nc_, opt.moe_tp);
   ms_.shape.down_bf16 = opt.moe_down_bf16;
   ms_.shape.rot = cfg_.w_rotate || opt.moe_rotate;  // experts baked in a block-Hadamard basis
+  ms_.shape.w4_bias = opt.prefill_moe_bias;  // read only by the prefill W4A16 block gate_up
   // decode W4A8 (the prefill path's numerics; tp only); by default as the checkpoint was tuned
   ms_.shape.a8 = (opt.decode_moe_a8 < 0 ? cfg_.act_bits == 8 : opt.decode_moe_a8 != 0) && opt.moe_tp;
   ms_.shape.rows_cap = step_cap_;  // the MoE's scratch by the largest step

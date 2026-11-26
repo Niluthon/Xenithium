@@ -59,7 +59,7 @@
 // checkpoint (qwen38) from the decode routes of chat prompts (rank.cpp; scripts/make-hot-rank.sh)
 // model --model DIR [--ppl FILE] [--rows 1,4] [--generate N] [--at P] [--context N] [--kv-bytes 1|2] [--kv-v4 0|1] [--kv-split heads|tokens] [--hot N] [--verify 0|1]
 // [--routes-out F] [--hot-rank F] [--reserve GIB] [--lp-out DIR] [--lp-ref F,F] [--bf16 PAT,PAT] [--moe-down-bf16 0|1] [--moe-dn-ks N] [--graphs 0|1]
-// [--moe-tp 0|1] [--hidden-out DIR] [--gen-out F] [--pf-chunk N] [--pf-moe-a8 0|1] [--pf-dense-a8 0|1|2] [--pf-wire fp32|bf16] [--dec-moe-a8 0|1] [--kv-pool N] [--kv-scramble 0|1] [--kv-lend 0|1] [--kv-lend-keep N] [--kv-lend-idle 0|1] [--moe-gu-ks N] [--gdn-scan 0|1] [--pf-cold-stage N] [--pf-fetch N] [--pf-graphs 0|1] [--pf-graph-gate N] [--pf-graph-sizes N,N] [--pf-route-trace F] [--pf-time-only 0|1] [--pf-sweep N,N]
+// [--moe-tp 0|1] [--hidden-out DIR] [--gen-out F] [--pf-chunk N] [--pf-moe-a8 0|1] [--pf-moe-fast 0|1] [--pf-dense-a8 0|1|2] [--pf-wire fp32|bf16] [--dec-moe-a8 0|1] [--kv-pool N] [--kv-scramble 0|1] [--kv-lend 0|1] [--kv-lend-keep N] [--kv-lend-idle 0|1] [--moe-gu-ks N] [--gdn-scan 0|1] [--pf-cold-stage N] [--pf-fetch N] [--pf-graphs 0|1] [--pf-graph-gate N] [--pf-graph-sizes N,N] [--pf-route-trace F] [--pf-time-only 0|1] [--pf-sweep N,N]
 // the whole model on both cards (model.cpp): teacher-forced perplexity on a token file at
 // each row count, then greedy decode timing; one load for everything
 // Every timed loop warms the card by wall time first (warmup.hpp), uses full-entropy data and
@@ -1686,7 +1686,7 @@ int main(int argc, char **argv) {
     }
   }
   if (argc < 2) {
-    std::fprintf(stderr, "usage: xenithium-probe devices|bw|w4|dense|pf|load|store|head|hc|moe|gdn|qsa|ple|model|mtp|seqs|serve [--model DIR] [--mtp DIR] [--prompt-len N] [--depth D] [--drafts-ref F] [--mtp-kv-bytes 1|2] [--ppl FILE] [--rows 1,4] [--generate N] [--layers L,L] [--context N] [--seqs N] [--kv-bytes 1|2] [--drafter 0|1] [--hot N] [--verify 0|1] [--routes-out F] [--hot-rank F] [--reserve GIB] [--lp-out DIR] [--lp-ref F,F] [--bf16 PAT,PAT] [--moe-down-bf16 0|1] [--moe-dn-ks N] [--graphs 0|1] [--moe-tp 0|1] [--hidden-out DIR] [--gen-out F] [--pf-chunk N] [--pf-moe-a8 0|1] [--pf-dense-a8 0|1|2] [--pf-wire fp32|bf16] [--dec-moe-a8 0|1] [--kv-pool N] [--kv-scramble 0|1] [--kv-lend 0|1] [--kv-lend-keep N] [--kv-lend-idle 0|1] [--moe-gu-ks N] [--gdn-scan 0|1] [--pf-cold-stage N] [--pf-fetch N] [--pf-graphs 0|1] [--pf-graph-gate N] [--pf-graph-sizes N,N] [--pf-route-trace F] [--pf-time-only 0|1] [--pf-sweep N,N] [--lp-time N] [--step-rows 4|8] [--two-deep 0|1] [--spec-cap F] [--bucket-gate N] [--bucket-pre 0|1] [--p1-kv-gate A,B] [--layer L] [--threads T] [--device N] [--mib M] [--iters I] [--n N] [--k K] [--ksplit S]\n");
+    std::fprintf(stderr, "usage: xenithium-probe devices|bw|w4|dense|pf|load|store|head|hc|moe|gdn|qsa|ple|model|mtp|seqs|serve [--model DIR] [--mtp DIR] [--prompt-len N] [--depth D] [--drafts-ref F] [--mtp-kv-bytes 1|2] [--ppl FILE] [--rows 1,4] [--generate N] [--layers L,L] [--context N] [--seqs N] [--kv-bytes 1|2] [--drafter 0|1] [--hot N] [--verify 0|1] [--routes-out F] [--hot-rank F] [--reserve GIB] [--lp-out DIR] [--lp-ref F,F] [--bf16 PAT,PAT] [--moe-down-bf16 0|1] [--moe-dn-ks N] [--graphs 0|1] [--moe-tp 0|1] [--hidden-out DIR] [--gen-out F] [--pf-chunk N] [--pf-moe-a8 0|1] [--pf-moe-fast 0|1] [--pf-dense-a8 0|1|2] [--pf-wire fp32|bf16] [--dec-moe-a8 0|1] [--kv-pool N] [--kv-scramble 0|1] [--kv-lend 0|1] [--kv-lend-keep N] [--kv-lend-idle 0|1] [--moe-gu-ks N] [--gdn-scan 0|1] [--pf-cold-stage N] [--pf-fetch N] [--pf-graphs 0|1] [--pf-graph-gate N] [--pf-graph-sizes N,N] [--pf-route-trace F] [--pf-time-only 0|1] [--pf-sweep N,N] [--lp-time N] [--step-rows 4|8] [--two-deep 0|1] [--spec-cap F] [--bucket-gate N] [--bucket-pre 0|1] [--p1-kv-gate A,B] [--layer L] [--threads T] [--device N] [--mib M] [--iters I] [--n N] [--k K] [--ksplit S]\n");
     return 2;
   }
   const std::string cmd = argv[1];
@@ -1755,6 +1755,7 @@ int main(int argc, char **argv) {
     else if (a == "--doc") o.docs = val;
     else if (a == "--pf-split") o.pf_split = v != 0;
     else if (a == "--pf-moe-a8") g_pf_moe_a8 = v != 0;
+    else if (a == "--pf-moe-fast") g_pf_moe_fast = v != 0;
     else if (a == "--pf-dense-a8") g_pf_dense_a8 = static_cast<int>(v);
     else if (a == "--pf-wire") g_q38_pf_wire_bf16 = std::string(val) == "bf16";
     else if (a == "--dec-moe-a8") g_dec_moe_a8 = v != 0 ? 1 : 0;

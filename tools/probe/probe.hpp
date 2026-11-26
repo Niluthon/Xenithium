@@ -60,6 +60,8 @@ extern bool g_dflash_prof;  // --dflash-prof 1: the drafter's stage wall times a
 extern bool g_step_reset;  // --step-reset 1: model35 --step-ab prefills the shape's slots to --at again before every shape
 // --pf-moe-a8 0|1: ModelOptions:prefill_moe_a8 for every model command.
 extern bool g_pf_moe_a8;  // (user): W4A16 only by default
+// --pf-moe-fast 0|1: ModelOptions:prefill_moe_bias for every model command.
+extern bool g_pf_moe_fast;
 // --pf-dense-a8 0|1|2 (2 = per row): ModelOptions:prefill_dense_a8 (+ _row) for every model command.
 extern int g_pf_dense_a8;  // 0 W8A16, 1 W8A8 per group, 2 W8A8 per row with the HC on W8A16
 // --pf-wire fp32|bf16: qwen38 ModelOptions:prefill_wire_bf16 for every qwen38 model command.

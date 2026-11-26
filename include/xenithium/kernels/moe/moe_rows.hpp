@@ -56,7 +56,8 @@ struct MoeRowsScratch {
   // With blk set (and blk_n), the group launch also lists blocks of <= kMoeBlkRows list rows of one expert, and the
   // W4A16 gate_up and down run a work-group per block (the block's x / h rows staged once in SLM per k group, every
   // weight tile loaded once per 32 rows instead of per 16): the same bits (each (row, column) keeps the per-segment
-  // kernels' DPAS chain, scale and rounding; test-moe compares them). Null = the segment kernels.
+  // kernels' DPAS chain, scale and rounding; test-moe compares them; MoeShape:w4_bias trades that for speed in gate_up).
+  // Null = the segment kernels.
   int32_t *blk = nullptr;  // [moe_rows_max_blks][4]: expert, first list position, rows, -
   int32_t *blk_n = nullptr;  // [16]: [0] = blocks
   moe_bf16 *h = nullptr;  // [rows_max * topk][inter_local]

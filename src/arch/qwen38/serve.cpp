@@ -62,6 +62,7 @@ ModelOptions model_options(const serve::Options &o, const model::ModelConfig &cf
   mo.prefill_graphs = o.prefill_graphs;
   mo.prefill_chunk = o.prefill_chunk > 0 ? o.prefill_chunk : 4096;
   mo.prefill_moe_a8 = o.prefill_moe == "w4a8";
+  mo.prefill_moe_bias = o.prefill_moe == "w4a16-fast";
   mo.prefill_dense_a8 = o.prefill_dense == "w8a8" || o.prefill_dense == "w8a8-row";
   mo.prefill_dense_a8_row = o.prefill_dense == "w8a8-row";
   mo.prefill_wire_bf16 = o.prefill_wire == "bf16";  // auto = fp32 (a numerics change: opt-in)

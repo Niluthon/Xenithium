@@ -241,6 +241,9 @@ struct ModelOptions {
   // activations, the numerics the bit-exact gates check). The served model runs W4A16 only: the default is false (W4A8
   // stays as an A/B switch for the probes and the calibration tool).
   bool prefill_moe_a8 = false;
+  // W4A16 prefill experts with the int4 widen's offset outside the DPAS operand (MoeShape:w4_bias): fewer instructions
+  // in gate_up, not the same bits (a numerics change, opt-in). No effect with prefill_moe_a8.
+  bool prefill_moe_bias = false;
   // Prefill dense numerics: true = W8A8, every many-row int8 dense GEMM (HC down / up, GDN qkvz /
   // out, QSA qkv / o, the shared expert, PLE kv, the drafter's prefill pass; not the lm_head: prompt logprobs
   // must equal the 4-row head bit for bit) takes
