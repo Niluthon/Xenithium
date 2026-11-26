@@ -282,6 +282,9 @@ DFlash::DFlash(Fabric &fab, const std::string &dir, const std::string &target_di
     cd.yq = static_cast<float *>(dev(R * hq_ * D * 4));
     cd.ykv_b = static_cast<float *>(dev(R * kvn * 4));
     cd.ykv_c = static_cast<float *>(dev(R * kvn * 4));
+    cd.tnx = static_cast<bf16 *>(dev(2 * R * H * 2));  // kv fuse: context rows then block rows
+    q.memset(cd.tnx, 0, 2 * R * H * 2);
+    cd.ykv_cb = static_cast<float *>(dev(2 * R * kvn * 4));
     cd.qb = static_cast<bf16 *>(dev(R * hq_ * D * 2));
     cd.kb = static_cast<bf16 *>(dev(R * hkv_ * D * 2));
     cd.vb = static_cast<bf16 *>(dev(R * hkv_ * D * 2));
@@ -312,6 +315,7 @@ DFlash::DFlash(Fabric &fab, const std::string &dir, const std::string &target_di
     q.memset(cd.h, 0, R * ipc_ * 2);
     q.memset(cd.rec, 0, k::kMaxSegs * k::kSegRec * 4);
     cd.wire.error = static_cast<uint32_t *>(dev(64));
+    { const char *e = std::getenv("XEN_DFLASH_WIRE_BF16"); cd.wire.bf16 = !(e && e[0] == '0'); }  // on by default (=0: the fp32 wire)
     q.memset(cd.wire.error, 0, 64);
     if (C > 1) {  // TP1: no wire (the sums are the card's own partials, the top-k its own list)
       const size_t tw_words = C == 4 ? k::kDfTopkWireWords4 : k::kDfTopkWireWords;  // two hops at four cards
@@ -475,10 +479,42 @@ void DFlash::load_dspine(const std::string &dir, const std::string &target_dir) 
       if (v & 0x7fff) throw std::runtime_error("dflash (DSpine): a nonzero terminal projection (selected_prefix_bridge.out.weight) is not implemented");
   }
   // bf16 [n][k] row-major -> packed tiles on every card
+  static const bool bridge_i8 = [] { const char *e = std::getenv("XEN_DS_BRIDGE_I8"); return !(e && e[0] == '0'); }();
   auto upload = [&](const std::vector<uint16_t> &w, int n, int kk) {
+    std::vector<k::DenseWeights> out;
+    if (bridge_i8) {
+      std::vector<int8_t> codes(static_cast<size_t>(n) * kk);
+      std::vector<float> sc(static_cast<size_t>(n));
+      for (int r = 0; r < n; ++r) {
+        float mx = 0.f;
+        for (int j = 0; j < kk; ++j) mx = std::max(mx, std::fabs(k::bf16_value(w[static_cast<size_t>(r) * kk + j])));
+        const float s = mx > 0.f ? mx / 127.f : 1.f;
+        sc[static_cast<size_t>(r)] = s;
+        for (int j = 0; j < kk; ++j)
+          codes[static_cast<size_t>(r) * kk + j] = static_cast<int8_t>(std::clamp(std::nearbyint(k::bf16_value(w[static_cast<size_t>(r) * kk + j]) / s), -127.f, 127.f));
+      }
+      std::vector<int8_t> pk(k::dense_packed_elems(n, kk));
+      k::pack_dense_i8(codes.data(), n, kk, pk.data());
+      for (size_t c = 0; c < C; ++c) {
+        void *d = fab_.alloc(c, pk.size());
+        float *sd = static_cast<float *>(fab_.alloc(c, sc.size() * 4));
+        cards_[c].mem.push_back(d);
+        cards_[c].mem.push_back(sd);
+        bytes_[c] += pk.size() + sc.size() * 4;
+        fab_.compute(c).memcpy(d, pk.data(), pk.size()).wait();
+        fab_.compute(c).memcpy(sd, sc.data(), sc.size() * 4).wait();
+        k::DenseWeights dw;
+        dw.w = d;
+        dw.scale = sd;
+        dw.kind = k::DenseKind::i8;
+        dw.n = n;
+        dw.k = kk;
+        out.push_back(dw);
+      }
+      return out;
+    }
     std::vector<uint16_t> pk(k::dense_packed_elems(n, kk));
     k::pack_dense_bf16(w.data(), n, kk, pk.data());
-    std::vector<k::DenseWeights> out;
     for (size_t c = 0; c < C; ++c) {
       void *d = fab_.alloc(c, pk.size() * 2);
       cards_[c].mem.push_back(d);
@@ -670,6 +706,8 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
   int32_t *ids = host_ + kIdsOff, *rec = host_ + kRecOff, *anc = host_ + kAnchorOff;
   // every pair_reduce on the wire alternates its parity: draw one only for a sum that runs
   const int pc = rc > 0 ? wire_parity() : 0;  // the fc sum (context rows)
+  static const bool kv_fuse_env = [] { const char *e = std::getenv("XEN_DS_KV_FUSE"); return !(e && e[0] == '0'); }();
+  const bool kvf = kv_fuse_env && cfg_.kind == DFlashConfig::Kind::dspine && rc > 0 && rb > 0 && rc + rb <= 2 * rows_;
   auto t_mark = std::chrono::steady_clock::now();
   auto mark = [&](int stage) {  // profile only: every stage waited on both cards
     if (!opt_.profile) return;
@@ -692,7 +730,7 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
     if (rc > 0) {
       k::dense_gemm(q, rc, cd.feat_step + static_cast<size_t>(ctx_row0) * fcols_, cd.fc, cd.part);
       reduce(cd, q, rc, pc, &Card::t);
-      k::rms_norm_plain(q, rc, H, cd.t, nullptr, cd.hnorm, eps, cd.tn);
+      k::rms_norm_plain(q, rc, H, cd.t, nullptr, cd.hnorm, eps, kvf ? cd.tnx : cd.tn);
     }
     if (rb > 0) {
       if (tgt_.gather) tgt_.gather(q, static_cast<int>(c), ids, rb, cd.res);  // the target's own gather (arch flint)
@@ -719,7 +757,7 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
       mark(stage);
     };
     const int pn = cards_[0].layers[static_cast<size_t>(l)].aproj.n;
-    if (rc > 0)  // the verified rows' context K / V
+    if (rc > 0 && !kvf)  // the verified rows' context K / V (kv fuse: with the block's, stage 3)
       each(1, [&](Card &cd, const Layer &ly, sycl::queue &q) {
         k::dense_gemm(q, rc, cd.tn, ly.kv, cd.ykv_c);
         k::df_prep(q, rc, ctx_rows, cd.rec, hq_, hkv_, nullptr, cd.ykv_c, ly.qn, ly.kn, eps, k::DfRope{cd.cos, cd.sin, rope.positions}, nullptr, nullptr, nullptr, ly.ring);
@@ -727,13 +765,19 @@ void DFlash::submit(int ns, int ctx_rows, int block_rows, int ctx_row0, int tree
     if (rb == 0) continue;
     if (cfg_.kind == DFlashConfig::Kind::dspine) {  // DSpine's layer (no convolution, a causal block) + its bridge
       const float beps = static_cast<float>(cfg_.bridge_eps);
-      each(2, [&](Card &cd, const Layer &ly, sycl::queue &q) { k::rms_norm_plain(q, rb, H, cd.res, nullptr, ly.in_ln, eps, cd.xn); });
+      each(2, [&](Card &cd, const Layer &ly, sycl::queue &q) { k::rms_norm_plain(q, rb, H, cd.res, nullptr, ly.in_ln, eps, kvf ? cd.tnx + static_cast<size_t>(rc) * H : cd.xn); });
       each(3, [&](Card &cd, const Layer &ly, sycl::queue &q) {
-        lm_gemm(q, rb, cd.xn, ly.q, cd.yq);
-        k::dense_gemm(q, rb, cd.xn, ly.kv, cd.ykv_b);
+        const bf16 *xnp = kvf ? cd.tnx + static_cast<size_t>(rc) * H : cd.xn;
+        lm_gemm(q, rb, xnp, ly.q, cd.yq);
+        if (kvf) {
+          k::dense_gemm(q, rc + rb, cd.tnx, ly.kv, cd.ykv_cb);
+          k::df_prep(q, rc, ctx_rows, cd.rec, hq_, hkv_, nullptr, cd.ykv_cb, ly.qn, ly.kn, eps, k::DfRope{cd.cos, cd.sin, rope.positions}, nullptr, nullptr, nullptr, ly.ring);
+        } else {
+          k::dense_gemm(q, rb, cd.xn, ly.kv, cd.ykv_b);
+        }
       });
       each(4, [&](Card &cd, const Layer &ly, sycl::queue &q) {
-        k::df_prep(q, rb, block_rows, cd.rec, hq_, hkv_, cd.yq, cd.ykv_b, ly.qn, ly.kn, eps, k::DfRope{cd.cos, cd.sin, rope.positions}, cd.qb, cd.kb, cd.vb, ly.ring);
+        k::df_prep(q, rb, block_rows, cd.rec, hq_, hkv_, cd.yq, kvf ? cd.ykv_cb + static_cast<size_t>(rc) * (2 * hkv_ * cfg_.head_dim) : cd.ykv_b, ly.qn, ly.kn, eps, k::DfRope{cd.cos, cd.sin, rope.positions}, cd.qb, cd.kb, cd.vb, ly.ring);
         k::df_attn(q, rb, block_rows, cd.rec, hq_, hkv_, cd.qb, cd.kb, cd.vb, ly.ring, cfg_.window, cd.apart, cd.attn, true);
       });
       each(5, [&](Card &cd, const Layer &ly, sycl::queue &q) {

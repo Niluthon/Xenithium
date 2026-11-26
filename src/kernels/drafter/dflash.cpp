@@ -40,8 +40,8 @@ class DfTopkMergeLists;
 class DfSelectK;
 class DfTreeK;
 
-constexpr int kTopkItems = 256;
-constexpr int kTopkChunk = 4096;  // columns per stage-1 work-group (16 per item)
+constexpr int kTopkItems = 128;  // 2048 x 128
+constexpr int kTopkChunk = 2048;  // columns per stage-1 work-group (16 per item)
 constexpr int kTopkPer = kTopkChunk / kTopkItems;
 constexpr int kPartStride = kDfDim + 2;  // o[128] | max | sum
 
