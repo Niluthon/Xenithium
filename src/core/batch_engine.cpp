@@ -743,6 +743,12 @@ void BatchEngine::spec_step(const std::vector<size_t> &dec_in, std::vector<std::
   // unequal segments at the largest picked depth, for all)
   int lk_depth = depth;
   for (int d : req_depth) lk_depth = std::max(lk_depth, d);
+  // Deep lookup (XEN_LOOKUP_DEEP, default on): a copying request's lookup proposes as many tokens as the step's rows
+  // can carry for one sequence (up to kDepthMax), not only the drafter's depth for this many sequences: a copy is right
+  // far more often than a draft, so at 2-4 streams it can fill segments the drafter's depth table keeps short. The
+  // proposals are still scored against the tokens that came (lk_yield) and the step's layout still fits the rows.
+  static const bool lk_deep = [] { const char *e = std::getenv("XEN_LOOKUP_DEEP"); return !(e && e[0] == '0'); }();
+  if (lk_deep && cfg_.lookup > 0 && going > 0) lk_depth = std::max(lk_depth, std::min(kDepthMax, m_.step_rows_at(going) - 1));
   bool lk_step = cfg_.lookup > 0 && lk_depth > 0 && going > 0;
   std::vector<std::vector<int32_t>> lk_props(static_cast<size_t>(N));
   if (cfg_.lookup > 0)
