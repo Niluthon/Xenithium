@@ -1334,11 +1334,124 @@ void test_tree8(xenithium::Fabric &f, const Model &m, const char *tag, bool flag
 
 }  // namespace
 
+// ---- XEN_GDN_BENCH=1: the core alone, timed (xq) ----
+void bench_core(xenithium::Fabric &f) {
+  const char *kh_e = std::getenv("XEN_GDN_BENCH_KH"), *vh_e = std::getenv("XEN_GDN_BENCH_VH");
+  Model m = make_model(5120, kh_e ? std::atoi(kh_e) : 8, vh_e ? std::atoi(vh_e) : 24, 21);
+  m.s.swish = true;
+  Card d = make_card(f, 0, m, 1);
+  const auto &s = d.s;
+  sycl::queue pq(f.card_context(0), f.device(0), sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
+  constexpr int kSlots = 4, LR = k::kGdnWideRows;
+  std::vector<void *> mem;
+  auto dev = [&](size_t bytes) {
+    void *p = f.alloc(0, std::max<size_t>(bytes, 64));
+    mem.push_back(p);
+    pq.memset(p, 0, std::max<size_t>(bytes, 64)).wait();
+    return p;
+  };
+  k::GdnState g;
+  g.slot_S = k::gdn_S_elems(s);
+  g.slot_win = k::gdn_win_elems(s);
+  g.slot_y = static_cast<size_t>(LR) * d.w.qkvz.n;
+  g.slot_ab = static_cast<size_t>(LR) * s.ab_n();
+  g.log_rows = LR;
+  g.S = static_cast<float *>(dev(g.slot_S * 4 * kSlots));
+  for (int q = 0; q < 2; ++q) {
+    g.win[q] = static_cast<bf16 *>(dev(g.slot_win * 2 * kSlots));
+    g.y[q] = static_cast<float *>(dev(g.slot_y * 4 * kSlots));
+    g.ab[q] = static_cast<float *>(dev(g.slot_ab * 4 * kSlots));
+  }
+  g.seg = static_cast<int32_t *>(dev(k::kMaxSegs * k::kSegRec * 4));
+  g.tree_S = static_cast<float *>(dev(k::gdn_tree_S_elems(s) * 4));
+  k::GdnScratch sc = d.sc;
+  sc.y = static_cast<float *>(dev(static_cast<size_t>(k::kMaxRows) * d.w.qkvz.n * 4));
+  std::vector<float> x(static_cast<size_t>(k::kMaxRows) * s.hidden);
+  std::mt19937 rng(5);
+  std::normal_distribution<float> nd(0.f, 1.f);
+  for (auto &v : x) v = bfr(nd(rng));
+  bf16 *xd = static_cast<bf16 *>(dev(x.size() * 2));
+  const auto xb = bits(x);
+  pq.memcpy(xd, xb.data(), xb.size() * 2).wait();
+  bf16 *outd = static_cast<bf16 *>(dev(static_cast<size_t>(k::kMaxRows) * s.hidden * 2));
+  sc.core = static_cast<bf16 *>(dev(static_cast<size_t>(k::kMaxRows) * s.val_w() * 2));
+  struct Case { int R, P, N; };
+  const Case cases[] = {{1, 0, 1}, {2, 1, 1}, {2, 2, 1}, {4, 3, 1}, {4, 4, 1}, {5, 4, 1}, {8, 4, 1}, {8, 7, 1}, {8, 8, 1}, {9, 8, 1},
+                        {12, 8, 1}, {12, 11, 1}, {16, 8, 1}, {16, 15, 1}, {16, 16, 1}, {4, 3, 4}, {4, 4, 4}, {8, 7, 2}, {8, 7, 4}};
+  const char *it_env = std::getenv("XEN_GDN_BENCH_ITERS");
+  const int iters = it_env ? std::atoi(it_env) : 200;
+  for (const Case &c : cases) {
+    std::vector<int32_t> w(static_cast<size_t>(k::kMaxSegs) * k::kSegRec, 0);
+    for (int sg = 0; sg < c.N; ++sg) {
+      w[sg * k::kSegRec + k::kSegAccept] = c.P;
+      w[sg * k::kSegRec + k::kSegParity] = 0;
+      w[sg * k::kSegRec + k::kSegSlot] = sg;
+    }
+    pq.memcpy(const_cast<int32_t *>(g.seg), w.data(), w.size() * 4).wait();
+    k::GdnState gs = g;
+    gs.seg_rows = c.R;
+    gs.accept_max = c.P;
+    gs.commit = c.R == 1;
+    const int rows = c.R * c.N;
+    double tot = 0, tq = 0;
+    for (int n = 0; n < iters + 10; ++n) {
+      const auto e = k::gdn_decode(pq, s, rows, xd, d.w, gs, 0, sc, nullptr, 0, outd);
+      pq.wait();
+      if (n < 10) continue;
+      auto us = [](const sycl::event &ev) {
+        return (ev.get_profiling_info<sycl::info::event_profiling::command_end>() - ev.get_profiling_info<sycl::info::event_profiling::command_start>()) * 1e-3;
+      };
+      tot += us(e.core);
+      tq += us(e.qkvz);
+    }
+    std::printf("BENCH rows %2d accept %2d users %d: core %7.2f us  (qkvz %7.2f us)\n", c.R, c.P, c.N, tot / iters, tq / iters);
+  }
+  // tree steps: production's draft trees (a main chain with side branches), N users, previous accept P (chain replay)
+  struct TCase { std::vector<int> par; int P, N; };
+  const std::vector<TCase> tcases = {  // production shapes (XEN_DIAG_TREES): 8 rows 1 save, 8 rows no save, 16 rows 1 save, 16 rows 2 saves
+      {{-1, 0, 1, 2, 0, 4, 4, 6}, 7, 1}, {{-1, 0, 1, 2, 0, 4, 4, 6}, 4, 1}, {{-1, 0, 1, 2, 2, 4, 5, 6}, 7, 1},
+      {{-1, 0, 1, 2, 0, 4, 0, 6}, 7, 2}, {{-1, 0, 1, 2, 0, 4, 0, 6}, 7, 3}, {{-1, 0, 1, 2, 0, 4, 0, 6}, 7, 4},
+      {{-1, 0, 0, 0, 0, 4, 5, 6, 0, 8, 9, 10, 0, 12, 0, 14}, 8, 1}, {{-1, 0, 0, 0, 0, 4, 5, 6, 0, 8, 9, 10, 0, 12, 0, 14}, 15, 1},
+      {{-1, 0, 1, 2, 2, 4, 5, 2, 7, 0, 9, 10, 0, 12, 0, 14}, 8, 1}};
+  for (const TCase &c : tcases) {
+    const int R = static_cast<int>(c.par.size());
+    uint64_t tw = k::kTreeFlag;
+    for (int j = 1; j < R; ++j) tw |= static_cast<uint64_t>(c.par[static_cast<size_t>(j)]) << (4 * j);
+    const uint64_t aux = k::tree_aux_word(c.par.data(), R);
+    std::vector<int32_t> w(static_cast<size_t>(k::kMaxSegs) * k::kSegRec, 0);
+    for (int sg = 0; sg < c.N; ++sg) {
+      int32_t *r = w.data() + sg * k::kSegRec;
+      r[k::kSegAccept] = c.P;
+      r[k::kSegParity] = 0;
+      r[k::kSegSlot] = sg;
+      k::rec_word_set(r, k::kSegTree, k::kSegTreeHi, tw);
+      k::rec_word_set(r, k::kSegTreeAux, k::kSegTreeAux2, aux);
+    }
+    pq.memcpy(const_cast<int32_t *>(g.seg), w.data(), w.size() * 4).wait();
+    k::GdnState gs = g;
+    gs.tree = true;
+    gs.seg_rows = R;
+    gs.accept_max = c.P;
+    gs.commit = false;
+    double tot = 0;
+    for (int n = 0; n < iters + 10; ++n) {
+      const auto e = k::gdn_decode(pq, s, R * c.N, xd, d.w, gs, 0, sc, nullptr, 0, outd);
+      pq.wait();
+      if (n < 10) continue;
+      tot += (e.core.get_profiling_info<sycl::info::event_profiling::command_end>() - e.core.get_profiling_info<sycl::info::event_profiling::command_start>()) * 1e-3;
+    }
+    std::printf("BENCH tree rows %2d accept %2d users %d: core %7.2f us\n", R, c.P, c.N, tot / iters);
+  }
+  for (void *p : mem) f.release(p);
+  free_card(f, d);
+}
+
 int main() {
   try {
     const auto loader = xenithium::l0::Loader::open();
     const bool two = loader.size() > 1;
     xenithium::Fabric f(loader, two ? std::vector<size_t>{0, 1} : std::vector<size_t>{0});
+    if (const char *b = std::getenv("XEN_GDN_BENCH"); b && b[0] == '1') { bench_core(f); return 0; }
     const Model small = make_model(512, 2, 8, 11), model = make_model(2560, 16, 48, 12);
     test_one(f, small, "small (h 512, 2 key / 8 value heads)");
     test_one(f, model, "model dims (h 2560, 16 key / 48 value heads)");
