@@ -91,6 +91,9 @@ inline esimd::simd<bf16, kOp> v_operand(esimd::simd<bf16, kOp> v) SYCL_ESIMD_FUN
 // and applies the same o / l, bf16 and gate roundings. Whole groups keep their bits. tail = 0: no split.
 // a short call's split: up to 16 units per work-group; a tail's remainder keeps 8
 inline constexpr int kFaSplitMax = 16;
+// a decode call (gqa_attn_fa_decode) on this thread: the slot's page row from a device word, its own tail buffer
+struct FaDec { const int32_t *slot_word = nullptr; int slot_pages = 0; bool on = false; };
+thread_local FaDec g_fa_dec;
 struct FaTail {
   int tail = 0, split = 1;
   float *buf = nullptr;  // [tail][split][NI][8 x D o + 8 m + 8 l] fp32
@@ -131,7 +134,8 @@ sycl::event attn_fa(sycl::queue &q, const GqaShape &s, int m, const GqaCache &c,
   const int hq = s.hq(), hkv = s.hkv(), blocks = (m + QB - 1) / QB;
   const uint8_t *kp = c.k, *vp = c.v;
   const float *ksp = c.ks, *vsp = c.vs;
-  const int32_t *pages = c.pages;
+  const int32_t *pages0 = c.pages, *slot_w = g_fa_dec.slot_word;
+  const int slot_pg = g_fa_dec.slot_pages;
   const int win = FL ? s.window : 0, ring = FL ? c.ring_pages : 0;
   const int W = blocks * hkv, tail = FL ? 0 : tp.tail, split = tail ? tp.split : 1, whole = W - tail;
   float *tbuf = tp.buf;
@@ -147,6 +151,7 @@ sycl::event attn_fa(sycl::queue &q, const GqaShape &s, int m, const GqaCache &c,
         const int blk = g / hkv, kvh = g % hkv, r0 = blk * QB;
         const int nrows = m - r0 < QB ? m - r0 : QB;
         const int p0 = pos_word[0] + r0;  // position of the block's first row
+        const int32_t *pages = slot_w ? pages0 + static_cast<size_t>(slot_w[0]) * slot_pg : pages0;
         const int ntok = p0 + nrows;
         int ntiles = (ntok + kTile - 1) / kTile;
         // FL: the first tile any row of the block attends to (its first row's window), the ring's logical page
@@ -551,7 +556,7 @@ sycl::event attn_fa_merge(sycl::queue &q, const GqaShape &s, int m, const int32_
 struct FaTailDev {
   sycl::device dev;
   int cores = 0;
-  float *buf = nullptr;
+  float *buf = nullptr, *dbuf = nullptr;  // dbuf: decode calls'
 };
 std::mutex g_tail_mu;
 std::vector<FaTailDev> g_tail_devs;
@@ -575,12 +580,14 @@ FaTail fa_tail_plan(sycl::queue &q, int W) {
     g_tail_devs.push_back(x);
     d = &g_tail_devs.back();
   }
+  if (g_fa_dec.on && !d->dbuf) d->dbuf = sycl::aligned_alloc_device<float>(4096, static_cast<size_t>(64) * 32 * (8 * 256 + 16), q);
+  float *const tbuf = g_fa_dec.on ? d->dbuf : d->buf;
   const int C = d->cores * std::max(1, 32 / NI), r = W % C;
   if (W < C && g_tail_on >= 2) {  // a short call (one partial wave): every group split over its tiles
     t.tail = W;
     t.split = std::min({kFaSplitMax, C / W, 64 / W});
     if (t.split < 2) return FaTail{};
-    t.buf = d->buf;
+    t.buf = tbuf;
     return t;
   }
   if (W < C) return t;  // mode 1: calls under one wave unsplit (their bits independent of the call's size)
@@ -588,7 +595,7 @@ FaTail fa_tail_plan(sycl::queue &q, int W) {
   t.tail = r;
   t.split = std::min(8, C / r);
   if (t.split < 2 || r * t.split > 64) return FaTail{};
-  t.buf = d->buf;
+  t.buf = tbuf;
   return t;
 }
 
@@ -681,6 +688,20 @@ sycl::event gqa_attn_fa_trained(sycl::queue &q, const GqaShape &s, int m, const 
     case 40: return run.template operator()<40>();
   }
   throw std::invalid_argument("gqa_attn_fa_trained: expected 16, 32 or 40 rows per group");
+}
+
+sycl::event gqa_attn_fa_decode(sycl::queue &q, const GqaShape &s, int m, const GqaCache &c, const int32_t *rec, int stride, const float *y, int ldy,
+                               const gqa_bf16 *qb, gqa_bf16 *attn, bool p_lo, int qk) {
+  if (s.head_dim != 256 || s.grp() != 6 || !s.gate || s.window > 0 || c.ring_pages > 0 || m < 1 || m > 16)
+    throw std::invalid_argument("gqa_attn_fa_decode: grp 6 at head_dim 256 with the gate, 1..16 rows of one segment");
+  if (qk && !qsa_kv_scaled(s.kv)) throw std::invalid_argument("gqa_attn_fa_decode: int8 q.k needs the int8 KV");
+  struct Guard {
+    Guard(const int32_t *w, int sp) { g_fa_dec = FaDec{w, sp, true}; }
+    ~Guard() { g_fa_dec = FaDec{}; }
+  } guard(stride >= kSegRec && c.slot_pages ? rec + kSegSlot : nullptr, c.slot_pages);
+  GqaCache c0 = c;
+  c0.slot_pages = 0;
+  return fa_kv<6, 16>(q, s, m, c0, rec + kSegPos, y, ldy, qb, attn, p_lo, qk);
 }
 
 void gqa_attn_fa_set_tail(int mode) { g_tail_on = std::clamp(mode, 0, 2); }
