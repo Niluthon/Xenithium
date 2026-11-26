@@ -110,6 +110,9 @@ xenithium-server --lora ~/models/hermes-adapter-dl/lora-adapter …
 
 ### Real adapter geometry (harness-hub/Qwen3.8-27B-hermes-adapted)
 
+A copy of this adapter is published as a standalone PEFT repo — `muni501/Qwen3.8-27B-hermes-r32-lora` (Apache-2.0,
+`adapter_model.safetensors` sha256 `0f6b706f…`) — so the path above can be exercised without training one.
+
 r=32 → r16=32, alpha=64 → scale 2.0. 64 layers, 16 GQA (every 4th: 3,7,…,63) + 48 GDN. 512 tensors (256 modules × A/B),
 all F32. hidden 5120, inter 17408, q_heads 48, kv_heads 8, head_dim 128, attn_output_gate true.
 
