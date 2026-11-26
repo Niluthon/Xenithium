@@ -2,6 +2,8 @@
 
 These are the settings we found fastest for each kind of use, with the command that starts them. A contributor measured them on two Arc Pro B60s (24 GB each, TP2, EPYC 7532 host); "our build" below is their fork. The settings we tried and rejected are listed at the end, so nobody has to test them again.
 
+For Qwen3.8-Flash-Next on four cards, see [its recommended settings](recommended-settings-qwen38-flash-next.md).
+
 Every switch is described in [server-env](server-env.md) and [trained K8V4 QSA](trained-k8v4-qsa.md). To see which kernel each setting picks, read the [kernel map](kernel-map.md). [Which PR adds each setting](#which-pr-adds-each-setting) names the pull request behind each switch and how it was measured.
 
 ## Pick a preset
