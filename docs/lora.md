@@ -154,6 +154,36 @@ Prefill (TTFT of a 1-token completion):
 Concurrency, 256-token requests: 2 streams 146.0 tok/s aggregate (73.0 each); 4 streams 187.7 tok/s aggregate
 (46.9 each).
 
+### BetterBench quick run
+
+`betterbench run --quick` (harness 0.6.1, corpus 1.0), driven from media1 against `175:8001`. This is the
+smoke-check preset (1 warmup + 5 passes per category), not a publishable result.
+
+Single-stream decode medians by category (t/s):
+
+| chat | code | file_edit | json | math | prose | reasoning | summarization |
+|---|---|---|---|---|---|---|---|
+| 105.2 | 117.7 | 136.6 | 150.5 | 145.7 | 76.7 | 96.6 | 135.4 |
+
+ALL-median **126.6 t/s**, pooled median **122.4 t/s** (40 requests). Prose is the slowest category — long-form
+generation accepts drafts at a lower rate than code/json.
+
+Prefill:
+
+| prompt tokens | prefill | TTFT |
+|---|---|---|
+| 1,555 | 1,823 tok/s | 0.85 s |
+| 5,953 | 1,771 tok/s | 3.36 s |
+| 11,868 | 1,720 tok/s | 6.90 s |
+| 23,571 | 1,640 tok/s | 14.37 s |
+| 47,109 | 1,506 tok/s | 31.28 s |
+
+Concurrency (48 requests per level): 102.3 t/s at 1 stream, 175.7 at 2, 214.6 at 4, 215.7 at 8.
+
+Caveat on provenance: the harness ran on the client (media1), so the report's `env.gpu_info` is empty — the
+upstream probe knows only `rocm-smi` / `nvidia-smi` and cannot see Intel Arc. The DUT hardware is recorded in
+the run notes (`dut=175`, `card=Arc Pro B70 BMG-G31 card1`), not in the report's environment block.
+
 ## What is not yet established
 
 The gate proves `lora_apply` matches a host reference for identical inputs, and the serve A/B proves the delta
