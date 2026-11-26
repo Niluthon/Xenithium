@@ -284,8 +284,10 @@ VisionPlan vision_plan(const Options &o, const model::ModelConfig &cfg, int card
   const int64_t pp = static_cast<int64_t>(v.vc.patch) * v.vc.patch, mm = static_cast<int64_t>(v.vc.merge) * v.vc.merge;
   v.max_patches = static_cast<int>(o.vision_max_pixels / pp / mm * mm);
   v.rows = static_cast<int64_t>(o.vision_images) * (v.max_patches / mm);
-  for (int c = 0; c < cards; ++c)  // the tower on the first cards, the image rows on all
-    v.gib.push_back(static_cast<double>(arch::VisionTower::bytes_on(v.vc, v.max_patches, cards, c) + arch::VisionStore::pool_bytes(v.vc, v.rows)) / 1073741824.0);
+  for (int c = 0; c < cards; ++c) {  // the tower on the first cards, the image rows on all
+    v.bytes.push_back(arch::VisionTower::bytes_on(v.vc, v.max_patches, cards, c) + arch::VisionStore::pool_bytes(v.vc, v.rows));
+    v.gib.push_back(static_cast<double>(v.bytes.back()) / 1073741824.0);
+  }
   return v;
 }
 

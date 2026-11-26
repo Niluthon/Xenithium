@@ -48,9 +48,31 @@ struct History {
   sycl::half *pool16;
   const float *norm, *rope;
   int cap;
+  // M-RoPE (image input). thw: this prefill call's own (t, h, w) per row, else null: a row at position p sits at
+  // p + its slot's delta on all three (text; the delta is 0 until an image). open: per slot the first row of the
+  // open 4-row block when a prefill wrote it (position, t, h, w; position -1: none). hmask / wmask: the rotary
+  // frequencies that take h / w (Mrope::pick); zero leaves every frequency on t, the text rope.
+  const int32_t *thw=nullptr;
+  const int32_t *delta=nullptr;
+  int32_t *open=nullptr;
+  uint32_t hmask=0, wmask=0;
 };
-// Position-indexed text rotary table (cos then sin), equivalent to broadcast
-// text MRoPE. We cannot use stock QSA's fused BF16 prep: the trained bank
+struct Thw { int t, h, w; };
+inline Thw text_thw(const History &h, int slot, int p) { const int q=p+h.delta[slot]; return {q,q,q}; }
+inline Thw row_thw(const History &h, int r, int slot, int p) {
+  if(h.thw) { const int32_t *t=h.thw+size_t(r)*3; return {t[0],t[1],t[2]}; }
+  return text_thw(h,slot,p);
+}
+// rotate the pair (lane, lane + 32) by frequency lane at its section's position: the table's rows are cos | sin
+inline void rotate(const History &h, const Thw &p, int lane, float &a0, float &a1) {
+  const int at=(h.hmask>>lane&1u)?p.h:(h.wmask>>lane&1u)?p.w:p.t;
+  const float *rot=h.rope+size_t(sycl::clamp(at,0,h.cap-1))*64;
+  const float aa=a0, bb=a1;
+  a0=aa*rot[lane]-bb*rot[lane+32];
+  a1=bb*rot[lane]+aa*rot[lane+32];
+}
+// Position-indexed rotary table (cos then sin); rotate() composes a row's
+// M-RoPE from it, text rows being broadcast text MRoPE. We cannot use stock QSA's fused BF16 prep: the trained bank
 // rounds neither projected input nor normalized keys to BF16 and has a third norm.
 template<bool PfQuery=false>
 sycl::event norm_index(sycl::queue &q, const History &h, const std::array<float*,3> &x, float eps,
@@ -78,10 +100,8 @@ sycl::event norm_index(sycl::queue &q, const History &h, const std::array<float*
       float *out=(draft?h.staged:h.pf_raw)+size_t(r)*dim;
       for(int i=0;i<dim/workers;++i) out[lane+i*workers]=a[i];
     } else {
-      const float *rot=h.rope+size_t(tree_queries?k::seg_vpos(rec,stride,sr):sr.pos)*64;
-      const float aa=a[0], bb=a[1];
-      a[0]=aa*rot[lane]-bb*rot[lane+32];
-      a[1]=bb*rot[lane]+aa*rot[lane+32];
+      const int p=tree_queries?k::seg_vpos(rec,stride,sr):sr.pos;
+      rotate(h,draft?text_thw(h,sr.slot,p):row_thw(h,r,sr.slot,p),lane,a[0],a[1]);
       float *out=h.query+(size_t(r)*heads+head)*dim;
       for(int i=0;i<dim/workers;++i) out[lane+i*workers]=a[i];
     }
@@ -112,10 +132,16 @@ sycl::event index_blocks(sycl::queue &q, const History &h, float eps, int rows, 
     }
     const float inv=sycl::rsqrt(sycl::reduce_over_group(it.get_group(),ss,sycl::plus<float>())/dim+eps);
     for(int i=0;i<dim/workers;++i) a[i]=(a[i]*inv)*h.norm[2*dim+lane+i*workers];
-    const float *rot=h.rope+size_t(sr.pos-3)*64;
-    const float aa=a[0], bb=a[1];
-    a[0]=aa*rot[lane]-bb*rot[lane+32];
-    a[1]=bb*rot[lane]+aa*rot[lane+32];
+    // the block's first row: in this call, else the slot's open entry when a prefill wrote that row (an image row
+    // can end a chunk); decode rows are text
+    const int t0=sr.pos-3;
+    Thw p;
+    if(t0>=start) p=draft?text_thw(h,sr.slot,t0):row_thw(h,r-3,sr.slot,t0);
+    else {
+      const int32_t *o=h.open+size_t(sr.slot)*4;
+      p=o[0]==t0?Thw{o[1],o[2],o[3]}:text_thw(h,sr.slot,t0);
+    }
+    rotate(h,p,lane,a[0],a[1]);
     const size_t at=(size_t(sr.slot)*(h.cap/4)+sr.pos/4)*dim;
     for(int i=0;i<dim/workers;++i) {
       const int d=lane+i*workers;
@@ -221,6 +247,9 @@ struct Device::Impl {
     std::vector<BankLayer> layer;
     std::array<float*,3> x{};
     uint16_t *upload=nullptr;
+    int32_t *thw=nullptr,*delta=nullptr,*open=nullptr;  // History::thw rows staged by set_rows_thw, delta, open
+    int thw_rows=0;
+    const int32_t *thw_now=nullptr;  // the running prefill's rows, for its plan
     size_t allocated=0;
     k::QsaScratch sc{};
     int32_t *entries=nullptr,*counts=nullptr,*status=nullptr;
@@ -297,7 +326,8 @@ size_t Device::bytes_per_rank(size_t layers,int hidden,int slots,int cap,int pf,
   if(subtile && !xmx_prefill) throw std::invalid_argument("prefill subtiles require serving XMX prefill");
   const size_t subtile_bytes=subtile?b(size_t((pf+39)/40)*pages):0;
   return subtile_bytes+prefill+layers*layer+weights+scratch+b(size_t(cap)*64)+b(size_t(pf)*dim)+b(size_t(st)*heads*dim)+
-      3*b(st)+b(size_t(st)*k::kTrainedQsaTopBlocks)+b(size_t(st)*k::kTrainedQsaPages)+b(size_t(st)*4);
+      3*b(st)+b(size_t(st)*k::kTrainedQsaTopBlocks)+b(size_t(st)*k::kTrainedQsaPages)+b(size_t(st)*4)+
+      b(size_t(pf)*3)+b(slots)+b(size_t(slots)*4);  // M-RoPE rows, deltas, open entries
 }
 Device::Device(Fabric &fab,std::span<const Layer> weights,int slots,int cap,int pf,int st,bool xmx_prefill) {
   const size_t planned=bytes_per_rank(weights.size(),weights.empty()?0:weights.front().hidden(),slots,cap,pf,st,xmx_prefill);
@@ -329,6 +359,11 @@ Device::Device(Fabric &fab,std::span<const Layer> weights,int slots,int cap,int 
     h.pf_raw=p_->alloc<float>(c,size_t(pf)*dim);
     auto *rt=p_->alloc<float>(c,rope.size()); h.rope=rt;
     q.memcpy(rt,rope.data(),rope.size()*sizeof(float)).wait_and_throw();
+    d.thw=p_->alloc<int32_t>(c,size_t(pf)*3);
+    d.delta=p_->alloc<int32_t>(c,slots); h.delta=d.delta;
+    d.open=p_->alloc<int32_t>(c,size_t(slots)*4); h.open=d.open;
+    q.fill(d.delta,int32_t(0),size_t(slots));
+    q.fill(d.open,int32_t(-1),size_t(slots)*4).wait_and_throw();
     d.layer.resize(weights.size());
     d.sc.nblk=p_->alloc<int32_t>(c,st);
     d.sc.sel=p_->alloc<int32_t>(c,size_t(st)*k::kTrainedQsaTopBlocks);
@@ -420,7 +455,7 @@ void publish_tail(sycl::queue &q,const History &h,int slot,int pos,int rows,cons
   if (n>0) q.memcpy(h.tail+(size_t(slot)*4+from%4)*dim,raw+size_t(from-pos)*dim,size_t(n)*dim*sizeof(float));
 }
 }
-k::GqaTrainedPrefill Device::prefill(int card,const k::gqa_bf16 *x,int rows,int slot,int pos,int bank_layer,int fa_rows) {
+k::GqaTrainedPrefill Device::prefill(int card,const k::gqa_bf16 *x,int rows,int slot,int pos,int bank_layer,int fa_rows,int thw_row0) {
   if(rows<1 || rows>p_->prefill_rows || slot<0 || slot>=p_->slots || pos<0 || pos>p_->cap-rows)
     throw std::invalid_argument("trained QSA layer3: invalid prefill slot/positions");
   auto &q=p_->fab.compute(card); auto &d=p_->cards.at(card);
@@ -429,11 +464,49 @@ k::GqaTrainedPrefill Device::prefill(int card,const k::gqa_bf16 *x,int rows,int 
     const auto w=p_->projection(d,l,q,bank_layer,i);
     k::pf_dense(q,rows,w,x,w.k,k::PfOut{d.x[i],nullptr,width});
   }
-  norm_index(q,l.h,d.x,p_->eps,rows,slot,pos,{},false);
-  index_blocks(q,l.h,p_->eps,rows,slot,pos,{},nullptr,false);
-  publish_tail(q,l.h,slot,pos,rows,l.h.pf_raw);
+  History h=l.h;
+  if(thw_row0>=0) {
+    if(thw_row0+rows>d.thw_rows) throw std::logic_error("trained QSA: the prefill's M-RoPE rows were not staged");
+    h.thw=d.thw+size_t(thw_row0)*3;
+  }
+  norm_index(q,h,d.x,p_->eps,rows,slot,pos,{},false);
+  index_blocks(q,h,p_->eps,rows,slot,pos,{},nullptr,false);
+  publish_tail(q,h,slot,pos,rows,h.pf_raw);
+  if(bank_layer+1==int(d.layer.size())) {
+    // after every bank read the old entry: the open block's first row, if this call wrote it
+    const int end=pos+rows, first=end-end%4;
+    q.single_task([=] {
+      int32_t *o=h.open+size_t(slot)*4;
+      if(first==end) { o[0]=-1; return; }
+      if(first<pos) return;  // the block opened before this call; its entry stands
+      const Thw p=row_thw(h,first-pos,slot,first);
+      o[0]=first; o[1]=p.t; o[2]=p.h; o[3]=p.w;
+    });
+  }
   if(!fa_rows) return {};  // the default still builds only the decode history
-  return prefill_plan(card,rows,slot,pos,bank_layer,fa_rows,p_->subtile);
+  d.thw_now=h.thw;
+  auto plan=prefill_plan(card,rows,slot,pos,bank_layer,fa_rows,p_->subtile);
+  d.thw_now=nullptr;
+  return plan;
+}
+void Device::set_rows_thw(int card,const int32_t *thw,int rows) {
+  auto &d=p_->cards.at(card);
+  if(!thw) { d.thw_rows=0; return; }
+  if(rows<1 || rows>p_->prefill_rows) throw std::invalid_argument("trained QSA: invalid M-RoPE row count");
+  p_->fab.compute(card).memcpy(d.thw,thw,size_t(rows)*3*sizeof(int32_t)).wait_and_throw();
+  d.thw_rows=rows;
+}
+void Device::set_delta(int card,int slot,int delta) {
+  if(slot<0 || slot>=p_->slots) throw std::invalid_argument("trained QSA: invalid delta slot");
+  p_->fab.compute(card).fill(p_->cards.at(card).delta+slot,int32_t(delta),1);
+}
+void Device::set_mrope(int sec_h,int sec_w) {
+  uint32_t hm=0,wm=0;
+  for(int i=0;i<32;++i) {
+    if(i%3==1 && i<3*sec_h) hm|=1u<<i;
+    else if(i%3==2 && i<3*sec_w) wm|=1u<<i;
+  }
+  for(auto &c:p_->cards) for(auto &l:c.layer) { l.h.hmask=hm; l.h.wmask=wm; }
 }
 k::GqaTrainedPrefill Device::prefill_plan(int card,int rows,int slot,int pos,int bank,int fa_rows,bool skip_subtiles) {
   auto &q=p_->fab.compute(card); auto &d=p_->cards.at(card);
@@ -455,11 +528,14 @@ k::GqaTrainedPrefill Device::prefill_plan(int card,int rows,int slot,int pos,int
   else k::qsa_trained_xmx_pack_k(q,l.h.pool+origin,(pos+rows)/4,w.xmx_keys);
   History h=l.h;
   h.query=w.query;
+  h.thw=d.thw_now;
   for(int q0=0;q0<rows;q0+=pf_score_tile) {
     const int n=std::min(pf_score_tile,rows-q0), start=pos+q0, bound=(start+n)/4;
     std::array<float*,3> projected=d.x;
     for(auto &p:projected) p+=size_t(q0)*width;
-    norm_index<true>(q,h,projected,p_->eps,n,slot,start,{},false);
+    History ht=h;
+    if(ht.thw) ht.thw+=size_t(q0)*3;
+    norm_index<true>(q,ht,projected,p_->eps,n,slot,start,{},false);
     k::qsa_trained_xmx_pack_q(q,w.query,n,w.xmx_queries);
     k::qsa_trained_xmx_score(q,w.xmx_queries,w.xmx_keys,n,start,bound,w.sc.score,p_->cap/4,w.sc.nblk);
     k::qsa_select(q,n,w.sc.score,p_->cap/4,w.sc.nblk,bound,w.sc);

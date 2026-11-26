@@ -191,6 +191,9 @@ struct ModelOptions {
   // once (kv_fit, after a warm-up; until then one context of pages; needs `loader`).
   int64_t kv_pool_tokens = 0;
   const l0::Loader *loader = nullptr;
+  // VRAM each card allocates after the model (--vision 1: the tower and its image rows, serve::VisionPlan::bytes): the
+  // load's KV checks keep it free too, so a pool that fits only until the tower loads is refused at the load
+  std::vector<size_t> later_bytes;
   bool kv_pool_scramble = false;  // pages handed out in a fixed shuffled order (a check: results must not depend on it)
   // KV lending. The shared pool's pages no sequence holds keep the oneDNN layouts of the wide prefill matrices
   // (kernels::onednn_pf_keep: gate | up, the GDN q|k|v|z and the attention q|k|v of every layer whose width takes the
@@ -751,6 +754,12 @@ class Model {
   std::vector<int> trained_qsa_layer_;  // model layer -> bank index; -1 is stock dispatch
   static constexpr int kTrainedQsaShort=8192;
   std::vector<int64_t> qsa_covered_;  // contiguous logical token count; -1 means disabled/incomplete
+  std::vector<int32_t> qsa_delta_dev_;  // each slot's rope delta as the selector's cards hold it
+  std::vector<int32_t> pf_thw_host_;  // the chunk's M-RoPE (t, h, w) per row, beside pf_rope_host_
+  // the selector follows M-RoPE positions (images); a YaRN tier's delta still disables it
+  bool qsa_rope_ok(int64_t delta) const { return delta == 0 || tier_limit_.size() <= 1; }
+  void qsa_sync_delta(int slot, int64_t delta);  // the selector cards' copy of a slot's delta
+  int64_t pf_delta_before_ = 0;  // the single-sequence prefill's delta before its chunk (pf_rope_rows moves it)
   void qsa_invalidate_snapshots(int slot,int64_t retained=-1);
   uint32_t qsa_stage_rows_=0;
   bool qsa_step_sparse_=false;      // some segment of the step runs the trained sparse walk
@@ -798,6 +807,7 @@ class Model {
   size_t kv_page_bytes(int c) const;
   size_t ring_bytes_of(int c) const;
   double vram_free_gib();                  // the tighter card's free VRAM (sysman; -1 without ModelOptions::loader)
+  size_t later_bytes_of(int c) const { return static_cast<size_t>(c) < opt_.later_bytes.size() ? opt_.later_bytes[static_cast<size_t>(c)] : 0; }
   std::vector<std::vector<void *>> kv_mem_;  // [card] the KV buffers (freed by kv_alloc)
   // KV lending (ModelOptions::kv_lend)
   struct LendMat {
