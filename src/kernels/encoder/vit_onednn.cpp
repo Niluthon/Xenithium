@@ -46,6 +46,8 @@ struct Attn {
   int seq = 0, heads = 0, hd = 0;
   g::compiled_partition cp;
   lt q, k, v, scale, out;
+  // the scale as a {1} f32 tensor on the device: oneDNN 3.9 takes host_scalar inputs only as s32
+  std::shared_ptr<float> scale_dev;
 };
 
 struct Dev {
@@ -93,7 +95,13 @@ Attn build_attn(Dev &d, int seq, int heads, int hd) {
   mm1.set_attr<bool>(g::op::attr::transpose_b, true);
   mm1.add_inputs({a.q, a.k});
   mm1.add_outputs({sc});
-  a.scale = lt(id++, ldt::f32, 0, lay::strided, prop::host_scalar);
+  a.scale = lt(id++, ldt::f32, lt::dims{1}, lay::strided);
+  {
+    sycl::queue q = d.q;
+    a.scale_dev = std::shared_ptr<float>(sycl::malloc_device<float>(1, q), [q](float *p) mutable { q.wait(); sycl::free(p, q); });
+    const float v = 1.f / std::sqrt(static_cast<float>(hd));
+    q.memcpy(a.scale_dev.get(), &v, sizeof v).wait();
+  }
   lt scaled(id++, ldt::f32, ssz, lay::strided);
   g::op mul(id++, g::op::kind::Multiply, "scale");
   mul.add_inputs({sc, a.scale});
@@ -159,10 +167,9 @@ sycl::event vit_attention(sycl::queue &q, int seq, int heads, int hd, const vit_
     if (d.attn.size() > 16) d.attn.pop_back();
     a = &d.attn.front();
   }
-  float scale = 1.f / std::sqrt(static_cast<float>(hd));
   vit_bf16 *base = const_cast<vit_bf16 *>(qkv);
   std::vector<g::tensor> in = {g::tensor(a->q, d.geng, base), g::tensor(a->k, d.geng, base + static_cast<size_t>(heads) * hd),
-                               g::tensor::make_scalar_tensor(a->scale, &scale), g::tensor(a->v, d.geng, base + static_cast<size_t>(2) * heads * hd)};
+                               g::tensor(a->scale, d.geng, a->scale_dev.get()), g::tensor(a->v, d.geng, base + static_cast<size_t>(2) * heads * hd)};
   std::vector<g::tensor> out = {g::tensor(a->out, d.geng, o)};
   return g::sycl_interop::execute(a->cp, d.gst, in, out);
 }

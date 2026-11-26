@@ -296,7 +296,8 @@ std::string plan_of(const serve::Options &opt, const model::ModelConfig &cfg, st
   const double page = kvb * kPage;
   // the load's own check on its first pool (Model: 1.5 GiB kept for the runtime's first use; what the warm-up and the
   // staged parts take later is still free then)
-  const double later = (o.warmup ? first_use : 0.0) + staged + (dense27 && block ? 0.09 : 0.0);  // (a block drafter's load line: 0.09 more)
+  // (the image tower is staged too, but the load's check keeps it free: ModelOptions::later_bytes)
+  const double later = (o.warmup ? first_use : 0.0) + staged - (vp.on ? vp.max_gib() : 0.0) + (dense27 && block ? 0.09 : 0.0);  // (a block drafter's load line: 0.09 more)
   const int64_t fit0 = static_cast<int64_t>(std::max(0.0, room + (later - 1.5) * G - rings) / page);
   const int64_t fit = static_cast<int64_t>(std::max(0.0, room - reserve * G - rings) / page);
   int64_t pool = 0;
@@ -345,6 +346,7 @@ class Backend final : public serve::Backend {
     loader_ = std::make_unique<l0::Loader>(l0::Loader::open());
     fab_ = std::make_unique<Fabric>(*loader_, serve::cards_for(*loader_, o_.tp, o_.card, arch_id, true), false);  // no queue profiling
     mo.loader = loader_.get();
+    mo.later_bytes = vp.bytes;  // the tower loads after the model: its VRAM stays free in the load's KV checks
     model_ = std::make_unique<Model>(*fab_, o_.model_dir, mo);
     StepOptions so;
     so.wire_bf16 = o_.wire == "bf16";

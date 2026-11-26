@@ -105,7 +105,8 @@ struct VisionPlan {
   model::VisionConfig vc;
   int max_patches = 0;
   int64_t rows = 0;
-  std::vector<double> gib;  // per card
+  std::vector<double> gib;     // per card
+  std::vector<size_t> bytes;   // per card (the same, in bytes: what ModelOptions::later_bytes keeps free)
   double max_gib() const { return gib.empty() ? 0.0 : *std::max_element(gib.begin(), gib.end()); }
 };
 VisionPlan vision_plan(const Options &o, const model::ModelConfig &cfg, int cards);
