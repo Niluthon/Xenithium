@@ -23,6 +23,7 @@ inline float bfr(float v) { return static_cast<float>(bf16(v)); }
 inline float hbf(float v) { return bf16_value(bf16_bits(v)); }  // host: round to bf16
 
 class DsBridgeInK;
+class DsBridgeInFastK;
 class DsCodesK;
 class DsMessageK;
 class DsBridgeOutK;
@@ -71,6 +72,39 @@ DsTreeTab ds_tree_tab(sycl::queue &q) {
 sycl::event ds_bridge_in(sycl::queue &q, int rows, int hidden, bf16 *res, const bf16 *add, float eps, float *rms, bf16 *xr) {
   if (rows < 1 || hidden < 1) throw std::invalid_argument("ds_bridge_in: shape");
   const int H = hidden;
+  static const bool fast = [] { const char *e = std::getenv("XEN_DS_BRIDGE_FAST"); return !(e && e[0] == '0'); }();
+  constexpr int kF = 1024, kV = 8;
+  if (fast && H <= kF * kV) {
+    return q.parallel_for<DsBridgeInFastK>(sycl::nd_range<1>(static_cast<size_t>(rows) * kF, kF), [=](sycl::nd_item<1> it) {
+      const int r = static_cast<int>(it.get_group(0)), lid = static_cast<int>(it.get_local_id(0));
+      bf16 *x = res + static_cast<size_t>(r) * H;
+      float v[kV];
+      float acc = 0.f;
+#pragma unroll
+      for (int j = 0; j < kV; ++j) {
+        const int h = lid + j * kF;
+        v[j] = 0.f;
+        if (h < H) {
+          float t = static_cast<float>(x[h]);
+          if (add) {
+            t = bfr(t + static_cast<float>(add[static_cast<size_t>(r) * H + h]));
+            x[h] = bf16(t);
+          }
+          v[j] = t;
+          acc += t * t;
+        }
+      }
+      acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+      const float s = sycl::sqrt(sycl::fmax(acc / static_cast<float>(H), FLT_MIN));
+      if (lid == 0) rms[r] = s;
+      const float den = s + eps;
+#pragma unroll
+      for (int j = 0; j < kV; ++j) {
+        const int h = lid + j * kF;
+        if (h < H) xr[static_cast<size_t>(r) * H + h] = bf16(v[j] / den);
+      }
+    });
+  }
   return q.parallel_for<DsBridgeInK>(sycl::nd_range<1>(static_cast<size_t>(rows) * kRowItems, kRowItems), [=](sycl::nd_item<1> it) {
     const int r = static_cast<int>(it.get_group(0)), lid = static_cast<int>(it.get_local_id(0));
     bf16 *x = res + static_cast<size_t>(r) * H;

@@ -248,6 +248,8 @@ class DFlash {
     bf16 *feat_step = nullptr, *feat_pf = nullptr;
     bf16 *feat_save = nullptr;  // the verify's feature rows, kept while they are re-laid
     float *part = nullptr, *dyn = nullptr, *yq = nullptr, *ykv_b = nullptr, *ykv_c = nullptr, *apart = nullptr, *gu = nullptr, *logits = nullptr, *hp = nullptr;
+    bf16 *tnx = nullptr;
+    float *ykv_cb = nullptr;
     float *silu = nullptr;  // kernels::swiglu_table (int4 gate | up: swiglu in the GEMM's epilogue)
     bf16 *t = nullptr, *tn = nullptr, *res = nullptr, *xn = nullptr, *xc = nullptr, *mix = nullptr, *mlp = nullptr, *hout = nullptr;
     bf16 *qb = nullptr, *kb = nullptr, *vb = nullptr, *attn = nullptr, *h = nullptr;
