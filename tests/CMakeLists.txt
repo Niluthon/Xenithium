@@ -53,6 +53,7 @@ xenithium_test(gqa-flint GPU TIMEOUT 600 LIBS xenithium_kernels)
 xenithium_test(moe-aff GPU TIMEOUT 600 LIBS xenithium_kernels)
 xenithium_test(dflash GPU LIBS xenithium_kernels)
 xenithium_test(ple GPU LIBS xenithium_kernels)
+xenithium_test(lora GPU LIBS xenithium_arch)  # the PEFT adapter: config / name / shape rejects, load + lora_apply vs the host reference, zero-adapter invariance
 xenithium_test(wire GPU LIBS xenithium_kernels)  # the two-card sums' bits for every row count and slot width
 xenithium_test(rows16 GPU LIBS xenithium_kernels)  # the 16-row kernel shape keeps every row's bits
 xenithium_test(vision GPU TIMEOUT 900 LIBS xenithium_arch)  # the encoder kernels + the vision tower vs the reference

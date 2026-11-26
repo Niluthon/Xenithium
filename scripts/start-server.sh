@@ -48,6 +48,7 @@ if [[ -n "$model_env" && "$model_env" != auto ]]; then
 fi
 if [[ "$model_env" == auto ]]; then
   for f in models/*.env models/presets/*.env; do
+    [[ -f "$f" ]] || continue
     [[ "$f" =~ \.tp[0-9]+\.env$ ]] && continue  # a setup file (it names no checkpoint)
     [[ "$f" == models/presets/* && -f "models/${f##*/}" ]] && continue  # your file of that name replaces the preset
     grep -q "^XEN_PRESET_EXPLICIT=1" "$f" && continue  # a variant that needs extra files: only by name (XEN_MODEL_ENV=<id>)
@@ -128,6 +129,7 @@ XEN_REPETITION_PENALTY=${XEN_REPETITION_PENALTY:-}
 XEN_MTP=${XEN_MTP:-}
 XEN_DRAFTER=${XEN_DRAFTER:-1}
 XEN_DRAFTER_MODEL=${XEN_DRAFTER_MODEL:-}
+XEN_LORA_ADAPTER=${XEN_LORA_ADAPTER:-}
 XEN_DRAFT_VOCAB=${XEN_DRAFT_VOCAB:-98304}
 XEN_DRAFTER_DEFER=${XEN_DRAFTER_DEFER:-64}
 XEN_DRAFTER_CUT=${XEN_DRAFTER_CUT:-0.02}
@@ -217,6 +219,7 @@ cmd=(./build/xenithium-server --model "$XEN_MODEL" --host "$XEN_HOST" --port "$X
 [[ -n "$XEN_PRESENCE_PENALTY" ]] && cmd+=(--presence-penalty "$XEN_PRESENCE_PENALTY")
 [[ -n "$XEN_REPETITION_PENALTY" ]] && cmd+=(--repetition-penalty "$XEN_REPETITION_PENALTY")
 [[ -n "$XEN_DRAFTER_MODEL" ]] && cmd+=(--drafter-model "${XEN_DRAFTER_MODEL/#\~/$HOME}")
+[[ -n "$XEN_LORA_ADAPTER" ]] && cmd+=(--lora "${XEN_LORA_ADAPTER/#\~/$HOME}")
 [[ -n "$XEN_DRAFT_DEPTHS" ]] && cmd+=(--draft-depths "$XEN_DRAFT_DEPTHS")
 cmd+=(--select-heads "$XEN_SELECT_HEADS")
 [[ -n "$XEN_PREFILL_A8_KEEP" ]] && cmd+=(--prefill-a8-keep "$XEN_PREFILL_A8_KEEP")
@@ -266,7 +269,7 @@ if (exec 3<>"/dev/tcp/127.0.0.1/$XEN_PORT") 2>/dev/null; then
 fi
 # other containers hold the cards; this project's own (label org.xenithium, docker/Dockerfile) share the host's
 # process table, so a server in one was caught by the check above
-others=$(docker ps --format '{{.Label "org.xenithium"}}	{{.Names}}' 2>/dev/null | awk -F'\t' '$1 != "1" {print $2}' | tr '\n' ' ')
+others=$(docker ps --format '{{.Label "org.xenithium"}}	{{.Names}}' 2>/dev/null | awk -F'\t' '$1 != "1" {print $2}' | tr '\n' ' ' || true)
 if [[ "$XEN_STUB" != 1 && -n "$others" ]]; then
   echo "start-server: containers hold the cards ($others); stop them first" >&2
   exit 1

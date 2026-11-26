@@ -68,6 +68,9 @@ serve::Options resolve(serve::Options o, std::string_view arch_id) {
   }
   if (!llama && !flint) return o;
   const char *name = llama ? "llama" : "flint";
+  if (!o.lora.empty() && flint)  // the dense LoRA path (q/k/v/o, gate/up/down) is built for qwen35 / llama only
+    throw serve::OptionError("--lora: the LoRA adapter path is built for qwen35 (Qwen3.8-27B) and llama; arch " + std::string(arch_id) +
+                             " (the MoE trunk) does not apply it");
   if (o.prefill_attn == "onednn")
     throw serve::OptionError(std::string("--prefill-attn onednn: oneDNN's attention is built for head_dim 256 with the gate (qwen35); arch ") + name +
                              " takes auto|exact|fast|int8|int8-fast");
@@ -171,6 +174,7 @@ ModelOptions model_options(const serve::Options &o, bool flint) {
     mo.mtp_from = o.drafter_mtp_from;  // both drafters
     mo.dflash_dense_bytes = o.drafter_int4 != 0 ? 4 : 1;  // q, o, gate | up, down as int4 (RTN at load)
   }
+  mo.lora_dir = o.lora;  // the PEFT LoRA adapter (qwen35 / llama; flint is rejected in resolve)
   // Depth 4..6 needs a 5- to 7-row verify: raise the GDN pending logs to 8 rows. DFlash / DSpine already do.
   if (o.drafter != 0 && o.drafter_model.empty() && o.mtp_depth > 3) mo.rows8 = true;
   std::vector<int> want;

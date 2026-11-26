@@ -54,7 +54,7 @@ target_link_libraries(xenithium_rt PUBLIC xenithium_util Threads::Threads)
 
 add_subdirectory(kernels)
 
-add_library(xenithium_arch STATIC ${XENITHIUM_ARCH_DEVICE} load/dense_store.cpp)
+add_library(xenithium_arch STATIC ${XENITHIUM_ARCH_DEVICE} load/dense_store.cpp load/lora.cpp)
 xenithium_sycl(xenithium_arch)
 target_link_libraries(xenithium_arch PUBLIC xenithium_rt xenithium_model xenithium_kernels)
 

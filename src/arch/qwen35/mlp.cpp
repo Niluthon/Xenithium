@@ -97,18 +97,33 @@ void Mlp::reserve_rows(int rows_max, const std::vector<bf16 *> &h, const std::ve
   rows_max_ = rows_max;
 }
 
-void Mlp::gate_up_rows(int c, int lo, int rows, const bf16 *x, const MlpWeights &w) {
+void Mlp::gate_up_rows(int c, int lo, int rows, const bf16 *x, const MlpWeights &w, const kernels::LoraLayer *ll, kernels::LoraScratch *ls) {
   if (lo < 0 || rows < 1 || lo + rows > rows_max_) throw std::invalid_argument("qwen35 mlp: gate_up_rows past reserve_rows");
   Rows &r = rows_[static_cast<size_t>(c)];
+  auto &q = fab_.compute(static_cast<size_t>(c));
+  const bool gu_lora = ll && (ll->gate.present() || ll->up.present());
+  if (gu_lora) {  // the gate | up delta needs the fp32 gu: the gate | up -> swiglu path (the same bits)
+    if (!r.gu) r.gu = static_cast<float *>(fab_.alloc(static_cast<size_t>(c), std::max<size_t>(static_cast<size_t>(rows_max_) * 2 * ipc_ * 4, 4096)));
+    ev_[static_cast<size_t>(c)].gu =
+        kernels::w4a16_gemm_pf(q, rows, x + static_cast<size_t>(lo) * hidden_, hidden_, w.gate_up.w, w.gate_up.scales,
+                               r.gu + static_cast<size_t>(lo) * 2 * ipc_, 2 * ipc_, 2 * ipc_, hidden_);
+    if (ll->gate.present())
+      ev_[static_cast<size_t>(c)].gu = kernels::lora_apply(q, rows, x + static_cast<size_t>(lo) * hidden_, ll->gate, r.gu + static_cast<size_t>(lo) * 2 * ipc_, 2 * ipc_, *ls, 0);
+    if (ll->up.present())  // out_off = ipc: the base pointer, the offset lands the delta on the up section
+      ev_[static_cast<size_t>(c)].gu = kernels::lora_apply(q, rows, x + static_cast<size_t>(lo) * hidden_, ll->up, r.gu + static_cast<size_t>(lo) * 2 * ipc_, 2 * ipc_, *ls, 0);
+    ev_[static_cast<size_t>(c)].silu = kernels::swiglu(q, rows, ipc_, r.gu + static_cast<size_t>(lo) * 2 * ipc_, r.h + static_cast<size_t>(lo) * ipc_);
+    kernels::w4a16_pf_a8_input_clear(q);
+    return;
+  }
   kernels::w4a16_pf_set_h_codes_only(true);  // h's only reader is down (run_rows); on W4A8 it takes the codes
   ev_[static_cast<size_t>(c)].gu = ev_[static_cast<size_t>(c)].silu =
-      kernels::w4a16_gemm_pf_swiglu(fab_.compute(static_cast<size_t>(c)), rows, x + static_cast<size_t>(lo) * hidden_, hidden_, w.gate_up.w, w.gate_up.scales,
+      kernels::w4a16_gemm_pf_swiglu(q, rows, x + static_cast<size_t>(lo) * hidden_, hidden_, w.gate_up.w, w.gate_up.scales,
                                     r.h + static_cast<size_t>(lo) * ipc_, ipc_, ipc_, hidden_);
   kernels::w4a16_pf_set_h_codes_only(false);
 }
 
 void Mlp::run_rows(int m, const std::vector<const bf16 *> &x, const std::vector<MlpWeights> &w, const std::vector<bf16 *> &out, bool reduce, bool fused,
-                   const kernels::PairSplitSend *const *send, bool gu_ready, int parity) {
+                   const kernels::PairSplitSend *const *send, bool gu_ready, int parity, const load::LoraAdapter *lora, int layer) {
   const size_t C = cards_.size();
   if (m < 1 || m > rows_max_) throw std::invalid_argument("qwen35 mlp: run_rows past reserve_rows");
   if (x.size() != C || w.size() != C || out.size() != C) throw std::invalid_argument("qwen35 mlp: one input, weight set and output per card");
@@ -118,11 +133,15 @@ void Mlp::run_rows(int m, const std::vector<const bf16 *> &x, const std::vector<
   for (size_t c = 0; c < C; ++c) {
     Rows &r = rows_[c];
     auto &q = fab_.compute(c);
-    if (!fused && !r.gu)
+    const kernels::LoraLayer *ll = lora ? &lora->layer(static_cast<int>(c), layer) : nullptr;
+    kernels::LoraScratch *ls = lora ? &lora->scratch(static_cast<int>(c)) : nullptr;
+    const bool gu_lora = ll && (ll->gate.present() || ll->up.present());
+    const bool dn_lora = ll && ll->down.present();
+    if ((!fused || gu_lora) && !r.gu)
       r.gu = static_cast<float *>(fab_.alloc(c, std::max<size_t>(static_cast<size_t>(rows_max_) * 2 * ipc_ * 4, 4096)));  // the unfused path
     if (gu_ready) {
-      // h filled by gate_up_rows
-    } else if (fused) {
+      // h filled by gate_up_rows (its gate | up delta applied there)
+    } else if (fused && !gu_lora) {
       // h's only reader is down below; on W4A8 it takes the codes (a split down starts at row m / 2: codes are found
       // from a row that is a multiple of 4)
       const bool codes_only = !send || (m / 2) % 4 == 0;
@@ -131,6 +150,8 @@ void Mlp::run_rows(int m, const std::vector<const bf16 *> &x, const std::vector<
       kernels::w4a16_pf_set_h_codes_only(false);
     } else {
       ev_[c].gu = kernels::w4a16_gemm_pf(q, m, x[c], hidden_, w[c].gate_up.w, w[c].gate_up.scales, r.gu, 2 * ipc_, 2 * ipc_, hidden_);
+      if (ll && ll->gate.present()) ev_[c].gu = kernels::lora_apply(q, m, x[c], ll->gate, r.gu, 2 * ipc_, *ls, 0);
+      if (ll && ll->up.present()) ev_[c].gu = kernels::lora_apply(q, m, x[c], ll->up, r.gu, 2 * ipc_, *ls, 0);  // out_off = ipc
       ev_[c].silu = kernels::swiglu(q, m, ipc_, r.gu, r.h);
       kernels::w4a16_pf_a8_input_clear(q);  // h rewritten without codes (drops a W4A8 GLU's registered h codes)
     }
@@ -138,7 +159,7 @@ void Mlp::run_rows(int m, const std::vector<const bf16 *> &x, const std::vector<
       return kernels::w4a16_gemm_pf(q, rows, r.h + static_cast<size_t>(lo) * ipc_, ipc_, w[c].down.w, w[c].down.scales, r.part + static_cast<size_t>(lo) * hidden_,
                                     hidden_, hidden_, ipc_);
     };
-    if (send && send[c]) {  // the peer's rows first, their copy beside the own rows
+    if (send && send[c] && !dn_lora) {  // the peer's rows first, their copy beside the own rows (a LoRA down: the plain sum)
       const kernels::PairSplitSend &sd = *send[c];
       int lo = 0, hi = 0;
       kernels::pair_split_owner_rows(1 - static_cast<int>(c), m, &lo, &hi);
@@ -149,6 +170,7 @@ void Mlp::run_rows(int m, const std::vector<const bf16 *> &x, const std::vector<
     } else {
       ev_[c].down = down(0, m);
     }
+    if (dn_lora) ev_[c].down = kernels::lora_apply(q, m, r.h, ll->down, r.part, hidden_, *ls, 0);  // the down delta before the sum
     if (reduce) {
       kernels::PairRowsWire xw{};
       if (wire_ext_ && C > 1) {
@@ -169,7 +191,8 @@ MlpWeights Mlp::weights(const load::DenseStore &dense, int card, int layer) cons
   return w;
 }
 
-void Mlp::run(int rows, const std::vector<const bf16 *> &x, const std::vector<MlpWeights> &w, int gu_ksplit, int dn_ksplit) {
+void Mlp::run(int rows, const std::vector<const bf16 *> &x, const std::vector<MlpWeights> &w, int gu_ksplit, int dn_ksplit,
+              const load::LoraAdapter *lora, int layer) {
   const size_t C = cards_.size();
   if (rows < 1 || rows > step_rows_) throw std::invalid_argument("qwen35 mlp: rows");
   if (x.size() != C || w.size() != C) throw std::invalid_argument("qwen35 mlp: one input and one weight set per card");
@@ -179,13 +202,19 @@ void Mlp::run(int rows, const std::vector<const bf16 *> &x, const std::vector<Ml
   for (size_t c = 0; c < C; ++c) {
     Card &k = cards_[c];
     auto &q = fab_.compute(c);
-    if (fused_) {  // swiglu in the gate|up epilogue (same bits)
+    const kernels::LoraLayer *ll = lora ? &lora->layer(static_cast<int>(c), layer) : nullptr;
+    kernels::LoraScratch *ls = lora ? &lora->scratch(static_cast<int>(c)) : nullptr;
+    const bool gu_lora = ll && (ll->gate.present() || ll->up.present());
+    if (fused_ && !gu_lora) {  // swiglu in the gate|up epilogue (same bits); a LoRA gate | up needs the fp32 gu
       ev_[c].gu = ev_[c].silu = kernels::w4a16_gemm_rows_swiglu(q, rows, x[c], w[c].gate_up.w, w[c].gate_up.scales, k.silu, k.h, ipc_, hidden_, gu_ksplit);
     } else {
       ev_[c].gu = kernels::w4a16_gemm_rows(q, rows, x[c], w[c].gate_up.w, w[c].gate_up.scales, k.gu, 2 * ipc_, hidden_, gu_ksplit);
+      if (ll && ll->gate.present()) ev_[c].gu = kernels::lora_apply(q, rows, x[c], ll->gate, k.gu, 2 * ipc_, *ls, 0);
+      if (ll && ll->up.present()) ev_[c].gu = kernels::lora_apply(q, rows, x[c], ll->up, k.gu, 2 * ipc_, *ls, 0);  // out_off = ipc
       ev_[c].silu = kernels::swiglu(q, rows, ipc_, k.gu, k.h);
     }
     ev_[c].down = kernels::w4a16_gemm_rows(q, rows, k.h, w[c].down.w, w[c].down.scales, k.part, hidden_, ipc_, dn_ksplit);
+    if (ll && ll->down.present()) ev_[c].down = kernels::lora_apply(q, rows, k.h, ll->down, k.part, hidden_, *ls, 0);  // the down delta before the reduce
     ev_[c].reduce = kernels::pair_reduce(q, rows, hidden_, k.part, C > 1 ? &k.wire : nullptr, parity_, k.out);
   }
   parity_ ^= 1;

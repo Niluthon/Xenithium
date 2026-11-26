@@ -924,7 +924,8 @@ sycl::event gqa_pack_trained_qsa(sycl::queue &q, int rows, int hkv, const GqaSte
 }
 
 GqaEvents gqa_decode(sycl::queue &q, const GqaShape &s, int rows, const bf16 *x, const GqaWeights &w, const GqaCache &c, const bf16 *rope,
-                     const GqaStep &step, const GqaScratch &sc, const PairWire *wire, int wire_parity, bf16 *out, int qkv_ks, int o_ks) {
+                     const GqaStep &step, const GqaScratch &sc, const PairWire *wire, int wire_parity, bf16 *out, int qkv_ks, int o_ks,
+                     const LoraLayer *lora, LoraScratch *lora_sc) {
   if (rows < 1 || rows > kMaxRows) throw std::invalid_argument("gqa_decode: rows 1..32");
   if (s.q_heads % s.kv_heads || s.q_heads % s.cards || s.kv_heads % s.cards || s.hidden % 64)
     throw std::invalid_argument("gqa_decode: heads must split over the cards and kv heads, hidden % 64 == 0");
@@ -965,6 +966,12 @@ GqaEvents gqa_decode(sycl::queue &q, const GqaShape &s, int rows, const bf16 *x,
   const int ns = s.window > 0 ? kGqaWinSplits : std::min(kGqaSplits, (step.pos_bound + kTile - 1) / kTile);
   GqaEvents e;
   e.qkv = w.dense() ? dense_gemm(q, rows, x, w.qkv_d, sc.y, qkv_ks) : w4a16_gemm_rows(q, rows, x, w.qkv.w, w.qkv.scales, sc.y, w.qkv.n, w.qkv.k, qkv_ks);
+  if (lora) {  // the q | k | v deltas into the fp32 qkv projection (before the norms / rope); the B rows sit at the
+    // q | k | v offsets of sc.y (out_off), the row stride w.qkv_n()
+    if (lora->q.present()) e.qkv = lora_apply(q, rows, x, lora->q, sc.y, w.qkv_n(), *lora_sc, 0);
+    if (lora->k.present()) e.qkv = lora_apply(q, rows, x, lora->k, sc.y, w.qkv_n(), *lora_sc, 0);
+    if (lora->v.present()) e.qkv = lora_apply(q, rows, x, lora->v, sc.y, w.qkv_n(), *lora_sc, 0);
+  }
   e.prep = prep_kv(q, s, rows, w, c, rope, sw, sc, true);
   if (step.kv_only) return e;
   // page selection once a segment's context can pass the budget (below it every segment keeps all
@@ -988,6 +995,7 @@ GqaEvents gqa_decode(sycl::queue &q, const GqaShape &s, int rows, const bf16 *x,
   e.merge = trained ? merge_d<256, true, true>(q, s, rows, w.qkv_n(), sw, sc, step.trained_qsa.counts)
                     : merge(q, s, rows, w.qkv_n(), sw, sc, sel ? sc.sel_n : nullptr);
   e.o = w.dense() ? dense_gemm(q, rows, sc.attn, w.o_d, sc.partial, o_ks) : w4a16_gemm_rows(q, rows, sc.attn, w.o.w, w.o.scales, sc.partial, w.o.n, w.o.k, o_ks);
+  if (lora && lora->o.present()) e.o = lora_apply(q, rows, sc.attn, lora->o, sc.partial, s.hidden, *lora_sc, 0);  // the o delta before the sum
   e.reduce = pair_reduce(q, rows, s.hidden, sc.partial, wire, wire_parity, out);
   return e;
 }
@@ -1141,7 +1149,8 @@ sycl::event gqa_attn_sdpa(sycl::queue &q, const GqaShape &s, int m, int pos0, co
 
 GqaEvents gqa_rows(sycl::queue &q, const GqaShape &s, int m, const bf16 *x, const GqaWeights &w, const GqaCache &c, const bf16 *rope,
                    const int32_t *pos4, int pos0, const GqaRowsScratch &sc, const PairRowsWire *wire, int wire_parity, bf16 *out, int attn,
-                   int rows_per_group, bool p_lo, int qk, const GqaRowsSelect &select, const GqaTrainedPrefill *trained) {
+                   int rows_per_group, bool p_lo, int qk, const GqaRowsSelect &select, const GqaTrainedPrefill *trained, const LoraLayer *lora,
+                   LoraScratch *lora_sc) {
   if (trained && (attn != kGqaAttnFa || select.pages || w.sinks || qk != 1 || p_lo || gqa_attn_fa_rows(s, rows_per_group) != trained->rows_per_group))
     throw std::invalid_argument("gqa_rows: trained prefill requires the stock K8V4 int8-fast FA shape");
   if (attn < kGqaAttnBatch || attn > kGqaAttnSdpa) throw std::invalid_argument("gqa_rows: attention body 0..4");
@@ -1162,7 +1171,15 @@ GqaEvents gqa_rows(sycl::queue &q, const GqaShape &s, int m, const bf16 *x, cons
     throw std::invalid_argument("gqa_rows: int8-v4 KV runs the fa body (attention 3) or the batch path (0)");
   const int ldy = w.qkv.n, hq = s.hq(), ok = s.o_k();
   GqaEvents e;
-  if (!sc.qkv_ready) e.qkv = w4a16_gemm_pf(q, m, x, s.hidden, w.qkv.w, w.qkv.scales, sc.y, ldy, w.qkv.n, w.qkv.k);
+  if (!sc.qkv_ready) {
+    e.qkv = w4a16_gemm_pf(q, m, x, s.hidden, w.qkv.w, w.qkv.scales, sc.y, ldy, w.qkv.n, w.qkv.k);
+    if (lora) {  // the q | k | v deltas into the fp32 qkv projection (before the norms / rope); the B rows sit at the
+      // q | k | v offsets of sc.y (out_off), the row stride ldy
+      if (lora->q.present()) e.qkv = lora_apply(q, m, x, lora->q, sc.y, ldy, *lora_sc, 0);
+      if (lora->k.present()) e.qkv = lora_apply(q, m, x, lora->k, sc.y, ldy, *lora_sc, 0);
+      if (lora->v.present()) e.qkv = lora_apply(q, m, x, lora->v, sc.y, ldy, *lora_sc, 0);
+    }
+  }
   const GqaScratch all{sc.y, sc.q, sc.part, sc.attn, sc.partial};
   e.prep = prep_kv(q, s, m, w, c, rope, SegW{pos4, 0, 0}, all);
   if (c.kmin) gqa_bounds_range(q, s, c, pos0, m);  // the chunk's pages' key bounds
@@ -1197,22 +1214,23 @@ GqaEvents gqa_rows(sycl::queue &q, const GqaShape &s, int m, const bf16 *x, cons
     e.merge = merge(q, s, rows, ldy, sw, v);
   }
   if (sc.o_later) return e;  // the caller runs gqa_rows_o over the rows of several calls
-  const GqaEvents t = gqa_rows_o(q, s, m, w, sc, wire, wire_parity, out);
+  const GqaEvents t = gqa_rows_o(q, s, m, w, sc, wire, wire_parity, out, lora, lora_sc);
   e.o = t.o, e.send = t.send, e.reduce = t.reduce;
   return e;
 }
 
 GqaEvents gqa_rows_o(sycl::queue &q, const GqaShape &s, int m, const GqaWeights &w, const GqaRowsScratch &sc, const PairRowsWire *wire, int wire_parity,
-                     bf16 *out) {
+                     bf16 *out, const LoraLayer *lora, LoraScratch *lora_sc) {
   if (m < 1) throw std::invalid_argument("gqa_rows_o: rows");
   if ((s.cards > 1) != (wire != nullptr)) throw std::invalid_argument("gqa_rows_o: a wire is needed exactly with two cards");
   const int ok = s.o_k();
   GqaEvents e;
+  const bool o_lora = lora && lora->o.present();
   auto o_gemm = [&](int lo, int rows) {
     return w4a16_gemm_pf(q, rows, sc.attn + static_cast<size_t>(lo) * ok, ok, w.o.w, w.o.scales, sc.partial + static_cast<size_t>(lo) * s.hidden, s.hidden,
                          w.o.n, w.o.k);
   };
-  if (wire && wire->split && wire->send) {  // the peer's rows first, their copy beside the own rows (gdn_rows')
+  if (wire && wire->split && wire->send && !o_lora) {  // the peer's rows first, their copy beside the own rows (a LoRA o: the plain sum)
     int lo = 0, hi = 0;
     pair_split_owner_rows(1 - s.card, m, &lo, &hi);
     if (hi > lo) o_gemm(lo, hi - lo);
@@ -1222,6 +1240,7 @@ GqaEvents gqa_rows_o(sycl::queue &q, const GqaShape &s, int m, const GqaWeights 
   } else {
     e.o = o_gemm(0, m);
   }
+  if (o_lora) e.o = lora_apply(q, m, sc.attn, lora->o, sc.partial, s.hidden, *lora_sc, 0);  // the o delta before the sum
   if (!wire || !wire->split) e.reduce = pair_reduce_rows(q, m, s.hidden, sc.partial, wire, wire_parity, out);  // split: the caller sums sc.partial
   return e;
 }
