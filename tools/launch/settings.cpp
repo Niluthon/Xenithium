@@ -1970,8 +1970,8 @@ std::vector<Spec> schema() {
     s.names = {{"0", "off"}};
     s.unit = "s";
   }
-  add("XEN_REPORT_LAUNCH", "Report the launch (benchmarks)", rt, Kind::Bool);
   add("XEN_STUB", "Stub engine (no GPU)", rt, Kind::Bool);
+  add("XEN_REPORT_LAUNCH", "Report the launch (benchmarks)", dg, Kind::Bool);  // a start-server.sh setting, so not .diag
   {
     auto &s = add("XEN_PF_LOG", "Prefill call log", dg, Kind::Bool);
     s.diag = true;
@@ -3092,7 +3092,7 @@ std::string group_brief(std::string_view group) {
       {"Queue & connections", "What happens when every slot is busy: how many requests may wait, in which order, and for how long."},
       {"Sampling defaults", "How requests that do not choose their own sampling get sampled: temperature, top-p / top-k / min-p and the penalties. A request's own values always win; empty = the model's recommended values (generation_config.json)."},
       {"Runtime", "The server process itself: sampler threads, warm-up, status log, and a GPU-less stub engine for API tests."},
-      {"Diagnostics", "Extra logging and profiling for debugging; they slow the server down. Off for normal use."},
+      {"Diagnostics", "Extra logging, profiling and reporting for debugging and benchmarks; the logging and profiling slow the server down. Off for normal use."},
       {"Other", "Settings the script or docs know but the launcher has no description for yet; edited as plain text."},
   };
   for (const auto &[g, d] : t)
