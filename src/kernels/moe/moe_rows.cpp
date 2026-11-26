@@ -632,7 +632,7 @@ MoeRowsSizes moe_rows_sizes(const MoeShape &s, int rows_max, int router_n) {
   z.xq = R * s.hidden;
   z.xs = R * (s.hidden / kGroup);
   z.hq = A * s.inter_local();
-  z.hs = A * (s.inter_local() / kHalf);
+  z.hs = A * std::max(s.inter_local() / kHalf, 2);  // (the TP4 W4A8 blocks: two segments per row)
   z.xr = R * s.hidden;
   z.blk = static_cast<size_t>(moe_rows_max_blks(s, rows_max)) * 4;
   return z;
@@ -648,8 +648,10 @@ MoeEvents moe_rows(sycl::queue &q, const MoeShape &s, int m, const bf16 *x, cons
   if (!s.tp) throw std::invalid_argument("moe_rows: expert TP layout only");
   if (s.experts > kGroupItems || s.experts > 32 * kLanes || s.topk > kMoeMaxTopk || s.topk > kLanes) throw std::invalid_argument("moe_rows: experts / topk");
   if (s.hidden % kCombineCols || s.inter_local() % kQuarter || s.shared_inter % kW) throw std::invalid_argument("moe_rows: shape");
-  if ((a8 || s.rot) && s.inter_local() % kHalf)  // the h quant groups / H_64 blocks are 64 wide: TP4's 160 columns cut them
-    throw std::invalid_argument("moe_rows: W4A8 and rot need 64-column cards (TP4's 160 columns per card run W4A16 without rot)");
+  // W4A8 at 160 columns per card: the block kernels with per-segment h scales (64-wide h groups would cut the card)
+  const bool blocks8 = a8 && sc.blk && sc.blk_n && s.inter_local() % kHalf && moe_rows_blk8_shape(s);
+  if (((a8 && !blocks8) || s.rot) && s.inter_local() % kHalf)  // the h quant groups / H_64 blocks are 64 wide
+    throw std::invalid_argument("moe_rows: W4A8 needs 64-column cards or the TP4 block list; rot needs 64-column cards");
   if (a8 && (!sc.xq || !sc.xs || !sc.hq || !sc.hs)) throw std::invalid_argument("moe_rows: W4A8 without its scratch");
   if (s.rot && !sc.xr) throw std::invalid_argument("moe_rows: rot without sc.xr");
   if (wire && m > wire->rows_max) throw std::invalid_argument("moe_rows: more rows than the wire holds");
@@ -708,10 +710,16 @@ MoeEvents moe_rows(sycl::queue &q, const MoeShape &s, int m, const bf16 *x, cons
       if (s.rot) moe_rot_quant_rows(q, m, s.hidden, s.hidden, x, sc.xq, sc.xs, kGroup, true);
       else quant_rows<kGroup>(q, m, s.hidden, x, sc.xq, sc.xs);
     }
-    ev.gate_up = gate_up8(q, s, max_segs, ws, sc);
-    if (s.rot) moe_rot_quant_rows(q, m * s.topk, s.inter_local(), s.inter_local(), sc.h, sc.hq, sc.hs, kHalf, true);
-    else quant_rows<kHalf>(q, m * s.topk, s.inter_local(), sc.h, sc.hq, sc.hs);
-    ev.down = down8(q, s, max_segs, ws, sc);
+    if (blocks8) {  // h leaves gate_up quantised
+      const int max_blks = moe_rows_max_blks(s, m);
+      ev.gate_up = moe_rows_gate_up8_blk(q, s, max_blks, ws, sc);
+      ev.down = moe_rows_down8_blk(q, s, max_blks, ws, sc);
+    } else {
+      ev.gate_up = gate_up8(q, s, max_segs, ws, sc);
+      if (s.rot) moe_rot_quant_rows(q, m * s.topk, s.inter_local(), s.inter_local(), sc.h, sc.hq, sc.hs, kHalf, true);
+      else quant_rows<kHalf>(q, m * s.topk, s.inter_local(), sc.h, sc.hq, sc.hs);
+      ev.down = down8(q, s, max_segs, ws, sc);
+    }
   } else {
     const bf16 *xe = x;
     if (s.rot && m > 0) {

@@ -71,7 +71,7 @@ struct MoeRowsScratch {
   int8_t *xq = nullptr;  // [rows_max][hidden]
   float *xs = nullptr;  // [rows_max][hidden / 128]
   int8_t *hq = nullptr;  // [rows_max * topk][inter_local]
-  float *hs = nullptr;  // [rows_max * topk][inter_local / 64]
+  float *hs = nullptr;  // [rows_max * topk][inter_local / 64] (the TP4 W4A8 blocks: [..][moe_rows_blk8_hsegs])
   moe_bf16 *xr = nullptr;  // [rows_max][hidden]: the rotated x (MoeShape:rot only;)
   PfA8 da8;  // set = the shared expert's gate|up and down GEMMs run W8A8 (its own
                              // quantisation of the plain x: xq is the routed experts' input, rotated under rot)
@@ -147,5 +147,13 @@ sycl::event moe_rows_down2(sycl::queue &q, const MoeShape &s, int max_segs, cons
 bool moe_rows_blk_shape(const MoeShape &s);
 sycl::event moe_rows_gate_up_blk(sycl::queue &q, const MoeShape &s, int max_blks, const moe_bf16 *x, const MoeWeights &w, const MoeRowsScratch &sc);
 sycl::event moe_rows_down_blk(sycl::queue &q, const MoeShape &s, int max_blks, const MoeWeights &w, const MoeRowsScratch &sc);
+// The work-group-per-block W4A8 gate_up and down at 160 columns per card (TP4; moe_rows_gu.cpp, 256 GRF): s8 x s4 DPAS
+// on xq / xs (one scale per (row, 128-k group)); gate_up writes h straight as hq with one scale per (list row, segment)
+// into hs ([rows][moe_rows_blk8_hsegs]), a segment = the card's k range cut at the down scales' 128-k group bounds;
+// down reads them. Not rotated experts.
+bool moe_rows_blk8_shape(const MoeShape &s);
+int moe_rows_blk8_hsegs(const MoeShape &s);
+sycl::event moe_rows_gate_up8_blk(sycl::queue &q, const MoeShape &s, int max_blks, const MoeWeights &w, const MoeRowsScratch &sc);
+sycl::event moe_rows_down8_blk(sycl::queue &q, const MoeShape &s, int max_blks, const MoeWeights &w, const MoeRowsScratch &sc);
 
 }  // namespace xenithium:kernels

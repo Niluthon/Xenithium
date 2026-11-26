@@ -436,12 +436,14 @@ const char *brief_of(std::string_view key) {
       {"XEN_PREFILL_MOE",
        "qwen38: precision of the expert activations while reading the prompt.\n"
        "\n"
+       "`auto`  `w4a8` on four cards, `w4a16` on one or two (the default)\n"
+       "`w4a8`  int8 activations\n"
        "`w4a16`  the same numerics as generation\n"
        "`w4a16-fast`  bf16 activations, the 4-bit weights unpacked in fewer steps\n"
-       "`w4a8`  int8 activations\n"
        "\n"
-       "Gives (w4a16-fast, w4a8): + prompt reading speed (a little).\n"
-       "Takes (w4a16-fast, w4a8): - exactness: the output changes slightly."},
+       "Gives (`w4a8` on four cards): + prompt reading speed, about 3 % over `w4a16`.\n"
+       "Takes (`w4a8`, `w4a16-fast`): - exactness: the output changes slightly.\n"
+       "Note: on one or two cards `w4a8` reads the prompt slower than `w4a16`."},
       {"XEN_PREFILL_DENSE",
        "qwen38: precision of the dense layers' activations while reading the prompt.\n"
        "\n"
@@ -1548,7 +1550,7 @@ std::vector<Spec> schema() {
   {
     auto &s = add("XEN_PREFILL_MOE", "Prefill experts", num, Kind::Choice);
     s.scope = Scope::Qwen38;
-    s.choices = {"w4a16", "w4a16-fast", "w4a8"};
+    s.choices = {"auto", "w4a8", "w4a16", "w4a16-fast"};
   }
   {
     auto &s = add("XEN_PREFILL_DENSE", "Prefill dense trunk", num, Kind::Choice);

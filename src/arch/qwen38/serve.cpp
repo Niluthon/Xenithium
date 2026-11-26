@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <memory>
 #include <sstream>
+#include <string_view>
 
 #include "xenithium/arch/common/vision.hpp"
 #include "xenithium/arch/qwen38/model.hpp"
@@ -37,6 +38,15 @@ constexpr int kDenseOneDnnRows = 1024;  // rows per call from which the int8 tru
 constexpr int kDefaultStepRows = kernels::kStepRows16, kDefaultStepRowsTp4 = kernels::kMaxRows;
 int step_rows_of(const serve::Options &o) { return o.step_rows_or(o.tp == 4 ? kDefaultStepRowsTp4 : kDefaultStepRows); }
 
+// The prefill experts' form when --prefill-moe is auto. Four cards take W4A8: their block kernels read int8 x and h on
+// s8 x s4 DPAS (prompt read +3.1..3.4 % over w4a16 at 32K-128K, KL to the reference 0.038 against w4a16's 0.047). One
+// and two cards keep w4a16: their W4A8 kernels are the older per-segment form, slower than the W4A16 blocks (two
+// cards: -4.5 % prompt read at 32K).
+std::string_view prefill_moe_of(const serve::Options &o) {
+  if (o.prefill_moe != "auto") return o.prefill_moe;
+  return o.tp == 4 ? "w4a8" : "w4a16";
+}
+
 // --vision 1 (serve::vision_plan): the tower's VRAM kept free through the reserve while the hot experts fill the cards;
 // the tower loads after the model.
 serve::VisionPlan vision_plan(const serve::Options &o, const model::ModelConfig &cfg) { return serve::vision_plan(o, cfg, o.tp); }
@@ -61,7 +71,7 @@ ModelOptions model_options(const serve::Options &o, const model::ModelConfig &cf
   mo.graphs = o.graphs;
   mo.prefill_graphs = o.prefill_graphs;
   mo.prefill_chunk = o.prefill_chunk > 0 ? o.prefill_chunk : 4096;
-  mo.prefill_moe_a8 = o.prefill_moe == "w4a8";
+  mo.prefill_moe_a8 = prefill_moe_of(o) == "w4a8";
   mo.prefill_moe_bias = o.prefill_moe == "w4a16-fast";
   mo.prefill_dense_a8 = o.prefill_dense == "w8a8" || o.prefill_dense == "w8a8-row";
   mo.prefill_dense_a8_row = o.prefill_dense == "w8a8-row";
@@ -228,6 +238,8 @@ class Backend final : public serve::Backend {
     std::fprintf(stderr, "server: MoE CPU path %s\n", ls.moe_cpu.c_str());  // --moe-cpu
     std::fprintf(stderr, "server: KV lending %s\n", ls.kv_lend.c_str());  // --kv-lend
     std::fprintf(stderr, "server: expert exchange %s\n", ls.exchange.c_str());  // --expert-exchange
+    std::fprintf(stderr, "server: prompt reads run the experts %.*s (--prefill-moe %s)\n", static_cast<int>(prefill_moe_of(o_).size()),
+                 prefill_moe_of(o_).data(), o_.prefill_moe.c_str());
     if (ls.prefill_fetch > 0)  // --prefill-fetch
       std::fprintf(stderr, "server: prompt reads fetch each layer's cold experts ahead: %d blobs x %d per card\n", ls.prefill_fetch, kPfFetchBufs);
     else

@@ -1179,7 +1179,8 @@ void rows_blocks(xenithium::Fabric &f, int c, const k::MoeShape &s, int M, int r
 
 // moe_rows on four cards (32-k quarter down pieces, the four-card MoeRowsWire) against
 // moe_decode on four cards over 4-row slices of the same rows (the decode's grouping of the sum differs: the bound of
-// test_rows), every card's rows identical, a second run identical; W4A8 and rot refused at 160 columns per card.
+// test_rows), every card's rows identical, a second run identical; W4A8 on the block kernels; W4A8 without the block
+// list and rot refused at 160 columns per card.
 void test_rows_quad(xenithium::Fabric &f, const Model &m0, const char *tag, int M) {
   Model m = m0;
   m.s.tp = true;
@@ -1278,6 +1279,36 @@ void test_rows_quad(xenithium::Fabric &f, const Model &m0, const char *tag, int 
   }
   expect(bias_ok, std::string(tag) + " four cards, rows " + std::to_string(M) + ": the block gate_up with w4_bias vs the exact rows (<= 2 ulps, <= 5 %) " + bias_text +
                       "; every card the same rows");
+  // W4A8 on the block kernels (int8 x per 128-k group, int8 h per segment of the card's k): within int8 rounding of
+  // the W4A16 rows, every card the same rows, a rerun identical
+  bool a8_ok = k::moe_rows_blk8_shape(s[0]);
+  double a8_rel = -1;
+  if (a8_ok) {
+    for (int c = 0; c < C; ++c) rows_blocks(f, c, s[c], M, m.router_n, mem[c], rs[c]);
+    auto run8 = [&](int parity) {
+      for (int c = 0; c < C; ++c) k::moe_rows(f.compute(c), s[c], M, x[c], d[c].w, rs[c], &rw[c], parity, orow[c], true);
+      for (int c = 0; c < C; ++c) f.compute(c).wait_and_throw();
+      return read16(f.compute(0), orow[0], static_cast<size_t>(M) * H);
+    };
+    const auto q8 = run8(next_parity);  // (the w4_bias run above took next_parity ^ 1)
+    for (int c = 1; c < C; ++c) a8_ok &= read16(f.compute(c), orow[c], q8.size()) == q8;
+    a8_ok &= run8(next_parity ^ 1) == q8;
+    double se = 0, sr = 0;
+    for (size_t i = 0; i < q8.size(); ++i) {
+      const double dv = k::bf16_value(q8[i]) - k::bf16_value(a[i]);
+      se += dv * dv;
+      sr += static_cast<double>(k::bf16_value(a[i])) * k::bf16_value(a[i]);
+    }
+    a8_rel = std::sqrt(se / std::max(sr, 1e-30));
+    a8_ok &= a8_rel < 2e-2;
+    for (int c = 0; c < C; ++c) rs[c].blk = nullptr, rs[c].blk_n = nullptr;
+  }
+  {
+    char w8[220];
+    std::snprintf(w8, sizeof w8, "%s four cards, rows %d: W4A8 blocks vs W4A16 relative rms %.2e (int8 rounding: < 2e-2); every card the same rows; a rerun identical", tag,
+                  M, a8_rel);
+    expect(a8_ok, w8);
+  }
   auto refused = [&](bool a8, bool rot) {
     k::MoeShape sr = s[0];
     sr.rot = rot;
@@ -1298,7 +1329,7 @@ void test_rows_quad(xenithium::Fabric &f, const Model &m0, const char *tag, int 
   std::snprintf(what, sizeof what, "%s four cards, rows %d: moe_rows vs moe_decode's 4-row slices (four cards, <= 4 ulps) %s; every card the same rows, decode too; a rerun identical; no timeout",
                 tag, M, cmp_text(cmp).c_str());
   expect(close && same && dec_same && again && err == 0, what);
-  std::snprintf(what, sizeof what, "%s four cards: moe_rows refuses W4A8 and rot at 160 columns per card", tag);
+  std::snprintf(what, sizeof what, "%s four cards: moe_rows refuses W4A8 without the block list and rot at 160 columns per card", tag);
   expect(refused(true, false) && refused(false, true), what);
   for (int c = 0; c < C; ++c) {
     for (void *p : mem[c]) f.release(p);

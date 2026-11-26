@@ -52,7 +52,7 @@ struct Options {
   std::string prefill_gemm = "onednn";  // onednn | onednn-all | esimd: qwen35 W4A8 prefill GEMMs n >= 6144 (onednn-all: every one) on oneDNN; qwen38 int8 trunk with chunks >= 2048
   std::string prefill_a8_keep;
   std::string prefill_a8_body = "auto";  // auto | slm | direct: qwen35 W4A8 prefill GEMM body
-  std::string prefill_moe = "w4a16";  // qwen38
+  std::string prefill_moe = "auto";  // qwen38: auto | w4a8 | w4a16 | w4a16-fast (auto: w4a8 on four cards, else w4a16)
   std::string prefill_dense = "w8a8-row";  // qwen38
   int prefill_cold_stage = 16;  // qwen38
   int prefill_fetch = 0;        // qwen38 (two cards)
