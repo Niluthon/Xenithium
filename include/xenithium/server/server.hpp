@@ -21,9 +21,12 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "xenithium/core/engine.hpp"
+#include "xenithium/util/machine.hpp"
 #include "xenithium/server/http.hpp"
 #include "xenithium/text/chat.hpp"
 #include "xenithium/text/tokenizer.hpp"
@@ -66,6 +69,15 @@ class MediaHook {
   virtual int32_t pad_token(int64_t id) const { (void)id; return image_token(); }
 };
 
+// A card the model runs on, as GET /v1/models reports it (benchmarks record what they measured on).
+struct Device {
+  std::string name;  // the driver's name, e.g. "Intel(R) Arc(TM) Pro B65 Graphics"
+  uint64_t memory_bytes = 0;  // device-local memory as the driver reports it (a 32 GB B65: 30.3 GiB)
+  int memory_gb = 0;  // the nominal size, the card table's (util:nominal_vram_gb); 0 = not known
+  std::string pci = {};  // PCI address "0000:01:00.0"; empty when the driver reports none
+  std::string driver = {};  // the GPU driver's version, "1.17.39395+16" (rt:Loader:driver_version_text); empty = not known
+};
+
 struct Config {
   std::string host = "0.0.0.0";  // every interface: reachable from the LAN
   int port = 8000;  // 0 = pick a free port (tests)
@@ -88,7 +100,26 @@ struct Config {
   MediaHook* media = nullptr;
   // How media URLs are loaded (data: always; http(s) fetched unless fetch.enabled is false).
   util::FetchOptions fetch;
+  // The cards the model runs on, in rank order, and its tensor-parallel width (GET /v1/models; empty / 0 = not
+  // reported, as with the stub engine).
+  std::vector<Device> devices;
+  int tensor_parallel = 0;
+  // What it runs (GET /v1/models; empty = not reported): the build's `git describe`, the oneAPI compiler it was built
+  // with ("2025.3.0") and the drafter ("none", "mtp", "dflash2", "dspine", "+mtp" when both draft: serve::Backend:drafter).
+  std::string build, oneapi, drafter;
+  // The machine it runs on (OS, kernel, CPU, host memory; util:this_machine); an empty kernel = not reported.
+  util::Machine machine;
+  // How it was started, only with --report-launch (it shows local paths): the command line's arguments after the
+  // program and the XEN_ variables it saw, so a benchmark can show the launch and anyone can start the same. Values of
+  // secret-looking names are hidden before they get here (tools/server/main.cpp). Empty = not reported.
+  std::vector<std::string> launch_args;
+  std::vector<std::pair<std::string, std::string>> launch_env;
 };
+
+// A name whose value must not leave the machine (Config:launch_args / launch_env are public in GET /v1/models): one of
+// its parts (split at '_' and '-') is a key, token, secret or password. Whole parts only: XEN_KV_POOL_TOKENS is a
+// count, not a token.
+bool secret_name(std::string_view name);
 
 class Server {
  public:

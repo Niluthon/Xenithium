@@ -20,6 +20,7 @@ struct Options {
   std::string served_name = "xenithium";
   bool stub = false;  // GPU-less scripted engine behind the real server
   bool plan = false;  // --plan: print the load's memory plan as JSON (no GPU, no model load) and exit
+  bool report_launch = false;  // --report-launch: GET /v1/models shows the command line and XEN_ variables (benchmarks: run this yourself)
   double stub_step_ms = 2;
   int stub_tokens_per_step = 1;
 

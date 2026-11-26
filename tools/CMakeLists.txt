@@ -1,7 +1,16 @@
 # Executables. SYCL unless HOST (cmake/Xenithium.cmake: xenithium_tool).
 
-# The OpenAI-compatible server (docs/server-env.md): options, then the arch's serving backend.
-xenithium_tool(xenithium-server SOURCES server/main.cpp server/options.cpp LIBS xenithium_gpu_engine)
+# The OpenAI-compatible server (docs/server-env.md): options, then the arch's serving backend. build_rev.cpp holds the
+# checkout's `git describe` (cmake/BuildRev.cmake, refreshed at every build, rewritten only when it changes): the
+# server reports it in GET /v1/models.
+set(XENITHIUM_BUILD_REV_CPP ${CMAKE_CURRENT_BINARY_DIR}/build_rev.cpp)
+add_custom_target(xenithium-build-rev
+  COMMAND ${CMAKE_COMMAND} -DSRC=${PROJECT_SOURCE_DIR} -DOUT=${XENITHIUM_BUILD_REV_CPP} -P ${PROJECT_SOURCE_DIR}/cmake/BuildRev.cmake
+  BYPRODUCTS ${XENITHIUM_BUILD_REV_CPP}
+  COMMENT "Reading the build's git revision"
+  VERBATIM)
+xenithium_tool(xenithium-server SOURCES server/main.cpp server/options.cpp ${XENITHIUM_BUILD_REV_CPP} LIBS xenithium_gpu_engine)
+add_dependencies(xenithium-server xenithium-build-rev)
 
 # Checkpoint catalog, arch validation and the byte budget.
 xenithium_tool(xenithium-inspect HOST SOURCES inspect/main.cpp LIBS xenithium_model)

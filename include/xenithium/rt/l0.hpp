@@ -52,6 +52,9 @@ class Loader {
   bool can_access_peer(size_t i, size_t j) const;
   std::string api_version() const;
   uint32_t driver_version(size_t i) const;
+  // The GPU driver's own version ("1.17.39395+16" for compute runtime 26.31.39395.16: Intel's version-string extension, as sycl-ls shows it), else "build 39395"
+  // from driver_version; empty = not known.
+  std::string driver_version_text(size_t i) const;
 
  private:
   std::vector<ze_driver_handle_t> drivers_;

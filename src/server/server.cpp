@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -944,6 +945,69 @@ struct Server::Impl final : core::EventSink {
       s += pool ? "\"pool\"" : "\"per_slot\"";
       s += ",\"kv_pool_tokens\":";
       append_int(s, pool ? static_cast<long long>(st.kv_pool_tokens) : static_cast<long long>(st.slots) * m.max_model_len);
+    }
+    // What the model runs on (benchmarks record it): the tensor-parallel width and the cards in rank order.
+    if (cfg.tensor_parallel > 0) {
+      s += ",\"tensor_parallel\":";
+      append_int(s, cfg.tensor_parallel);
+    }
+    if (!cfg.devices.empty()) {
+      s += ",\"devices\":[";
+      for (size_t d = 0; d < cfg.devices.size(); ++d) {
+        s += d ? ",{\"name\":" : "{\"name\":";
+        json::write_string(cfg.devices[d].name, s);
+        s += ",\"memory_bytes\":";
+        append_int(s, static_cast<long long>(cfg.devices[d].memory_bytes));
+        if (cfg.devices[d].memory_gb > 0) {
+          s += ",\"memory_gb\":";
+          append_int(s, cfg.devices[d].memory_gb);
+        }
+        if (!cfg.devices[d].pci.empty()) {
+          s += ",\"pci\":";
+          json::write_string(cfg.devices[d].pci, s);
+        }
+        if (!cfg.devices[d].driver.empty()) {
+          s += ",\"driver\":";
+          json::write_string(cfg.devices[d].driver, s);
+        }
+        s += "}";
+      }
+      s += "]";
+    }
+    // What it runs and how it was started (benchmarks show it, so others can run the same).
+    for (const auto &[key, value] : {std::pair{",\"build\":", &cfg.build}, {",\"oneapi\":", &cfg.oneapi}, {",\"drafter\":", &cfg.drafter}})
+      if (!value->empty()) {
+        s += key;
+        json::write_string(*value, s);
+      }
+    if (!cfg.machine.kernel.empty()) {
+      const util::Machine &mc = cfg.machine;
+      s += ",\"machine\":{\"os\":";
+      json::write_string(mc.os, s);
+      s += ",\"kernel\":";
+      json::write_string(mc.kernel, s);
+      s += ",\"cpu\":";
+      json::write_string(mc.cpu, s);
+      s += ",\"cpu_threads\":";
+      append_int(s, mc.cpu_threads);
+      s += ",\"memory_gib\":";
+      append_int(s, mc.memory_gib);
+      s += "}";
+    }
+    if (!cfg.launch_args.empty() || !cfg.launch_env.empty()) {
+      s += ",\"launch\":{\"args\":[";
+      for (size_t a = 0; a < cfg.launch_args.size(); ++a) {
+        if (a) s += ",";
+        json::write_string(cfg.launch_args[a], s);
+      }
+      s += "],\"env\":{";
+      for (size_t e = 0; e < cfg.launch_env.size(); ++e) {
+        if (e) s += ",";
+        json::write_string(cfg.launch_env[e].first, s);
+        s += ":";
+        json::write_string(cfg.launch_env[e].second, s);
+      }
+      s += "}}";
     }
     s += "}";
     return s;
@@ -2277,6 +2341,20 @@ struct Server::Impl final : core::EventSink {
 };
 
 // =====================================================================================
+
+bool secret_name(std::string_view name) {
+  std::string part;
+  for (size_t at = 0; at <= name.size(); ++at) {
+    if (at < name.size() && name[at] != '_' && name[at] != '-') {
+      part += static_cast<char>(std::toupper(static_cast<unsigned char>(name[at])));
+      continue;
+    }
+    for (const char* word : {"KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASS", "AUTH", "CREDENTIALS", "BEARER"})
+      if (part == word) return true;
+    part.clear();
+  }
+  return false;
+}
 
 Server::Server(Config cfg, core::Engine& engine, const text::Tokenizer& tok, const text::ChatFormat* chat)
     : impl_(std::make_unique<Impl>(std::move(cfg), engine, tok, chat)) {}

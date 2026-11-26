@@ -55,6 +55,10 @@ class Backend {
   // Image input (--vision 1 on a checkpoint with a vision tower): the hook the server hands decoded images to;
   // nullptr = text only (image parts answer 400).
   virtual server::MediaHook *media() { return nullptr; }
+  // The cards the model runs on, in rank order (GET /v1/models reports them, and their count as the TP width).
+  virtual std::vector<server::Device> devices() const { return {}; }
+  // The drafter it runs, for GET /v1/models: "none", "mtp", "dflash2", "dspine" (with "+mtp" when both draft)
+  virtual std::string drafter() const { return {}; }
 };
 
 struct BackendEntry {
@@ -154,6 +158,12 @@ double vram_free_gib(const l0::Loader &loader, const Fabric &fab);
 // The cards of the deployment checked against the visible devices; throws OptionError. tp1_ok: the arch runs TP1 too
 // (--tp / --card); else it is TP2 on cards 0 and 1. tp4_ok: --tp 4 = cards 0-3 (qwen38).
 std::vector<size_t> cards_for(const l0::Loader &loader, int tp, int card, std::string_view arch, bool tp1_ok, bool tp4_ok = false);
+// The fabric's cards in rank order, as the server reports them (Backend:devices).
+std::vector<server::Device> devices_of(const l0::Loader &loader, const Fabric &fab);
+// The drafter a backend runs, as Backend:drafter names it: `block_dir` = a block drafter's checkpoint (empty = none; its
+// config.json's architectures tell DSpine from DFlash 2), `mtp` = an MTP layer drafts (alone or, with a block drafter,
+// from some stream count on).
+std::string drafter_name(const std::string &block_dir, bool mtp);
 
 // "server: prefix cache on..." / "off": the one load line every prefix-cache arch prints (bytes per snapshot and card;
 // bytes_card0 == 0 with a capacity = KV pages only, no recurrent state). first_use: say the store is allocated on first use.

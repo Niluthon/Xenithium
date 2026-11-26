@@ -982,6 +982,10 @@ const char *brief_of(std::string_view key) {
        "`2`  the model's default\n"
        "\n"
        "Tip: lower = fewer tokens and a faster first token."},
+      {"XEN_REPORT_LAUNCH",
+       "Shows how the server was started in GET /v1/models (its arguments and every XEN_ variable), so a benchmark's page can say \"Run this yourself\" with the exact command.\n"
+       "\n"
+       "Note: the values of key-, token- or password-like names are hidden, but local paths (the model folder) are visible to every client that can reach the server. Its build, the oneAPI version, the drafter and the cards are reported either way."},
       {"XEN_STUB",
        "A fake engine without GPU behind the real server, for testing clients and the API.\n"
        "\n"
@@ -1966,6 +1970,7 @@ std::vector<Spec> schema() {
     s.names = {{"0", "off"}};
     s.unit = "s";
   }
+  add("XEN_REPORT_LAUNCH", "Report the launch (benchmarks)", rt, Kind::Bool);
   add("XEN_STUB", "Stub engine (no GPU)", rt, Kind::Bool);
   {
     auto &s = add("XEN_PF_LOG", "Prefill call log", dg, Kind::Bool);

@@ -224,6 +224,7 @@ std::vector<Flag> flags(serve::Options &o, std::string &kv_pool) {
       {"--served-model-name", "S", str(o.served_name)},
       {"--stub", "", [&o](const std::string &) { o.stub = true; }},
       {"--plan", "", [&o](const std::string &) { o.plan = true; }},
+      {"--report-launch", "", [&o](const std::string &) { o.report_launch = true; }},
       {"--stub-step-ms", "MS", f64(o.stub_step_ms)},
       {"--stub-tokens-per-step", "N", i32(o.stub_tokens_per_step)},
       // sequences, KV, cards

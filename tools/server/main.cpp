@@ -21,6 +21,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -42,9 +43,52 @@ namespace serve = xenithium::serve;
 namespace text = xenithium::text;
 namespace json = xenithium::json;
 
+extern char **environ;
+
+namespace xenithium {
+const char *build_rev();  // `git describe --always --dirty` at build time (cmake/BuildRev.cmake)
+}  // namespace xenithium
+
 namespace {
 
 xenithium::server::Server *g_server = nullptr;
+
+using xenithium::server::secret_name;
+
+// The oneAPI compiler this server was built with ("2025.3.0" from __INTEL_LLVM_COMPILER = 20250300), else the
+// compiler's own version string.
+std::string oneapi_version() {
+#ifdef __INTEL_LLVM_COMPILER
+  char v[32];
+  std::snprintf(v, sizeof v, "%d.%d.%d", __INTEL_LLVM_COMPILER / 10000, __INTEL_LLVM_COMPILER / 100 % 100, __INTEL_LLVM_COMPILER % 100);
+  return v;
+#else
+  return std::string("not oneAPI: ") + __VERSION__;
+#endif
+}
+
+// How this server was started, for GET /v1/models with --report-launch: the arguments after the program (a
+// secret-looking flag's value hidden) and every XEN_ variable of the environment (a secret-looking one's value hidden),
+// sorted by name.
+// The XEN_ variables as the server was started with them, taken first thing in main: the server sets some of its own
+// later (XEN_EMU_CARD), which are not part of how it was started.
+std::vector<std::string> g_start_env;
+
+void fill_launch(xenithium::server::Config &cfg, int argc, char **argv) {
+  for (int a = 1; a < argc; ++a) {
+    const std::string arg = argv[a];
+    const size_t eq = arg.find('=');
+    if (arg.rfind("--", 0) == 0 && eq != std::string::npos && secret_name(arg.substr(0, eq))) cfg.launch_args.push_back(arg.substr(0, eq) + "=(hidden)");
+    else cfg.launch_args.push_back(a > 1 && std::string(argv[a - 1]).rfind("--", 0) == 0 && secret_name(argv[a - 1]) ? "(hidden)" : arg);
+  }
+  for (const std::string &kv : g_start_env) {
+    const size_t eq = kv.find('=');
+    if (eq == std::string::npos || kv.rfind("XEN_", 0) != 0) continue;
+    const std::string name = kv.substr(0, eq);
+    cfg.launch_env.push_back({name, secret_name(name) ? "(hidden)" : kv.substr(eq + 1)});
+  }
+  std::sort(cfg.launch_env.begin(), cfg.launch_env.end());
+}
 
 void on_signal(int) {
   if (g_server) g_server->stop();
@@ -285,6 +329,15 @@ int server_main(int argc, char **argv) {
   scfg.eos_ids = eos;
   scfg.vocab = vocab;  // token masks cover the logits row (structured output); 0 with the stub
   scfg.media = backend ? backend->media() : nullptr;  // Image input (--vision 1)
+  if (backend) {  // What the model runs on (GET /v1/models): its cards, their count the TP width
+    scfg.devices = backend->devices();
+    scfg.tensor_parallel = static_cast<int>(scfg.devices.size());
+  }
+  scfg.build = xenithium::build_rev();  // what it runs
+  scfg.oneapi = oneapi_version();
+  scfg.machine = xenithium::util::this_machine();
+  if (backend) scfg.drafter = backend->drafter();
+  if (o.report_launch) fill_launch(scfg, argc, argv);  // and how it was started (opt-in: it shows local paths)
   scfg.fetch.enabled = o.media_urls != 0;  // Http(s) media URLs
   scfg.fetch.allowed_domains = xenithium::util::split_domains(o.media_domains);
   scfg.fetch.timeout_s = o.media_timeout_s;
@@ -321,6 +374,8 @@ int server_main(int argc, char **argv) {
 // on a directory without lm_head.qweight) ends the server with its message and exit 1, without an abort's core dump. No
 // unwinding: catching it in main hung in the destructors of the half-built devices and threads.
 int main(int argc, char **argv) {
+  for (char **e = environ; e && *e; ++e)
+    if (std::string_view(*e).starts_with("XEN_")) g_start_env.emplace_back(*e);
   install_crash_handlers();
   std::set_terminate([] {
     if (const std::exception_ptr e = std::current_exception()) {

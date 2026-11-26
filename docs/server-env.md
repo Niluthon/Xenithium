@@ -209,6 +209,7 @@ gets what differs from the model's file and the defaults; keys it already lists 
 | `XEN_QUEUE_TIMEOUT` | `0` | `--queue-timeout` | Seconds a request may wait for a slot before it is turned away with HTTP 503.<br><br>`0`  wait forever |
 | `XEN_IDLE_TIMEOUT` | `300` | `--idle-timeout` | Seconds before an idle keep-alive connection is closed.<br><br>`0`  never |
 | `XEN_LOG_INTERVAL` | `10` | `--log-interval` | Seconds between the server's status lines in the log while it is busy: step time, prefill speed, KV pool, prefix cache, host RAM.<br><br>`0`  off<br><br>Note: the host-RAM warning and the crash report are written either way. |
+| `XEN_REPORT_LAUNCH` | `0` | `--report-launch` | Shows how the server was started in `GET /v1/models` (`launch`: its arguments and every `XEN_` variable), so a benchmark's page can say "Run this yourself" with the exact command.<br><br>Note: the values of key-, token- or password-like names are hidden, but local paths (the model folder) are visible to every client that can reach the server. Its build, the oneAPI version, the drafter and the cards are reported either way. |
 | `XEN_STUB` | `0` | `--stub` | A fake engine without GPU behind the real server, for testing clients and the API.<br><br>Note: model settings do not apply. |
 
 ## MoE expert files: the hot-expert ranking

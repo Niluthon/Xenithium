@@ -38,9 +38,7 @@ CardView card_view(uint32_t pci_id, std::string_view name, int xe_cores, uint64_
   }
   if (e == v.phys) return v;  // already that card: nothing to take away
   const double gib = static_cast<double>(vram_bytes) / kGiB;
-  // the device's nominal GB: the table's, else from the reported module size (zeDeviceGetMemoryProperties: a 32 GB B70
-  // reports 30.30 GiB, sysman 31.89; the B70's ratio scales an unknown card)
-  const int gb = v.phys ? v.phys->vram_gb : static_cast<int>(std::lround(gib * 32 / 30.30));
+  const int gb = nominal_vram_gb(v.phys, vram_bytes);
   if (e->xe_cores > xe_cores || e->vram_gb > gb || (v.phys && e->bw_gbs > v.phys->bw_gbs)) {
     char b[320];
     std::snprintf(b, sizeof b, "XEN_EMU_CARD=%s: the %s (%d Xe cores, %d GB, %.0f GB/s) is larger than this %s (%d Xe cores, %.1f GiB); an emulation can only take away",
