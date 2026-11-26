@@ -304,10 +304,10 @@ void test_two(xenithium::Fabric &f, const Model &m, const char *tag) {
   free_card(f, d[1]);
 }
 
-// ple_rows (prefill) against ple_decode on 4-row slices: bit-identical by design (decode's
-// kv GEMM sums k in order; the gate and conv do the same arithmetic per row). History: two
-// decode steps (6 positions) before the chunk, so the chunk's first rows read the ring; then one
-// decode step after the chunk, which reads the ring the rows left.
+// Compare prefill with 4-row decode slices using the same KV accumulation order. Prefill sums K in
+// order, while decode can auto-select split-K and round a projection differently. Pin decode to one
+// split so the gate and convolution can be checked bit for bit. The chunk reads the ring left by
+// two decode steps, and the first decode step after the chunk reads the ring left by prefill.
 void test_rows(xenithium::Fabric &f, const Model &m, const char *tag, int M) {
   const int C = m.s.width(), E = m.s.emb;
   Card d = make_card(f, 0, m);
@@ -342,7 +342,7 @@ void test_rows(xenithium::Fabric &f, const Model &m, const char *tag, int M) {
         const int rows = std::min(4, M - 4 * sl), pos = p0 + 4 * sl;
         d.q->memcpy(d.pos, &pos, 4).wait();
         k::ple_decode(*d.q, m.s, rows, reinterpret_cast<const bf16 *>(pinned + static_cast<size_t>(sl) * 4 * E), d.w, d.st, d.pos, d.sc,
-                      res + static_cast<size_t>(sl) * 4 * C)
+                      res + static_cast<size_t>(sl) * 4 * C, /*kv_ks=*/1)
             .conv.wait();
       }
     } else {

@@ -11,7 +11,7 @@
 // in a chain (o = bf16(S q), then y), so a flip of o plus y's own rounding is 2 ulps.
 // Not ulps of y alone either: o = S q can cancel to a small value whose fp32
 // sum-order error is many of its own ulps.
-// S: max |dS| <= 1e-4 max |S| (fp32 state vs a double reference)
+// S: max |dS| <= 1e-4 max |S| (fp32 versus double recurrence from GPU BF16 convolution rows)
 // out: within 2^-7 max(|ref|, row rms), <= 1 % off, from the device's y
 // protocol: "R rows then accept c" == "c rows then the next step", bit for bit
 // two cards: bit-identical outputs; each card's y equals the one-card y of its heads; out
@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/kernels/linear_attention/gdn_core.hpp"
 #include "xenithium/kernels/linear_attention/gdn.hpp"
 #include "xenithium/kernels/linear_attention/gdn_rows.hpp"
 #include "xenithium/kernels/pack.hpp"
@@ -307,22 +308,81 @@ Trace run_hint(Card &d, const std::vector<Step> &plan, uint32_t seed, int qks) {
   return t;
 }
 
+// Re-run the single-sequence core from the normal run's projections and capture its accepted
+// convolution rows. These are the exact BF16 inputs to the committed-state update.
+template <bool Swish>
+sycl::event capture_replay(Card &d, int rows, int parity, bf16 *conv) {
+  using namespace k::gdn_detail;
+  // Both test shapes use the generic ABI and the full four-row replay bound.
+  if (rows == 1)
+    return core<kVR, Swish, 1, k::kGdnRows, 0, k::kGdnRows, false, true>(
+        *d.q, d.s, rows, d.x, d.w, d.st, parity, d.sc.y, d.sc.core, conv);
+  return core<kVR, Swish, k::kGdnRows, k::kGdnRows, 0, k::kGdnRows, false, true>(
+      *d.q, d.s, rows, d.x, d.w, d.st, parity, d.sc.y, d.sc.core, conv);
+}
+
+void check_committed_state(xenithium::Fabric &f, Card &d, const Trace &t, uint32_t seed, const char *tag) {
+  const auto &s = d.s;
+  const int cc = s.conv_ch(), vw = s.val_w();
+  auto *conv = up(f, 0, std::vector<bf16>(static_cast<size_t>(k::kGdnRows) * cc), d.mem);
+  reset(d);
+  k::GdnRefState ref;
+  ref.reset(s);
+  bool same = true, within = true;
+  double worst = 0;
+  std::vector<float> z(vw), o(vw), y(vw);
+  for (size_t i = 0; i < kPlan.size(); ++i) {
+    const int32_t accepted = i ? kPlan[i - 1].accept : 0;
+    const int rows = kPlan[i].rows, parity = i & 1;
+    const auto x = bits(make_x(s.hidden, seed + static_cast<uint32_t>(i)));
+    // The compute queue is in order. The uploads complete before the capture runs.
+    d.q->memcpy(d.accept, &accepted, sizeof accepted);
+    d.q->memcpy(d.st.y[parity], t.proj[i].data(), static_cast<size_t>(rows) * d.w.qkvz.n * sizeof(float));
+    d.q->memcpy(d.x, x.data(), x.size() * sizeof(uint16_t));
+    (s.swish ? capture_replay<true>(d, rows, parity, conv) : capture_replay<false>(d, rows, parity, conv)).wait_and_throw();
+    const auto &normal = t.S[i];
+    const auto captured = rd(*d.q, d.st.S, normal.size());
+    same &= std::memcmp(captured.data(), normal.data(), normal.size() * sizeof(float)) == 0;
+    const auto replay = accepted ? rd16(*d.q, conv, static_cast<size_t>(accepted) * cc) : std::vector<float>{};
+    for (int r = 0; r < accepted; ++r) {
+      const float *a = t.ab[i - 1].data() + static_cast<size_t>(r) * s.ab_n();
+      const float *p = t.proj[i - 1].data() + static_cast<size_t>(r) * d.w.qkvz.n;
+      std::transform(p + cc, p + cc + vw, z.begin(), bfr);
+      // The device logs a and b after BF16 rounding.
+      k::gdn_ref_recur(s, d.ref, ref, replay.data() + static_cast<size_t>(r) * cc, z.data(), a, o.data(), y.data());
+    }
+    double err = 0, scale = 0;
+    for (size_t j = 0; j < ref.S.size(); ++j) {
+      within &= std::isfinite(normal[j]) && std::isfinite(ref.S[j]);
+      err = std::max(err, std::fabs(normal[j] - ref.S[j]));
+      scale = std::max(scale, std::fabs(ref.S[j]));
+    }
+    within &= (accepted == 0 || scale > 0) && err <= 1e-4 * scale;
+    if (scale > 0) worst = std::max(worst, err / scale);
+  }
+  char what[256];
+  std::snprintf(what, sizeof what, "%s one card: capture and normal committed states are bit-identical at every step", tag);
+  expect(same, what);
+  std::snprintf(what, sizeof what, "%s one card: committed S vs reference from GPU convolution: worst relative max error %.2e", tag, worst);
+  expect(within, what);
+}
+
 void test_one(xenithium::Fabric &f, const Model &m, const char *tag) {
   Card d = make_card(f, 0, m, 1);
   const auto &s = d.s;
-  const int H = s.hidden, VW = s.val_w(), CC = s.conv_ch();
-  const Trace t = run_one(d, kPlan, 100, 0);
+  const int H = s.hidden, VW = s.val_w();
+  constexpr uint32_t seed = 100;
+  const Trace t = run_one(d, kPlan, seed, 0);
   char what[512];
   // Reference, teacher-forced at the device projections; committed state advances by accept.
   k::GdnRefState st;
   st.reset(s);
   BoundCmp yc, oc, fc;
-  double s_err = 0, s_max = 0;
   k::GdnRefState fr;  // free-running
   fr.reset(s);
   for (size_t i = 0; i < kPlan.size(); ++i) {
     const int R = kPlan[i].rows, ldy = d.w.qkvz.n, ldab = s.ab_n();
-    const auto x = make_x(H, 100 + static_cast<uint32_t>(i));
+    const auto x = make_x(H, seed + static_cast<uint32_t>(i));
     k::GdnRefState run = st, frun = fr;
     std::vector<k::GdnRefState> after;
     for (int r = 0; r < R; ++r) {
@@ -345,44 +405,20 @@ void test_one(xenithium::Fabric &f, const Model &m, const char *tag) {
       if (r + 1 == kPlan[i].accept) fr = frun;
     }
     if (kPlan[i].accept > 0) st = after[kPlan[i].accept - 1];
-    // Device S after step i is the state committed at its start (after replaying step i-1's
-    // accepted rows): compare against the reference's state before this step's commit.
-    (void)CC;
-  }
-  // S: the device's committed state after the last step = the reference before the last commit.
-  {
-    k::GdnRefState st2;
-    st2.reset(s);
-    for (size_t i = 0; i + 1 < kPlan.size(); ++i) {
-      k::GdnRefState run = st2;
-      for (int r = 0; r < kPlan[i].accept; ++r) {
-        std::vector<float> pq(s.qkvz_n()), pa(s.ab_n()), o(VW), y(VW);
-        for (int n = 0; n < s.qkvz_n(); ++n) pq[n] = bfr(t.proj[i][static_cast<size_t>(r) * d.w.qkvz.n + n]);
-        for (int n = 0; n < s.ab_n(); ++n) pa[n] = bfr(t.ab[i][static_cast<size_t>(r) * s.ab_n() + n]);
-        k::gdn_ref_core(s, d.ref, run, pq.data(), pa.data(), o.data(), y.data());
-      }
-      st2 = run;
-    }
-    const auto &S = t.S.back();
-    for (size_t j = 0; j < S.size(); ++j) {
-      s_err = std::max(s_err, std::fabs(S[j] - st2.S[j]));
-      s_max = std::max(s_max, std::fabs(st2.S[j]));
-    }
   }
   std::snprintf(what, sizeof what, "%s one card, %zu steps (rows 1-4, accept 0-4): y vs reference from the device's projections %s", tag,
                 kPlan.size(), yc.text().c_str());
   expect(yc.scaled <= 1.0 / 64 && yc.off * 200 <= yc.n, what);
-  std::snprintf(what, sizeof what, "%s one card: committed S vs reference: max |dS| %.2e of max |S| %.2e", tag, s_err, s_max);
-  expect(s_err <= 1e-4 * s_max && s_max > 0, what);
+  check_committed_state(f, d, t, seed, tag);
   std::snprintf(what, sizeof what, "%s one card: out vs reference from the device's y %s (free-running: %s)", tag, oc.text().c_str(),
                 fc.text().c_str());
   expect(oc.ok() && fc.scaled <= 1.0 / 32, what);
 
   // Determinism.
-  const Trace t2 = run_one(d, kPlan, 100, 0);
+  const Trace t2 = run_one(d, kPlan, seed, 0);
   std::snprintf(what, sizeof what, "%s one card: run-to-run bit-identical (outputs and state)", tag);
   expect(t2.out == t.out && t2.S.back() == t.S.back(), what);
-  const Trace th = run_hint(d, kPlan, 100, 0);
+  const Trace th = run_hint(d, kPlan, seed, 0);
   std::snprintf(what, sizeof what, "%s one card: accept_max = the accept word and commit on 1-row steps == the plain protocol, bit for bit", tag);
   expect(th.out == t.out, what);
 

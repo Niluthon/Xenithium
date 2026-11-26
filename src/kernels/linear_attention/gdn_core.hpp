@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cmath>
+#include <type_traits>
 
 #include <sycl/ext/intel/esimd.hpp>
 
@@ -21,6 +22,8 @@ constexpr int kOutKSplit = 8;  // out_proj [hidden][val_w]: its k split
 
 template <int VR, bool SWISH, int NR, int NP, int ABI, int KM, bool TREE>
 class GdnCoreK;
+template <int VR, bool SWISH, int NR, int NP, int ABI, int KM>
+class GdnReplayCaptureK;
 
 template <int N>
 inline esimd::simd<float, N> round_bf16(esimd::simd<float, N> v) SYCL_ESIMD_FUNCTION {
@@ -77,9 +80,9 @@ inline esimd::simd<float, VR> conv4(esimd::simd<float, VR * kGdnTaps> wt, const 
   return esimd::simd<float, VR>(__builtin_elementwise_fma(w3.data(), u.data(), r.data()));
 }
 
-template <int VR, bool SWISH, int NR, int NP, int ABI, int KM, bool TREE = false>
+template <int VR, bool SWISH, int NR, int NP, int ABI, int KM, bool TREE = false, bool CAPTURE_REPLAY = false>
 sycl::event core(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, const GdnWeights &w, const GdnState &st, int parity, const float *ystep,
-                 bf16 *core_out) {
+                 bf16 *core_out, bf16 *replay_conv = nullptr) {
   constexpr int kItems = kD / VR;
   constexpr int kM = KM, kTMax = 2 * KM;  // rows per segment this instance stages (4, or 8)
   constexpr int kAbW = 16;  // k elements per a / b load
@@ -108,7 +111,10 @@ sycl::event core(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, con
   const int seg_code = st.seg_rows;  // seg_het = unequal segments (records give each one's rows)
   const bf16 *conv = w.conv, *alog = w.a_log, *dtb = w.dt_bias, *nw = w.norm, *wa = w.a, *wb = w.b;
   float *treeS = st.tree_S;
-  return q.parallel_for<GdnCoreK<VR, SWISH, NR, NP, ABI, KM, TREE>>(
+  static_assert(!CAPTURE_REPLAY || !TREE);
+  using Kernel = std::conditional_t<CAPTURE_REPLAY, GdnReplayCaptureK<VR, SWISH, NR, NP, ABI, KM>,
+                                    GdnCoreK<VR, SWISH, NR, NP, ABI, KM, TREE>>;
+  return q.parallel_for<Kernel>(
       sycl::nd_range<2>({static_cast<size_t>(nseg), static_cast<size_t>(vh) * kItems}, {1, kItems}), [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
         esimd::slm_init<kSlm>();
         // a (segment, value head) grid: the ids come from the launch, not from a division by the run-time head count in every item
@@ -248,6 +254,11 @@ sycl::event core(sycl::queue &q, const GdnShape &s, int rows, const bf16 *x, con
             const esimd::simd<float, VR> c = conv4<VR>(wtt, w0, w1, w2, u);
             const esimd::simd<float, VR> o = round_bf16<VR>(c * sigmoid_v<VR>(c));
             esimd::slm_block_store<float, VR>(slm_off(kConvBase + (t * 3 + G) * kD + i * VR), o);
+            if constexpr (CAPTURE_REPLAY) {
+              // Test capture for the single-sequence chain, before normalization overwrites q and k.
+              if (t < A && owner)
+                esimd::block_store<bf16, VR>(replay_conv + static_cast<size_t>(t) * CC + ch0[G], esimd::simd<bf16, VR>(o));
+            }
             w0 = w1;
             w1 = w2;
             w2 = u;

@@ -148,6 +148,9 @@ void gdn_ref_proj(const GdnShape &s, const GdnRefWeights &w, const float *x, flo
 // One token through conv, gates, recurrence and gated norm from bf16 projection values;
 // advances st. o, y: bf16 values [val_w].
 void gdn_ref_core(const GdnShape &s, const GdnRefWeights &w, GdnRefState &st, const float *qkvz, const float *ab, float *o, float *y);
+// Run the recurrence and norm from an already rounded convolution row [conv_ch] and z [val_w].
+void gdn_ref_recur(const GdnShape &s, const GdnRefWeights &w, GdnRefState &st, const float *c, const float *z,
+                   const float *ab, float *o, float *y);
 // This card's out_proj partial [hidden] from y [val_w].
 void gdn_ref_out(const GdnShape &s, const GdnRefWeights &w, const float *y, double *part);
 
