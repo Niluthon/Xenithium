@@ -649,8 +649,9 @@ MoeEvents moe_rows(sycl::queue &q, const MoeShape &s, int m, const bf16 *x, cons
   if (!s.tp) throw std::invalid_argument("moe_rows: expert TP layout only");
   if (s.experts > kGroupItems || s.experts > 32 * kLanes || s.topk > kMoeMaxTopk || s.topk > kLanes) throw std::invalid_argument("moe_rows: experts / topk");
   if (s.hidden % kCombineCols || s.inter_local() % kQuarter || s.shared_inter % kW) throw std::invalid_argument("moe_rows: shape");
-  // W4A8 at 160 columns per card: the block kernels with per-segment h scales (64-wide h groups would cut the card)
-  const bool blocks8 = a8 && sc.blk && sc.blk_n && s.inter_local() % kHalf && moe_rows_blk8_shape(s);
+  // W4A8 on the block list (160 or 320 columns per card): the block kernels with per-segment h scales; without it the
+  // per-segment kernels with 64-wide h groups, which would cut a 160-column card
+  const bool blocks8 = a8 && sc.blk && sc.blk_n && moe_rows_blk8_shape(s);
   if (((a8 && !blocks8) || s.rot) && s.inter_local() % kHalf)  // the h quant groups / H_64 blocks are 64 wide
     throw std::invalid_argument("moe_rows: W4A8 needs 64-column cards or the TP4 block list; rot needs 64-column cards");
   if (a8 && (!sc.xq || !sc.xs || !sc.hq || !sc.hs)) throw std::invalid_argument("moe_rows: W4A8 without its scratch");

@@ -443,7 +443,7 @@ const char *brief_of(std::string_view key) {
        "\n"
        "Gives (`w4a8` on four cards): + prompt reading speed, about 3 % over `w4a16`.\n"
        "Takes (`w4a8`, `w4a16-fast`): - exactness: the output changes slightly.\n"
-       "Note: on one or two cards `w4a8` reads the prompt slower than `w4a16`."},
+       "Note: on two cards `w4a8` reads the prompt as fast as `w4a16` (the cold experts' reads set the pace); on one card slower."},
       {"XEN_PREFILL_DENSE",
        "qwen38: precision of the dense layers' activations while reading the prompt.\n"
        "\n"

@@ -1,4 +1,4 @@
-// Xenithium · moe_rows' W4A16 gate_up and down, and the W4A8 block pair at 160 columns per card. Their own TU because
+// Xenithium · moe_rows' W4A16 gate_up and down, and the W4A8 block pair at 160 or 320 columns per card. Their own TU because
 // they need 256 GRF (gate_up spills at 128): built in xenithium_kernels_xl (-doubleGRF). gate_up is one item for both
 // projections, down two tiles per item.
 #include <algorithm>
@@ -489,20 +489,26 @@ sycl::event down_blk(sycl::queue &q, const MoeShape &s, int max_blks, const MoeW
 }
 
 
-// ---- W4A8 blocks at 160 columns per card (TP4) --------------------------------------------------------------------
+// ---- W4A8 blocks at 160 (TP4) or 320 (TP2) columns per card -------------------------------------------------------
 //
 // x: int8 rows with one scale per (row, 128-k group) (row_quant_item). h: int8 list rows with one scale per (row,
-// segment), a segment = this card's k range cut at the down scales' 128-k group bounds (160 columns: two segments, one
-// of 4 x 32 + one of 1 x 32 .. 1 + 4), so down sums a segment's 32-k pieces in int32 and scales once per segment. The
-// int4 codes become s4 DPAS operands by w4a8::to_s4 (a byte reorder and an xor), not widened.
+// segment), a segment = this card's k range cut at the down scales' 128-k group bounds (160 columns: two segments,
+// 4 + 1 or 1 + 4 pieces of 32; 320 columns: three, 4 + 4 + 2 or 2 + 4 + 4), so down sums a segment's 32-k pieces in
+// int32 and scales once per segment. The int4 codes become s4 DPAS operands by w4a8::to_s4 (a byte reorder and an
+// xor), not widened.
 constexpr int kK8 = w4a8::kK8, kOp8 = w4a8::kOp8;
-constexpr int kNP8 = 5;  // 32-k pieces per card
+constexpr int kSegPieces8 = kGroup / kK8;  // 32-k pieces in a full segment (one 128-k scale group)
 
-// the first segment's pieces on card `card` (the second has kNP8 minus them; kNP8: one segment)
+// 32-k pieces per card: 5 (160 columns) or 10 (320)
+constexpr bool blk8_pieces_ok(int np) { return np == 5 || np == 10; }
+// the first segment's pieces on card `card` (the next ones have kSegPieces8 each, the last the rest)
 inline int blk8_first_pieces(int I, int card) {
   const int k0 = card * I, e = std::min(k0 + I, (k0 / kGroup + 1) * kGroup);
   return (e - k0) / kK8;
 }
+// h scale segments per row on a card whose first segment has p1 of np pieces
+constexpr int blk8_segments(int np, int p1) { return 1 + (np - p1 + kSegPieces8 - 1) / kSegPieces8; }
+inline int blk8_segments_of(int I, int card) { return blk8_segments(I / kK8, blk8_first_pieces(I, card)); }
 
 // gate_up: TI threads, per KG 128-k groups the block's int8 x rows staged as s8 A tiles [call][8-row block][8][32] with
 // the rows' group scales; per group an int32 chain of four s8 x s4 calls per (8-row block, projection), then
@@ -608,7 +614,7 @@ template <int TI, int KG>
 class MrGateUp8Blk;
 template <int TI, int KG>
 sycl::event gate_up8_blk(sycl::queue &q, const MoeShape &s, int max_blks, const MoeWeights &w, const MoeRowsScratch &sc) {
-  const int H = s.hidden, I = s.inter_local(), G = H / kGroup, k0 = s.card * I, NS = blk8_first_pieces(I, s.card) < kNP8 ? 2 : 1;
+  const int H = s.hidden, I = s.inter_local(), G = H / kGroup, k0 = s.card * I, NS = blk8_segments_of(I, s.card);
   const MoeBlobLayout lay = w.blob;
   const uint8_t *const *blobs = w.blobs;
   const int32_t *blk = sc.blk, *blk_n = sc.blk_n, *row = sc.row;
@@ -637,15 +643,18 @@ sycl::event gate_up8_blk(sycl::queue &q, const MoeShape &s, int max_blks, const 
 }
 
 // down: 16 threads per block, the block's int8 h rows staged as s8 A tiles [piece][8-row block][8][32] with their
-// segment scales; each thread walks the output tile pairs p = j, j + 16... loading every piece's codes of the pair
-// at once, and per segment runs an int32 chain over its pieces (one s8 x s4 call each) per (tile, 8-row block), then
-// acc += float(sum) x (column scale x row scale). P1: the first segment's pieces (compile time, one body per card's
-// split). Bounded by the bf16 y stores (y is the rows x topk x hidden partials).
-template <int P1, int NRB>
+// segment scales; each thread walks the output tile pairs p = j, j + 16..., and per segment runs an int32 chain over
+// its 32-k pieces (one s8 x s4 call each) per (tile, 8-row block), then acc += float(sum) x (column scale x row scale).
+// NP: 32-k pieces per card (5 or 10); P1: the first segment's pieces (compile time, one body per card's split); PK: the
+// blob's k piece (32 at TP4, 64 at TP2: a 64-k piece holds two 32-k pieces back to back in each tile's bytes). Five
+// pieces load every piece's codes of the pair at once; ten load a segment's at a time (registers). Bounded by the bf16
+// y stores (y is the rows x topk x hidden partials).
+template <int NP, int P1, int PK, int NRB>
 inline void down8_blk_body(int j, int n, int p0, int H, int I, const uint8_t *codes, const sycl::half *scales, const int8_t *hq, const float *hs,
                            bf16 *y) SYCL_ESIMD_FUNCTION {
-  constexpr int NP = kNP8, NS = P1 < NP ? 2 : 1;
+  constexpr int NS = blk8_segments(NP, P1), SUB = PK / kK8;
   constexpr int R = NRB * 8, T = 16, kTile = 8 * kK8, kPB = kOp8;
+  constexpr int kAllAtOnce = NP <= 5;
   constexpr uint32_t kSOff = kMoeBlkRows * NP * kK8;
   const int tiles = H / kW, pairs = tiles / 2;
   for (int r = j; r < R; r += T) {
@@ -662,25 +671,45 @@ inline void down8_blk_body(int j, int n, int p0, int H, int I, const uint8_t *co
 #pragma unroll
   for (int sg = 0; sg < NS; ++sg) sa.template select<R, 1>(sg * R) = esimd::slm_block_load<float, R>(kSOff + static_cast<uint32_t>(sg * kMoeBlkRows * 4));
   constexpr auto hint = esimd::properties{esimd::cache_hint_L1<esimd::cache_hint::streaming>, esimd::cache_hint_L2<esimd::cache_hint::write_back>, esimd::alignment<32>};
-  const size_t gstride = static_cast<size_t>(tiles) * kPB;  // bytes between a tile's pieces
+  const size_t tstride = static_cast<size_t>(SUB) * kPB, pstride = static_cast<size_t>(tiles) * tstride;  // bytes per tile / blob piece
+  // the pair's two tiles of 32-k piece g, side by side
+  auto load_pair = [&](int t0, int g) SYCL_ESIMD_FUNCTION {
+    const uint8_t *p = codes + static_cast<size_t>(g / SUB) * pstride + static_cast<size_t>(t0) * tstride + static_cast<size_t>(g % SUB) * kPB;
+    esimd::simd<uint8_t, 2 * kPB> v;
+    if constexpr (SUB == 1) {
+      v = esimd::block_load<uint8_t, 2 * kPB>(p);
+    } else {
+      v.template select<kPB, 1>(0) = esimd::block_load<uint8_t, kPB>(p);
+      v.template select<kPB, 1>(kPB) = esimd::block_load<uint8_t, kPB>(p + tstride);
+    }
+    return v;
+  };
+  constexpr int kRawPieces = kAllAtOnce ? NP : kSegPieces8;
   for (int pr = j; pr < pairs; pr += T) {
     const int t0 = pr * 2;
-    const uint8_t *cp = codes + static_cast<size_t>(t0) * kPB;
-    esimd::simd<uint8_t, NP * 2 * kPB> raw;  // per piece the pair's two tiles, contiguous
+    esimd::simd<uint8_t, kRawPieces * 2 * kPB> raw;  // per piece the pair's two tiles, contiguous
+    if constexpr (kAllAtOnce) {
 #pragma unroll
-    for (int g = 0; g < NP; ++g) raw.template select<2 * kPB, 1>(g * 2 * kPB) = esimd::block_load<uint8_t, 2 * kPB>(cp + g * gstride);
+      for (int g = 0; g < NP; ++g) raw.template select<2 * kPB, 1>(g * 2 * kPB) = load_pair(t0, g);
+    }
     esimd::simd<float, R * kW> acc0, acc1;
 #pragma unroll
     for (int sg = 0; sg < NS; ++sg) {
+      const int g0 = sg == 0 ? 0 : P1 + (sg - 1) * kSegPieces8, g1 = sg == 0 ? P1 : std::min(NP, P1 + sg * kSegPieces8);  // its pieces
+      if constexpr (!kAllAtOnce) {
+#pragma unroll
+        for (int g = g0; g < g1; ++g) raw.template select<2 * kPB, 1>((g - g0) * 2 * kPB) = load_pair(t0, g);
+      }
       const esimd::simd<float, kW> sc0 = esimd::block_load<sycl::half, kW>(scales + static_cast<size_t>(sg) * H + t0 * kW);
       const esimd::simd<float, kW> sc1 = esimd::block_load<sycl::half, kW>(scales + static_cast<size_t>(sg) * H + (t0 + 1) * kW);
       esimd::simd<int32_t, R * kW> s0, s1;
 #pragma unroll
-      for (int g = (sg == 0 ? 0 : P1); g < (sg == 0 ? P1 : NP); ++g) {
-        esimd::simd<uint8_t, 2 * kPB> b = w4a8::to_s4<2>(raw.template select<2 * kPB, 1>(g * 2 * kPB));
+      for (int g = g0; g < g1; ++g) {
+        const int at_raw = kAllAtOnce ? g : g - g0;
+        esimd::simd<uint8_t, 2 * kPB> b = w4a8::to_s4<2>(raw.template select<2 * kPB, 1>(at_raw * 2 * kPB));
         esimd::simd<uint8_t, NRB * kTile> at = esimd::slm_block_load<uint8_t, NRB * kTile>(static_cast<uint32_t>(g * NRB * kTile));
         const esimd::simd<uint8_t, kPB> b0 = b.template select<kPB, 1>(0), b1 = b.template select<kPB, 1>(kPB);
-        const bool first = g == (sg == 0 ? 0 : P1);
+        const bool first = g == g0;
 #pragma unroll
         for (int rb = 0; rb < NRB; ++rb) {
           const esimd::simd<uint8_t, kTile> a = at.template select<kTile, 1>(rb * kTile);
@@ -721,11 +750,11 @@ inline void down8_blk_body(int j, int n, int p0, int H, int I, const uint8_t *co
   }
 }
 
-template <int P1>
+template <int NP, int P1, int PK>
 class MrDown8Blk;
-template <int P1>
+template <int NP, int P1, int PK>
 sycl::event down8_blk(sycl::queue &q, const MoeShape &s, int max_blks, const MoeWeights &w, const MoeRowsScratch &sc) {
-  constexpr int T = 16, NS = P1 < kNP8 ? 2 : 1;
+  constexpr int T = 16, NS = blk8_segments(NP, P1);
   const int H = s.hidden, I = s.inter_local();
   const MoeBlobLayout lay = w.blob;
   const uint8_t *const *blobs = w.blobs;
@@ -734,8 +763,8 @@ sycl::event down8_blk(sycl::queue &q, const MoeShape &s, int max_blks, const Moe
   const float *hs = sc.hs;
   bf16 *y = sc.y;
   return q.submit([&](sycl::handler &cgh) {
-    cgh.parallel_for<MrDown8Blk<P1>>(sycl::nd_range<1>(static_cast<size_t>(max_blks) * T, T), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
-      esimd::slm_init<kMoeBlkRows * kNP8 * kK8 + NS * kMoeBlkRows * 4>();
+    cgh.parallel_for<MrDown8Blk<NP, P1, PK>>(sycl::nd_range<1>(static_cast<size_t>(max_blks) * T, T), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+      esimd::slm_init<kMoeBlkRows * NP * kK8 + NS * kMoeBlkRows * 4>();
       const int b = static_cast<int>(it.get_group(0)), j = static_cast<int>(it.get_local_id(0));
       if (b >= blk_n[0]) return;
       const esimd::simd<int32_t, 4> bp = esimd::block_load<int32_t, 4>(blk + static_cast<size_t>(b) * 4);
@@ -744,10 +773,10 @@ sycl::event down8_blk(sycl::queue &q, const MoeShape &s, int max_blks, const Moe
       const uint8_t *codes = blob + lay.dn_codes;
       const sycl::half *scales = reinterpret_cast<const sycl::half *>(blob + lay.dn_scales);
       switch ((n + 7) / 8) {  // uniform over the work-group
-        case 1: down8_blk_body<P1, 1>(j, n, p0, H, I, codes, scales, hq, hs, y); break;
-        case 2: down8_blk_body<P1, 2>(j, n, p0, H, I, codes, scales, hq, hs, y); break;
-        case 3: down8_blk_body<P1, 3>(j, n, p0, H, I, codes, scales, hq, hs, y); break;
-        default: down8_blk_body<P1, 4>(j, n, p0, H, I, codes, scales, hq, hs, y); break;
+        case 1: down8_blk_body<NP, P1, PK, 1>(j, n, p0, H, I, codes, scales, hq, hs, y); break;
+        case 2: down8_blk_body<NP, P1, PK, 2>(j, n, p0, H, I, codes, scales, hq, hs, y); break;
+        case 3: down8_blk_body<NP, P1, PK, 3>(j, n, p0, H, I, codes, scales, hq, hs, y); break;
+        default: down8_blk_body<NP, P1, PK, 4>(j, n, p0, H, I, codes, scales, hq, hs, y); break;
       }
     });
   });
@@ -777,18 +806,32 @@ sycl::event moe_rows_down_blk(sycl::queue &q, const MoeShape &s, int max_blks, c
   throw std::invalid_argument("moe_rows_down_blk: k pieces per card");
 }
 
-bool moe_rows_blk8_shape(const MoeShape &s) { return moe_rows_blk_shape(s) && s.inter_local() == kNP8 * kK8 && !s.rot; }
-int moe_rows_blk8_hsegs(const MoeShape &s) { return blk8_first_pieces(s.inter_local(), s.card) < kNP8 ? 2 : 1; }
+bool moe_rows_blk8_shape(const MoeShape &s) {
+  const int I = s.inter_local();
+  // the blob's k pieces (moe_tp_piece) hold whole 32-k pieces; 160 columns come in 32-k pieces, 320 in 64-k ones
+  return moe_rows_blk_shape(s) && I % kK8 == 0 && blk8_pieces_ok(I / kK8) && moe_tp_piece(I) == (I / kK8 == 5 ? kK8 : 2 * kK8) && !s.rot;
+}
+int moe_rows_blk8_hsegs(const MoeShape &s) { return blk8_segments_of(s.inter_local(), s.card); }
 sycl::event moe_rows_gate_up8_blk(sycl::queue &q, const MoeShape &s, int max_blks, const MoeWeights &w, const MoeRowsScratch &sc) {
-  return (s.hidden / kGroup) % 2 == 0 ? gate_up8_blk<10, 2>(q, s, max_blks, w, sc) : gate_up8_blk<10, 1>(q, s, max_blks, w, sc);
+  if (!moe_rows_blk8_shape(s)) throw std::invalid_argument("moe_rows_gate_up8_blk: 160 or 320 columns per card");
+  const bool even = (s.hidden / kGroup) % 2 == 0;
+  if (s.inter_local() / kW == 10) return even ? gate_up8_blk<10, 2>(q, s, max_blks, w, sc) : gate_up8_blk<10, 1>(q, s, max_blks, w, sc);
+  return even ? gate_up8_blk<20, 2>(q, s, max_blks, w, sc) : gate_up8_blk<20, 1>(q, s, max_blks, w, sc);
 }
 sycl::event moe_rows_down8_blk(sycl::queue &q, const MoeShape &s, int max_blks, const MoeWeights &w, const MoeRowsScratch &sc) {
-  switch (blk8_first_pieces(s.inter_local(), s.card)) {
-    case 1: return down8_blk<1>(q, s, max_blks, w, sc);
-    case 2: return down8_blk<2>(q, s, max_blks, w, sc);
-    case 3: return down8_blk<3>(q, s, max_blks, w, sc);
-    case 4: return down8_blk<4>(q, s, max_blks, w, sc);
-    default: return down8_blk<5>(q, s, max_blks, w, sc);
+  if (!moe_rows_blk8_shape(s)) throw std::invalid_argument("moe_rows_down8_blk: 160 or 320 columns per card");
+  const int p1 = blk8_first_pieces(s.inter_local(), s.card);
+  if (s.inter_local() / kK8 == 10) {  // two cards: card 0 starts on a group bound (4 + 4 + 2), card 1 halfway in one (2 + 4 + 4)
+    if (p1 == 4) return down8_blk<10, 4, 2 * kK8>(q, s, max_blks, w, sc);
+    if (p1 == 2) return down8_blk<10, 2, 2 * kK8>(q, s, max_blks, w, sc);
+    throw std::invalid_argument("moe_rows_down8_blk: a 320-column card starts on a 64-k bound");
+  }
+  switch (p1) {
+    case 1: return down8_blk<5, 1, kK8>(q, s, max_blks, w, sc);
+    case 2: return down8_blk<5, 2, kK8>(q, s, max_blks, w, sc);
+    case 3: return down8_blk<5, 3, kK8>(q, s, max_blks, w, sc);
+    case 4: return down8_blk<5, 4, kK8>(q, s, max_blks, w, sc);
+    default: return down8_blk<5, 5, kK8>(q, s, max_blks, w, sc);
   }
 }
 

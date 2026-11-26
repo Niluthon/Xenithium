@@ -1468,6 +1468,27 @@ void test_rows(xenithium::Fabric &f, const Model &m0, const char *tag, int M) {
     for (int c = 0; c < C; ++c) rs[c].blk = nullptr, rs[c].blk_n = nullptr;
     expect(blk_same, std::string(tag) + " (" + std::to_string(M) + " rows): the work-group-per-block gate_up / down == the segment kernels, bit for bit");
   }
+  // W4A8 on the block kernels at this card count (320 columns per card at two cards: h scales per segment of the card's
+  // k, three segments): within int8 rounding of the W4A16 rows, every card the same rows, a rerun identical
+  if (k::moe_rows_blk8_shape(s[0])) {
+    for (int c = 0; c < C; ++c) rows_blocks(f, c, s[c], M, m.router_n, mem[c], rs[c]);
+    const auto q8 = run_rows(0, 0, 0, true);
+    bool ok = run_rows(1, 0, 0, true) == q8;
+    if (C > 1) ok &= read16(f.compute(1), orow[1], q8.size()) == q8;
+    double se = 0, sr = 0;
+    for (size_t i = 0; i < q8.size(); ++i) {
+      const double dv = k::bf16_value(q8[i]) - k::bf16_value(a[i]);
+      se += dv * dv;
+      sr += static_cast<double>(k::bf16_value(a[i])) * k::bf16_value(a[i]);
+    }
+    const double rel = std::sqrt(se / std::max(sr, 1e-30));
+    ok &= rel < 2e-2;
+    for (int c = 0; c < C; ++c) rs[c].blk = nullptr, rs[c].blk_n = nullptr;
+    char w8[220];
+    std::snprintf(w8, sizeof w8, "%s (%d rows, %d card(s)): W4A8 blocks vs W4A16 relative rms %.2e (int8 rounding: < 2e-2); every card the same rows; a rerun identical",
+                  tag, M, C, rel);
+    expect(ok, w8);
+  }
   // The fused launches (x quantiser in the router's launch, swiglu in topk's) == the
   // launches, bit for bit, W4A16 and W4A8 (outputs poisoned before each run).
   bool fuse_same = true;

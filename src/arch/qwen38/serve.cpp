@@ -39,9 +39,9 @@ constexpr int kDefaultStepRows = kernels::kStepRows16, kDefaultStepRowsTp4 = ker
 int step_rows_of(const serve::Options &o) { return o.step_rows_or(o.tp == 4 ? kDefaultStepRowsTp4 : kDefaultStepRows); }
 
 // The prefill experts' form when --prefill-moe is auto. Four cards take W4A8: their block kernels read int8 x and h on
-// s8 x s4 DPAS (prompt read +3.1..3.4 % over w4a16 at 32K-128K, KL to the reference 0.038 against w4a16's 0.047). One
-// and two cards keep w4a16: their W4A8 kernels are the older per-segment form, slower than the W4A16 blocks (two
-// cards: -4.5 % prompt read at 32K).
+// s8 x s4 DPAS (prompt read +3.1..3.4 % over w4a16 at 32K-128K, KL to the reference 0.038 against w4a16's 0.047). Two
+// cards keep w4a16: their W4A8 blocks read the prompt at the same speed (the cold experts' reads set the pace there) and
+// change the numerics. One card's W4A8 is the older per-segment form, slower than the W4A16 blocks.
 std::string_view prefill_moe_of(const serve::Options &o) {
   if (o.prefill_moe != "auto") return o.prefill_moe;
   return o.tp == 4 ? "w4a8" : "w4a16";
