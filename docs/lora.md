@@ -178,7 +178,15 @@ Prefill:
 | 23,571 | 1,640 tok/s | 14.37 s |
 | 47,109 | 1,506 tok/s | 31.28 s |
 
-Concurrency (48 requests per level): 102.3 t/s at 1 stream, 175.7 at 2, 214.6 at 4, 215.7 at 8.
+Concurrency (48 requests per level): 102.3 t/s at 1 stream, 175.7 at 2, 214.6 at 4, 215.7 at 8. Latency tells
+the rest of the story — TTFT p50 is 118 ms at one stream, 304 at two, 350 at four, and **6,524 ms at eight**,
+because the server runs 4 slots and the 8-stream level queues. Per-request decode holds ~121 t/s at one stream
+and settles at ~65 t/s once four are resident.
+
+Two disclosures the report makes about this run: **30 of 40 single-stream passes stopped at `max_tokens` (75%)**,
+so those decode numbers measure the generation phase of a thinking model rather than complete answers; and the p99
+columns rest on 20 observations against the harness's `n · tail ≥ 5` gate (500 needed), so read them as "roughly
+the worst observed", not as percentiles.
 
 Caveat on provenance: the harness ran on the client (media1), so the report's `env.gpu_info` is empty — the
 upstream probe knows only `rocm-smi` / `nvidia-smi` and cannot see Intel Arc. The DUT hardware is recorded in
