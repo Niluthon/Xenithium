@@ -787,14 +787,17 @@ void test_pf_dense_pair(xenithium::Device &dev) {
 
 // W8A8 with one activation scale per row (PfA8:row). Lossless data (one +-127 per row, scales 2^-5, power-of-two
 // weight scales): out == float(int sum) x 2^-5 x w_scale bit for bit on every body (4 / 2 / 1 tiles, 2 groups per
-// barrier, the direct 16-row blocks), codes and scales exact. Real data: every body the same bits, row 0 alone == in the
-// call, the per-row quantiser == the CPU rule, the pair == two calls; split-K refuses the mode.
+// barrier, the direct 16-row blocks), codes and scales exact. Real data (real-valued activations and column scales, so
+// the epilogue's two multiplies round differently in another order): every body the same bits (the direct one split over
+// k included: M <= 16 on few tiles), row 0 alone == in the call, the per-row quantiser == the CPU rule, the pair == two
+// calls; split-K refuses the mode.
 void test_pf_dense_a8_row(xenithium::Device &dev) {
   using bf16 = sycl::ext::oneapi::bfloat16;
   struct Shape { int n, k, m; };
   const Shape shapes[] = {{8192, 2560, 512}, {2560, 3072, 300}, {6144, 2560, 1031}, {1280, 2560, 13}, {2560, 640, 30},
                           {16, 64, 7},       {48, 96, 20},      {10240, 320, 256},  {5120, 320, 300}, {2560, 3072, 1},
-                          {2560, 3072, 20},  {2560, 3072, 32},  {336, 10240, 17}};  // the split direct body (m <= 32, few tiles)
+                          {2560, 3072, 20},  {2560, 3072, 32},  {336, 10240, 17},  // the split direct body (m <= 32, few tiles)
+                          {2560, 1536, 9}};  // four cards' GDN / QSA out projection at <= 16 rows (the split direct body)
   auto &q = dev.compute();
   char what[200];
   for (const Shape s : shapes) {
@@ -877,6 +880,9 @@ void test_pf_dense_a8_row(xenithium::Device &dev) {
       if (s.m > 2)
         for (int i = 0; i < s.k; ++i) xr[2 * static_cast<size_t>(lda) + i] = bf16(0.f);  // an all-zero row
       q.memcpy(dx, xr.data(), xr.size() * sizeof(bf16)).wait();
+      std::vector<float> rscale(s.n);
+      for (auto &v : rscale) v = 1e-3f * (1.5f + uni(rng));
+      q.memcpy(ds, rscale.data(), rscale.size() * 4).wait();
       std::vector<float> ref(want.size()), alt(want.size());
       kernels::pf_dense_tiles(q, s.m, w, dx, lda, kernels::PfOut{dy, nullptr, 0}, 4, &a8).wait_and_throw();
       q.memcpy(ref.data(), dy, ref.size() * 4).wait();

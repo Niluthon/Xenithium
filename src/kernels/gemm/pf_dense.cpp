@@ -683,19 +683,23 @@ sycl::event launch_direct_a8r_ks(sycl::queue &q, const Args &A0, int ks) {
       direct_body_a8r_ks(a, static_cast<int>(it.get_global_id(0)), part);
     });
   });
-  const int m = A.m, n = A.n, ld = A.ld;
-  const float *rs = A.as, *cs = A.scale;
-  float *f32 = A.f32;
-  bf16 *b16 = A.b16;
-  return q.parallel_for<PfA8RKsSum>(sycl::range<1>(static_cast<size_t>(m) * n), [=](sycl::id<1> id) {
-    const int r = static_cast<int>(id[0] / n), c = static_cast<int>(id[0] % n);
-    int32_t t = 0;
-    for (int p = 0; p < ks; ++p) t += part[(static_cast<size_t>(p) * m + r) * n + c];
-    float v = static_cast<float>(t) * rs[r];
-    v *= cs[c];
-    const size_t at = static_cast<size_t>(r) * ld + c;
-    if (f32) f32[at] = v;
-    if (b16) b16[at] = bf16(v);
+  // The parts' sum per (16-row block, tile), then the unsplit bodies' own epilogue (store_a8r): a scalar form of the same
+  // two multiplies is not the same code, and the build's fast floating point may order it differently.
+  const size_t sum_global = (static_cast<size_t>(A.tiles) * direct_rbs_a8(A) + 15) / 16 * 16;
+  const Args a = A;
+  return q.parallel_for<PfA8RKsSum>(sycl::nd_range<1>(sum_global, 16), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+    constexpr int MB = kMbA8;
+    const int gid = static_cast<int>(it.get_global_id(0));
+    if (gid >= a.tiles * direct_rbs_a8(a)) return;
+    const int tt = gid % a.tiles, m0 = gid / a.tiles * MB;
+    esimd::simd<int32_t, MB * kW> ai(0);
+#pragma unroll
+    for (int r = 0; r < MB; ++r)
+      if (m0 + r < a.m)
+        for (int p = 0; p < a.ks; ++p)
+          ai.template select<kW, 1>(r * kW) += esimd::block_load<int32_t, kW>(part + (static_cast<size_t>(p) * a.m + m0 + r) * a.n + static_cast<size_t>(tt) * kW);
+    const esimd::simd<float, MB> sr = esimd::block_load<float, MB>(a.as + m0);
+    store_a8r<MB, 1>(a, m0, tt, 0, ai, sr);
   });
 }
 
