@@ -48,6 +48,7 @@
 #include "xenithium/kernels/attention/gqa.hpp"
 #include "xenithium/kernels/gemm/w4a16_gemm.hpp"
 #include "xenithium/load/dense_store.hpp"
+#include "xenithium/load/lora.hpp"
 #include "xenithium/model/checkpoint.hpp"
 #include "xenithium/model/kv_lend.hpp"
 #include "xenithium/model/kv_pages.hpp"
@@ -163,6 +164,11 @@ struct ModelOptions {
   double dflash_tree_cut = 0;  // DFlashOptions:tree_cut
   int dflash_tree_seqs = 1;  // DFlashOptions:tree_seqs
   double dflash_tree_temp = 0;  // DFlashOptions:tree_temp (0 = by drafter)
+  // A PEFT LoRA adapter from this directory (load/lora.hpp): loaded after the base weights, its deltas applied at
+  // every layer's q / k / v / o (GQA) and gate / up / down (MLP) projections. Startup-only (one adapter for the
+  // server's life, applied to every request). The adapter's target modules must be the GQA + MLP modules (a GDN /
+  // router / conv / norm module is rejected at load). Empty = no adapter.
+  std::string lora_dir;
   // seg_rows 16 = segments (one sequence's verify) of up to 16 rows: a drafter trained on a block of 16 or more (DSpine
   // b16), its passes up to 16 block rows (DFlashOptions:wide), the GDN's pending logs at 16 rows per slot (more VRAM per
   // slot); 0 / 8 = 8 with a DFlash drafter. dflash_tree_wide: a 16-row tree's nodes (DFlashOptions:tree_wide). When a
@@ -566,6 +572,11 @@ class Model {
   Mtp *drafter() { return mtp_.get(); }
   DFlash *dflash() { return dflash_.get(); }
   const DFlash *dflash() const { return dflash_.get(); }
+  // ---- the PEFT LoRA adapter (ModelOptions:lora_dir): the layer's deltas and the card's scratch (null = no adapter) ----
+  bool has_lora() const { return lora_ != nullptr; }
+  std::string lora_name() const { return lora_ ? lora_->name() : std::string{}; }
+  const kernels::LoraLayer *lora_layer(int c, int l) const { return lora_ ? &lora_->layer(c, l) : nullptr; }
+  kernels::LoraScratch *lora_scratch(int c) { return lora_ ? &lora_->scratch(c) : nullptr; }
   // rows one sequence's segment may carry in a step: 4 (kRows), 8 with DFlash (its 8-row verify)
   int seg_rows_max() const { return rows_max_; }
   // rows one step carries in all: 16 (kernels::kStepRows32) for qwen35, 8 (kStepRows8) for llama / flint (their
@@ -772,7 +783,8 @@ class Model {
   std::chrono::steady_clock::time_point t_submit_;
   // the drafter
   std::unique_ptr<Mtp> mtp_;
-  std::unique_ptr<DFlash> dflash_;  // 
+  std::unique_ptr<DFlash> dflash_;  //
+  std::unique_ptr<load::LoraAdapter> lora_;  // the PEFT LoRA adapter (ModelOptions:lora_dir; null = none)
   int rows_max_ = kRows;            // a segment's rows at most (GdnState:log_rows)
   int step_rows_ = kernels::kStepRows8;  // a step's rows at most (step_rows())
   int rows_cap_ = kernels::kStepRows16;  // rows_cap()

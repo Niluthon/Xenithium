@@ -41,6 +41,7 @@
 #include "xenithium/kernels/attention/qsa.hpp"  // QsaKv, the page / rope constants, the host references
 #include "xenithium/kernels/gemm/w4a16_gemm.hpp"
 #include "xenithium/kernels/comm/wire.hpp"
+#include "xenithium/kernels/lora.hpp"
 
 namespace xenithium::kernels {
 
@@ -257,9 +258,12 @@ float gqa_page_score_ref(const float *q, const float *kmin, const float *kmax);
 // x bf16 [8][hidden] (rows < `rows` live, the rest finite); out bf16 [rows][hidden]. rope: device bf16
 // [>= cache.max_tokens][64]. wire: null with one card. Every row computes what a step of its own
 // sequence alone computes for it, bit for bit. grp() 6 (Qwen3.8-27B: 24 q / 4 kv heads) or 12.
+// lora (null: no adapter): the layer's q / k / v / o deltas (one LoraLayer for this card) added to the fp32 qkv
+// projection (sc.y, before the norms / rope) and the o partial (sc.partial, before the sum); lora_sc the card's
+// scratch (mid + delta). The q / k / v deltas share the input x; their B rows sit at the q | k | v offsets of sc.y.
 GqaEvents gqa_decode(sycl::queue &q, const GqaShape &s, int rows, const gqa_bf16 *x, const GqaWeights &w, const GqaCache &c,
                      const gqa_bf16 *rope, const GqaStep &step, const GqaScratch &sc, const PairWire *wire, int wire_parity, gqa_bf16 *out,
-                     int qkv_ks = 0, int o_ks = 0);
+                     int qkv_ks = 0, int o_ks = 0, const LoraLayer *lora = nullptr, LoraScratch *lora_sc = nullptr);
 
 // After a tree step, the accepted path's K / V rows to their final slots. In each listed cache (one
 // card's attention layers), for every kv head, the token at slot position p0 + from[i] moves to p0 + to[i], i ascending
@@ -347,16 +351,20 @@ struct GqaRowsScratch {
 // select (above): the page selection; pages 0 = dense. The fa body at grp 6 / head_dim 256 only, int8 or bf16
 // KV, with the cache's bounds and sc.sel.
 inline constexpr int kGqaAttnBatch = 0, kGqaAttnBlock = 1, kGqaAttnStaged = 2, kGqaAttnFa = 3, kGqaAttnSdpa = 4;
+// lora (null: no adapter): the layer's q / k / v / o deltas (one LoraLayer for this card); the q / k / v deltas are
+// added to sc.y after the projection (only when sc.qkv_ready is false: the projection ran here), the o delta in
+// gqa_rows_o. lora_sc the card's scratch.
 GqaEvents gqa_rows(sycl::queue &q, const GqaShape &s, int m, const gqa_bf16 *x, const GqaWeights &w, const GqaCache &c, const gqa_bf16 *rope,
                    const int32_t *pos4, int pos0, const GqaRowsScratch &sc, const PairRowsWire *wire, int wire_parity, gqa_bf16 *out,
                    int attn = kGqaAttnFa, int rows_per_group = 0, bool p_lo = true, int qk = 0, const GqaRowsSelect &select = {},
-                   const GqaTrainedPrefill *trained = nullptr);
+                   const GqaTrainedPrefill *trained = nullptr, const LoraLayer *lora = nullptr, LoraScratch *lora_sc = nullptr);
 // gqa_rows' last stage alone: the o projection of sc.attn's m rows into sc.partial and the
 // two-card sum (or, wire->split, the partial left for the caller). One prefill call that carries the rows of several
 // sequences runs gqa_rows per sequence with sc.o_later (its own cache and positions, its rows of y / attn at their
 // offset, the other scratch shared: the calls run in order on the queue) and this once over all rows.
+// lora (null: no adapter): the layer's o delta (lora->o) added to sc.partial after the o projection, before the sum.
 GqaEvents gqa_rows_o(sycl::queue &q, const GqaShape &s, int m, const GqaWeights &w, const GqaRowsScratch &sc, const PairRowsWire *wire, int wire_parity,
-                     gqa_bf16 *out);
+                     gqa_bf16 *out, const LoraLayer *lora = nullptr, LoraScratch *lora_sc = nullptr);
 // Only the K / V of m consecutive rows (the MTP drafter's prefill pass): the q|k|v projection over the rows
 // (pf_dense for dense weights, w4a16_gemm_pf for W4) and prep (norms, rope, the cache writes of every row; q to sc.q);
 // no attention. Slot 0, positions pos0 + r (pos4: gqa_rows' words). Returns the qkv and prep events.

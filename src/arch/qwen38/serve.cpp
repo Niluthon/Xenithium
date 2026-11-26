@@ -44,6 +44,8 @@ serve::VisionPlan vision_plan(const serve::Options &o, const model::ModelConfig 
 ModelOptions model_options(const serve::Options &o, const model::ModelConfig &cfg) {
   if (o.prefill_gemm == "onednn-all")  // (qwen35's int4 trunk only; this arch's trunk is int8)
     throw serve::OptionError("--prefill-gemm onednn-all: every int4 prefill GEMM on oneDNN is built for the dense 27B (qwen35); arch qwen38 takes onednn|esimd");
+  if (!o.lora.empty())  // the dense LoRA path (q/k/v/o, gate/up/down) is built for qwen35 / llama only
+    throw serve::OptionError("--lora: the LoRA adapter path is built for qwen35 (Qwen3.8-27B) and llama; arch qwen38 (the MoE trunk) does not apply it");
   ModelOptions mo;
   mo.slots = o.slots;
   mo.step_rows_cap = step_rows_of(o) > kernels::kStepRows32 ? kernels::kMaxRows : 0;  // 64-row steps (four cards)

@@ -284,6 +284,16 @@ const char *brief_of(std::string_view key) {
        "Takes: - VRAM per card, for the drafter and for its context in every slot: the 27B at 16 slots about 2.0 GiB with DFlash 2 and 3.6 GiB with DSpine; flint about 1 GiB; qwen38 about 0.5 GiB.\n"
        "KV context (qwen35 / flint): the drafter's VRAM comes out of the auto KV pool.\n"
        "Output: the same."},
+      {"XEN_LORA_ADAPTER",
+       "A PEFT LoRA adapter (a directory with `adapter_model.safetensors` + `adapter_config.json`) applied to the served model at startup, over the quantized checkpoint.\n"
+       "\n"
+       "`empty`  no adapter (the base model)\n"
+       "\n"
+       "qwen35 (Qwen3.8-27B) and llama only; the MoE trunks (flint, qwen38) refuse it.\n"
+       "\n"
+       "Gives: a fine-tune of the served model without re-quantising.\n"
+       "Takes: - a little VRAM per card (the A / B matrices), - a little decode / prefill time (the low-rank deltas, under 1-2 % at rank 32).\n"
+       "Output: the adapted model's logits (the base model's when the adapter is a no-op)."},
       {"XEN_DRAFTER_DEFER",
        "With a block drafter: on steps where the drafter does not guess (a busy server), its catch-up work is batched per slot instead of done every step.\n"
        "\n"
@@ -1255,7 +1265,7 @@ std::vector<Spec> schema() {
   };
   const std::string net = "Model & network", cap = "Capacity & memory", spec = "Speculative decoding", num = "Numerics & kernels",
                     pf = "Prompt processing & cache", q = "Queue & connections", rt = "Runtime", dg = "Diagnostics",
-                    smp = "Sampling defaults", tq = "Trained page selection";
+                    smp = "Sampling defaults", tq = "Trained page selection", ad = "Adapters";
   add("XEN_MODEL", "Model", net, Kind::Path);
   {
     auto &s = add("XEN_MODELS_DIR", "Models folder", net, Kind::Path);
@@ -1543,6 +1553,12 @@ std::vector<Spec> schema() {
     auto &s = add("XEN_MTP_DEPTH", "MTP depth", spec, Kind::Choice);  // one decoding sequence; qwen38 1-3, the dense 27B 1-6
     s.choices = {"3", "2", "1", "4", "5", "6"};
     s.names = {{"3", "MTP-3 (default)"}, {"2", "MTP-2"}, {"1", "MTP-1"}, {"4", "MTP-4 (Qwen3.8-27B)"}, {"5", "MTP-5 (Qwen3.8-27B)"}, {"6", "MTP-6 (Qwen3.8-27B)"}};
+  }
+  {
+    auto &s = add("XEN_LORA_ADAPTER", "LoRA adapter", ad, Kind::Path);  // a PEFT adapter over the dense trunk
+    s.scope = Scope::Qwen35;
+    s.allow_empty = true;
+    s.names = {{"", "off"}};
   }
   {
     auto &s = add("XEN_PREFILL_MOE", "Prefill experts", num, Kind::Choice);

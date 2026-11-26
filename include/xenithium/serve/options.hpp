@@ -125,6 +125,9 @@ struct Options {
   int unequal_segments = 1;  // a draft depth per request (qwen38 with DFlash)
   int lookup = 4;  // lookup drafting: the match length (0 = off)
 
+  // ---- adapters ----
+  std::string lora;  // a PEFT LoRA adapter directory (adapter_model.safetensors + adapter_config.json); qwen35 / llama only
+
   // ---- prefix cache ----
   int prefix_cache = 1;
   double prefix_cache_gib = 8;

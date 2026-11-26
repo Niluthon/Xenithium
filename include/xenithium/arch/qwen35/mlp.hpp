@@ -13,9 +13,11 @@
 
 #include "xenithium/arch/qwen35/arch.hpp"
 #include "xenithium/kernels/gemm/mlp.hpp"
+#include "xenithium/kernels/lora.hpp"
 #include "xenithium/kernels/rows.hpp"
 #include "xenithium/kernels/comm/wire.hpp"
 #include "xenithium/load/dense_store.hpp"
+#include "xenithium/load/lora.hpp"
 #include "xenithium/rt/fabric.hpp"
 
 namespace xenithium::arch::qwen35 {
@@ -58,8 +60,11 @@ class Mlp {
   // The layer's slices on card c from the store (layers.L.mlp.{gate_proj,down_proj}, the checkpoint's packed name).
   MlpWeights weights(const load::DenseStore &dense, int card, int layer) const;
   // One layer on every card: x[c] bf16 [rows][H] (rows finite), w[c] the card's slices; out in card(c).out.
-  // Submits on both cards and returns; the mailbox parity alternates per call.
-  void run(int rows, const std::vector<const bf16 *> &x, const std::vector<MlpWeights> &w, int gu_ksplit = 0, int dn_ksplit = 0);
+  // Submits on both cards and returns; the mailbox parity alternates per call. lora (null: no adapter): the layer's
+  // gate | up | down deltas (lora->layer(c, layer)) added to the fp32 gu / part before swiglu / the reduce; the gate |
+  // up delta forces the gate | up -> swiglu path (the fused epilogue has no fp32 gu).
+  void run(int rows, const std::vector<const bf16 *> &x, const std::vector<MlpWeights> &w, int gu_ksplit = 0, int dn_ksplit = 0,
+           const load::LoraAdapter *lora = nullptr, int layer = 0);
   // Prefill: allocate the many-row scratch for up to rows_max rows (once). h (optional, one per card): the caller's
   // [rows_max][ipc] bf16 for h (the model's shared stage scratch; not released here). wire (optional, one per card): the
   // caller's rows wire for the reduce (the model's mixer wire, its parity passed to run_rows), no own mailbox.
@@ -73,9 +78,13 @@ class Mlp {
   // gu_ready (fused only): h already holds the gate|up + swiglu of every row (gate_up_rows in row parts).
   // parity: the reduce's mailbox parity with reserve_rows' caller wire (the caller alternates it), else unused.
   void run_rows(int m, const std::vector<const bf16 *> &x, const std::vector<MlpWeights> &w, const std::vector<bf16 *> &out, bool reduce = true,
-                bool fused = true, const kernels::PairSplitSend *const *send = nullptr, bool gu_ready = false, int parity = 0);
-  // Card c's fused gate|up + swiglu of rows [lo, lo + rows) of x (bf16 [.][H], x pointing at row 0) into h.
-  void gate_up_rows(int c, int lo, int rows, const bf16 *x, const MlpWeights &w);
+                bool fused = true, const kernels::PairSplitSend *const *send = nullptr, bool gu_ready = false, int parity = 0,
+                const load::LoraAdapter *lora = nullptr, int layer = 0);
+  // Card c's fused gate|up + swiglu of rows [lo, lo + rows) of x (bf16 [.][H], x pointing at row 0) into h. lora (null:
+  // no adapter): the gate | up delta (lora->layer(c, layer)) added to the fp32 gu before swiglu (forces the gate | up ->
+  // swiglu path).
+  void gate_up_rows(int c, int lo, int rows, const bf16 *x, const MlpWeights &w, const kernels::LoraLayer *ll = nullptr,
+                    kernels::LoraScratch *ls = nullptr);
   const sycl::event &sent(int c) const { return sent_[static_cast<size_t>(c)]; }
   const float *rows_part(int c) const { return rows_[static_cast<size_t>(c)].part; }
   void wait();

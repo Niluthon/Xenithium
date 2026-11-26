@@ -307,6 +307,8 @@ std::vector<Flag> flags(serve::Options &o, std::string &kv_pool) {
       {"--adaptive-depth", "0|1", i32(o.adaptive_depth)},
       {"--unequal-segments", "0|1", i32(o.unequal_segments)},
       {"--lookup", "0|2..8", i32(o.lookup)},
+      // adapters
+      {"--lora", "DIR", str(o.lora)},
       // prefix cache
       {"--prefix-cache", "0|1", i32(o.prefix_cache)},
       {"--prefix-cache-gib", "F", f64(o.prefix_cache_gib)},

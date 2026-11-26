@@ -272,6 +272,20 @@ Model::Model(Fabric &fab, const std::string &dir, const ModelOptions &opt) : fab
     plan.insert(plan.end(), extra.begin(), extra.end());
   }
   dense_->load(ck, plan, opt.threads);
+  if (!opt.lora_dir.empty()) {  // the PEFT LoRA adapter (load/lora.hpp): the per-(card, layer) A / B deltas
+    load::LoraGeom lg;
+    lg.cards = C;
+    lg.layers = cfg_.layers;
+    lg.hidden = cfg_.hidden;
+    lg.q_heads = cfg_.q_heads;
+    lg.kv_heads = cfg_.kv_heads;
+    lg.head_dim = cfg_.head_dim;
+    lg.attn_output_gate = cfg_.attn_output_gate;
+    lg.inter = cfg_.inter;
+    lg.full_attention = cfg_.full_attention;
+    lg.prefix = cfg_.prefix;
+    lora_ = std::make_unique<load::LoraAdapter>(fab, opt.lora_dir, lg, opt.threads);
+  }
   head_ = std::make_unique<Head>(fab, *dense_, cfg_, opt.head_rescore > 0, rows_cap_);
   cands_ = std::make_unique<HeadCands>(fab, head_->vocab_per_card(), rows_cap_);  // device scratch before any VRAM fit
   if (opt.head_rescore > 0) head_->set_mode(HeadMode::rescore, opt.head_rescore);
@@ -534,6 +548,8 @@ Model::Model(Fabric &fab, const std::string &dir, const ModelOptions &opt) : fab
     }
     mlp_->reserve_rows(opt.prefill_chunk, h, w);
   }
+  if (lora_)  // the adapter's per-card scratch (mid + delta), sized to the largest prefill chunk
+    lora_->reserve_scratch(fab, std::max(rows_max_, opt.prefill_chunk));
   if (!opt.dflash_dir.empty()) {  // the DFlash 2 drafter (own store, context rings, scratch; the target's embedding, lm_head)
     if (opt.prefill_slices) throw std::invalid_argument("qwen35 model: the drafter needs the many-row prefill (prefill_slices false)");
     DFlashOptions dop;
@@ -1868,7 +1884,8 @@ void Model::submit_layers(int rows, int seg_rows, int pb, StepEvents *sev) {
         ash.dec_qk = sopt_.attn_qk, ash.dec_p_lo = sopt_.attn_p_lo;  // the decode attention numerics
         if (trained_qsa3_ && trained_qsa_layer_[l]>=0 && qsa_stage_rows_)
           trained_qsa3_->stage(static_cast<int>(c),x,rows,ash.hkv(),gs,trained_qsa_layer_[l],l,qsa_stage_rows_,qsa_step_sparse_,qsa_dense_rows_);
-        auto ev = k::gqa_decode(q, ash, rows, x, attn_.w[c][l], cd.kv[l], cd.rope, gs, asc, wire, mix_parity_, cd.mix);
+        auto ev = k::gqa_decode(q, ash, rows, x, attn_.w[c][l], cd.kv[l], cd.rope, gs, asc, wire, mix_parity_, cd.mix, 0, 0,
+                               lora_layer(static_cast<int>(c), l), lora_scratch(static_cast<int>(c)));
         if (pc) sev->aev.push_back(ev);
         if (q_hook) q_ready[c] = ev.attn;
       } else {
@@ -1903,7 +1920,7 @@ void Model::submit_layers(int rows, int seg_rows, int pb, StepEvents *sev) {
       continue;
     }
     for (size_t c = 0; c < C; ++c) mw[c] = mlp_->weights(*dense_, static_cast<int>(c), l);
-    mlp_->run(rows, xn, mw, gu_ks);
+    mlp_->run(rows, xn, mw, gu_ks, 0, lora_.get(), l);
     for (size_t c = 0; c < C; ++c) mlp_out[c] = mlp_->card(static_cast<int>(c)).out;
     if (pr) sev->mev.push_back(mlp_->events(opt_.profile_card));
   }
@@ -2747,7 +2764,7 @@ bool Model::pf_step(int layers) {
   // the producers send the peer's rows on the side queue; the consumer (norm + its first GEMM) takes the peer's
   // rows late. Both from kSendMinRows.
   constexpr int kSendMinRows = 512;
-  const bool send = split && opt_.prefill_send && m >= kSendMinRows && !multi;  // (a segment is under kSendMinRows: its own call sends nothing)
+  const bool send = split && opt_.prefill_send && m >= kSendMinRows && !multi && !has_lora();  // (a segment is under kSendMinRows: its own call sends nothing; a LoRA delta lands after a send)
   const bool defer = send && opt_.prefill_defer;
   double split_ms = 0;
   // the split two-card sum of a many-row producer's fp32 partials (both cards' partial on their queues); sent: the
@@ -2834,9 +2851,16 @@ bool Model::pf_step(int layers) {
       std::function<void(int, int)> proj;
       if (pre_in && full) {
         const k::GqaWeights &w = attn_.w[c][l];
+        const k::LoraLayer *ll = lora_layer(static_cast<int>(c), l);
+        k::LoraScratch *ls = lora_scratch(static_cast<int>(c));
         proj = [&](int lo, int hi) {
           k::w4a16_gemm_pf(q, hi - lo, cd.pf_xn + static_cast<size_t>(lo) * H, H, w.qkv.w, w.qkv.scales, cd.pf_gqa.y + static_cast<size_t>(lo) * w.qkv.n, w.qkv.n,
                            w.qkv.n, w.qkv.k);
+          if (ll) {  // the q | k | v deltas into the fp32 qkv (before the norms / rope)
+            if (ll->q.present()) k::lora_apply(q, hi - lo, cd.pf_xn + static_cast<size_t>(lo) * H, ll->q, cd.pf_gqa.y + static_cast<size_t>(lo) * w.qkv.n, w.qkv.n, *ls, 0);
+            if (ll->k.present()) k::lora_apply(q, hi - lo, cd.pf_xn + static_cast<size_t>(lo) * H, ll->k, cd.pf_gqa.y + static_cast<size_t>(lo) * w.qkv.n, w.qkv.n, *ls, 0);
+            if (ll->v.present()) k::lora_apply(q, hi - lo, cd.pf_xn + static_cast<size_t>(lo) * H, ll->v, cd.pf_gqa.y + static_cast<size_t>(lo) * w.qkv.n, w.qkv.n, *ls, 0);
+          }
         };
       } else if (pre_in) {
         const k::GdnWeights &w = gdn_.w[c][l];
@@ -2880,6 +2904,12 @@ bool Model::pf_step(int layers) {
           auto &q = fab_.compute(c);
           const k::GqaWeights &w = attn_.w[c][l];
           k::w4a16_gemm_pf(q, m, cd.pf_xn, H, w.qkv.w, w.qkv.scales, cd.pf_gqa.y, w.qkv.n, w.qkv.n, w.qkv.k);
+          if (auto *ll = lora_layer(static_cast<int>(c), l)) {  // the q | k | v deltas into the fp32 qkv (before the norms / rope)
+            auto *ls = lora_scratch(static_cast<int>(c));
+            if (ll->q.present()) k::lora_apply(q, m, cd.pf_xn, ll->q, cd.pf_gqa.y, w.qkv.n, *ls, 0);
+            if (ll->k.present()) k::lora_apply(q, m, cd.pf_xn, ll->k, cd.pf_gqa.y, w.qkv.n, *ls, 0);
+            if (ll->v.present()) k::lora_apply(q, m, cd.pf_xn, ll->v, cd.pf_gqa.y, w.qkv.n, *ls, 0);
+          }
           for (const auto &sg : pf_.segs) {
             const size_t r0 = static_cast<size_t>(sg.row0);
             k::GqaRowsScratch ss = cd.pf_gqa;
@@ -2898,12 +2928,12 @@ bool Model::pf_step(int layers) {
             k::gqa_rows(q, as, sg.m, cd.pf_xn + r0 * static_cast<size_t>(H), w, kv_view(cd.kv[l], sg.slot), cd.rope, cd.pf_pos + r0 / 4, static_cast<int>(sg.pos), ss,
                         C > 1 ? &pw : nullptr, pf_parity_, cd.pf_mix + r0 * static_cast<size_t>(H), opt_.prefill_attn, opt_.prefill_attn_rows, opt_.prefill_attn_p_lo,
                         opt_.prefill_attn_qk, k::GqaRowsSelect{.pages = opt_.prefill_select, .dense_last_block = sg.next < 0},
-                        segment_plan.pages?&segment_plan:nullptr);
+                        segment_plan.pages?&segment_plan:nullptr, lora_layer(static_cast<int>(c), l), lora_scratch(static_cast<int>(c)));
             if(pf_merged && l==3 && c==0)
               std::fprintf(stderr,"QSA_MERGED_PREFILL slot=%d pos=%lld rows=%d route=%s\n",sg.slot,
                 static_cast<long long>(sg.pos),sg.m,segment_plan.pages?"trained":"dense");
           }
-          const auto e = k::gqa_rows_o(q, ash, m, w, cd.pf_gqa, C > 1 ? &pw : nullptr, pf_parity_, cd.pf_mix);
+          const auto e = k::gqa_rows_o(q, ash, m, w, cd.pf_gqa, C > 1 ? &pw : nullptr, pf_parity_, cd.pf_mix, lora_layer(static_cast<int>(c), l), lora_scratch(static_cast<int>(c)));
           if (c == 0) ae = e;
           continue;
         }
@@ -2911,7 +2941,7 @@ bool Model::pf_step(int layers) {
                                    static_cast<int>(pos_), sc, C > 1 ? &pw : nullptr, pf_parity_, cd.pf_mix, opt_.prefill_attn, opt_.prefill_attn_rows,
                                    opt_.prefill_attn_p_lo, opt_.prefill_attn_qk,
                                    k::GqaRowsSelect{.pages = opt_.prefill_select, .dense_last_block = ends_prompt},
-                                   pf_plan[c].pages ? &pf_plan[c] : nullptr);
+                                   pf_plan[c].pages ? &pf_plan[c] : nullptr, lora_layer(static_cast<int>(c), l), lora_scratch(static_cast<int>(c)));
         if (pf_plan[c].pages) {
           const uint64_t bit=uint64_t(1)<<trained_qsa_layer_[l];
           if (!(trained_prefill_reported_[c]&bit)) {
@@ -2939,7 +2969,7 @@ bool Model::pf_step(int layers) {
         if (full) {
           const int pb = static_cast<int>(std::min<int64_t>(cap_, pos[s] + rows[s]));
           k::gqa_decode(q, attn_.shape_of(static_cast<int>(c), l), rows[s], x, attn_.w[c][l], kv_view(cd.kv[l], slot_), cd.rope, k::GqaStep{cd.pf_pos + s, pb}, cd.asc,
-                        C > 1 ? &cd.wire : nullptr, mix_parity_, out);
+                        C > 1 ? &cd.wire : nullptr, mix_parity_, out, 0, 0, lora_layer(static_cast<int>(c), l), lora_scratch(static_cast<int>(c)));
         } else if (!rows_mode) {
           k::GdnState st = gdn_view(cd.gdn[l], slot_);
           st.accept = cd.pf_acc + s;
@@ -3019,7 +3049,7 @@ bool Model::pf_step(int layers) {
     for (size_t c = 0; c < C; ++c) {
       if (!moe_l) mw[c] = mlp_->weights(*dense_, static_cast<int>(c), l);
       std::function<void(int, int)> proj;
-      if (pre_mid) proj = [&, c](int lo, int hi) { mlp_->gate_up_rows(static_cast<int>(c), lo, hi - lo, cards_[c]->pf_xn, mw[c]); };
+      if (pre_mid) proj = [&, c](int lo, int hi) { mlp_->gate_up_rows(static_cast<int>(c), lo, hi - lo, cards_[c]->pf_xn, mw[c], lora_layer(static_cast<int>(c), l), lora_scratch(static_cast<int>(c))); };
       // the dense MLP's xn feeds only its gate|up GEMM
       pf_norm(static_cast<int>(c), m, cards_[c]->pf_mix, cards_[c]->post_norm[l], pend_mid, proj, !moe_l && mlp_ && !opt_.prefill_slices && pf_codes_only(m),
               pend_mid ? post_mode : PfNorm::both);
@@ -3056,7 +3086,7 @@ bool Model::pf_step(int layers) {
       const k::PairSplitSend *snd[2] = {nullptr, nullptr};
       if (send)
         for (size_t c = 0; c < C; ++c) snd[c] = send_of(c);
-      mlp_->run_rows(m, xs, mw, outs, !split, opt_.prefill_fused_swiglu, send ? snd : nullptr, pre_mid, pf_parity_);
+      mlp_->run_rows(m, xs, mw, outs, !split, opt_.prefill_fused_swiglu, send ? snd : nullptr, pre_mid, pf_parity_, lora_.get(), l);
       if (!split) pf_parity_ ^= 1;  // the reduce ran on the mixers' wire
       if (pr) {
         mlp_->wait();
@@ -3070,7 +3100,7 @@ bool Model::pf_step(int layers) {
       for (int s = 0; s < S; ++s) {
         for (size_t c = 0; c < C; ++c) xs[c] = cards_[c]->pf_xn + s * sl;
         if (moe_l) moe_->run(l, rows[s], xs);
-        else mlp_->run(rows[s], xs, mw);
+        else mlp_->run(rows[s], xs, mw, 0, 0, lora_.get(), l);
         for (size_t c = 0; c < C; ++c)
           fab_.compute(c).memcpy(cards_[c]->pf_mlp + s * sl, moe_l ? moe_->out(static_cast<int>(c)) : mlp_->card(static_cast<int>(c)).out,
                                  static_cast<size_t>(rows[s]) * H * 2);

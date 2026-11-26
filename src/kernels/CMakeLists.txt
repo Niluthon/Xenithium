@@ -22,6 +22,8 @@ xenithium_kernel_family(moe
   REF     moe_cpu.cpp)
 xenithium_kernel_family(residual
   SOURCES rmsnorm.cpp hc.cpp hc_fused.cpp)
+xenithium_kernel_family(lora
+  SOURCES lora.cpp)
 xenithium_kernel_family(embed
   SOURCES embed_aff.cpp ple.cpp
   REF     ple_ref.cpp)
