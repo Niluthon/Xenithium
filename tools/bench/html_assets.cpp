@@ -112,6 +112,19 @@ tbody tr:hover td{background:var(--hl)}
 .miss dt{color:var(--mute)}.miss dd{margin:0;overflow-wrap:anywhere}
 .miss dd.want{color:var(--ok)}.miss dd.got{color:var(--bad)}.miss dd.none{color:var(--bad);font-style:italic}
 a.fig.bad{border-color:var(--bad)}.fig .w{font:12.5px var(--mono);color:var(--bad);margin-top:6px}
+.fig .d a{color:var(--acc);text-decoration:none}.fig .d a:hover{text-decoration:underline}
+
+/* the decode figure's weighting: a switch on the figure and in its section, and what each weighting is */
+.mixsw{display:inline-flex;gap:0;margin-top:10px;border:1px solid var(--rule);border-radius:999px;overflow:hidden;font:12px var(--mono)}
+.mixsw button{border:0;background:none;color:var(--mute);padding:3px 12px;cursor:pointer;font:inherit}
+.mixsw button+button{border-left:1px solid var(--rule)}
+.mixsw button[aria-pressed=true]{background:var(--acc);color:var(--panel)}
+.mixsw button:focus-visible{outline:2px solid var(--acc);outline-offset:-2px}
+.mixinfo{margin-top:18px;border:1px solid var(--rule);border-radius:12px;background:var(--panel);overflow:hidden}
+.mixinfo .mbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:8px 14px;border-bottom:1px solid var(--rule);font:13px var(--mono);color:var(--ink)}
+.mixinfo .mbar .mixsw{margin-top:0}
+.mixinfo tr.on td{background:var(--hl)}.mixinfo tr.on td:first-child{box-shadow:inset 3px 0 0 var(--acc)}
+.mixinfo ul{margin:0;padding:10px 14px 12px 30px;font-size:13px;color:var(--mute)}.mixinfo li{margin-top:4px}.mixinfo li b{color:var(--ink);font-weight:600}
 
 /* setup */
 dl.setup{display:grid;grid-template-columns:max-content 1fr;gap:6px 22px;margin:16px 0 0;font:12.5px var(--mono)}
@@ -191,6 +204,29 @@ constexpr std::string_view kScript = R"JS(
     try { localStorage.setItem(themeKey, theme); } catch (e) { /* not kept */ }
     applyTheme();
   });
+
+  // ---- the decode figure's weighting: every switch shows the pick, the figure and the panel's row follow it; the pick
+  // is kept for the next report ----
+  const mixKey = 'xenithium-bench-mix';
+  const pickMix = (name, keep) => {
+    let found = false;
+    document.querySelectorAll('.mixsw button').forEach(b => { if (b.dataset.mix === name) found = true; });
+    if (!found) return;
+    document.querySelectorAll('.mixsw button').forEach(b => {
+      const on = b.dataset.mix === name;
+      b.setAttribute('aria-pressed', String(on));
+      if (!on) return;
+      const card = b.closest('.mixfig');
+      if (card) { card.querySelector('.mv').textContent = b.dataset.v; card.querySelector('.md').textContent = b.dataset.d; }
+    });
+    document.querySelectorAll('.mixinfo tr[data-mix]').forEach(row => row.classList.toggle('on', row.dataset.mix === name));
+    if (keep) try { localStorage.setItem(mixKey, name); } catch (e) { /* not kept */ }
+  };
+  document.querySelectorAll('.mixsw').forEach(sw => {
+    sw.hidden = false;
+    sw.querySelectorAll('button').forEach(b => b.addEventListener('click', () => pickMix(b.dataset.mix, true)));
+  });
+  try { const kept = localStorage.getItem(mixKey); if (kept) pickMix(kept, false); } catch (e) { /* a file page may have no storage */ }
 
   // ---- folding the scenarios' sections ----
   const setFolded = (section, folded) => {

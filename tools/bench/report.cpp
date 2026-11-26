@@ -276,6 +276,7 @@ json::Value headline_json(const Headline &h) {
   json::Value obj = json::Value::object();
   obj.set("decode_tps", json::Value::real(h.decode_tps));
   if (!h.decode_mix.empty()) obj.set("decode_mix", json::Value::string(h.decode_mix));
+  if (h.decode_mixes.size() > 1) obj.set("decode_mixes", pairs_json(h.decode_mixes, "mix", "decode_tps"));
   obj.set("decode_by_category", pairs_json(h.decode_by_category, "category", "decode_tps"));
   obj.set("prefill", depths_json(h.prefill, "prefill_tps"));
   obj.set("deep_decode", depths_json(h.deep_decode, "decode_tps"));
@@ -435,8 +436,12 @@ Headline headline(const Run &run) {
       const std::string *category = label_value(row, "category");
       if (!category) continue;
       const double tps = median_of(row, metric::kDecode);
-      if (*category == "weighted" || category->ends_with(" mix")) h.decode_tps = tps, h.decode_mix = *category;
-      else h.decode_by_category.emplace_back(*category, tps);
+      if (*category == "weighted" || category->ends_with(" mix")) {
+        if (h.decode_mixes.empty()) h.decode_tps = tps, h.decode_mix = *category;
+        h.decode_mixes.emplace_back(*category, tps);
+      } else {
+        h.decode_by_category.emplace_back(*category, tps);
+      }
     }
   if (const ScenarioResult *prefill = scenario_named(run, "prefill")) {
     const std::string *first_kind = prefill->rows.empty() ? nullptr : label_value(prefill->rows.front(), "kind");
@@ -515,8 +520,8 @@ std::string to_json(const Run &run) {
   config.set("top_p", json::Value::real(i.sampling.top_p));
   config.set("top_k", json::Value::integer(i.sampling.top_k));
   config.set("thinking", json::Value::string(thinking_or_default(i.thinking)));
-  config.set("mode", json::Value::string(i.mode));
-  config.set("mode_version", json::Value::integer(i.mode_version));
+  if (i.method > 0) config.set("method", json::Value::integer(i.method));
+  if (!i.mode.empty()) config.set("mode", json::Value::string(i.mode)), config.set("mode_version", json::Value::integer(i.mode_version));
   config.set("reply_length", json::Value::string(i.reply_length));
   config.set("corpus", json::Value::string(i.corpus));
   config.set("corpus_version", json::Value::integer(i.corpus_version));
@@ -554,13 +559,16 @@ std::optional<Run> run_from_json(std::string_view text, std::string &err) {
     i.seed = static_cast<uint64_t>(number_at(*config, "seed"));
     i.corpus_version = static_cast<int>(number_at(*config, "corpus_version"));
     i.corpus = text_at(*config, "corpus");
-    if (i.corpus.empty()) i.corpus = "hard";  // runs from before the second set read the engine's own code
-    i.mode = text_at(*config, "mode");
-    i.mode_version = std::max(1, static_cast<int>(number_at(*config, "mode_version")));
-    if (i.mode.empty()) {  // runs from before the modes: the set named "easy" then is the medium corpus now
-      if (i.corpus == "easy") i.corpus = "medium";
-      i.mode = i.corpus == "medium" ? "medium" : "hard";
+    i.method = static_cast<int>(number_at(*config, "method"));
+    if (i.method == 0) {  // a run from before the one method: it had a mode, or before the modes its corpus said which
+      i.mode = text_at(*config, "mode");
+      i.mode_version = std::max(1, static_cast<int>(number_at(*config, "mode_version")));
+      if (i.corpus.empty()) i.corpus = "hard";  // runs from before the second set read the engine's own code
+      if (i.mode.empty()) i.mode = i.corpus == "hard" ? "hard" : "medium";
     }
+    // the sets' names before the modes were merged: hard = the engine's own text, medium (once easy) = the generic one
+    if (i.corpus == "hard") i.corpus = "engine";
+    else if (i.corpus == "medium" || i.corpus == "easy") i.corpus = "generic";
     i.sampling = {.temperature = number_at(*config, "temperature"), .top_p = number_at(*config, "top_p"), .top_k = static_cast<int>(number_at(*config, "top_k")), .seed = std::nullopt};
   }
   if (const json::Value *power = root.get_object("power")) i.power = run_power_from(*power);
@@ -642,21 +650,28 @@ std::string render_scenario(const ScenarioResult &scenario) {
   return out;
 }
 
+std::string method_text(const RunInfo &info) {
+  if (info.method > 0 || info.mode.empty()) return "method v" + std::to_string(info.method);
+  return "mode " + info.mode + " v" + std::to_string(info.mode_version);
+}
+
 std::string render_run(const Run &run) {
   const RunInfo &i = run.info;
   std::string out = "xenithium-bench run " + i.timestamp + "-" + i.name + "\n";
   out += std::string(kIndent) + "endpoint " + i.endpoint + ", model " + i.model + (i.context_tokens ? ", context " + with_thousands(i.context_tokens) + " tokens" : "") +
          (i.kv_pool_tokens ? ", KV pool " + with_thousands(i.kv_pool_tokens) + " tokens" : "") + "\n";
   char line[520];
-  std::snprintf(line, sizeof(line), "mode %s v%d, suite %s, seed %llu, sampling T %.2f / top-p %.2f / top-k %d, thinking %.*s, replies %s, corpus %s v%d %s, %.0f s", i.mode.c_str(),
-                i.mode_version, i.suite.c_str(), static_cast<unsigned long long>(i.seed), i.sampling.temperature, i.sampling.top_p, i.sampling.top_k,
+  std::snprintf(line, sizeof(line), "%s, suite %s, seed %llu, sampling T %.2f / top-p %.2f / top-k %d, thinking %.*s, replies %s, corpus %s v%d %s, %.0f s", method_text(i).c_str(),
+                i.suite.c_str(), static_cast<unsigned long long>(i.seed), i.sampling.temperature, i.sampling.top_p, i.sampling.top_k,
                 static_cast<int>(thinking_or_default(i.thinking).size()), thinking_or_default(i.thinking).data(), i.reply_length.c_str(), i.corpus.c_str(), i.corpus_version, i.corpus_hash.c_str(),
                 i.seconds);
   out += std::string(kIndent) + line + "\n";
   const Headline h = headline(run);
   if (h.decode_tps > 0) {
     const std::string mix = h.decode_mix.empty() || h.decode_mix == "weighted" ? "weighted over the categories" : "the " + h.decode_mix + " of the categories";
-    out += std::string(kIndent) + "headline: decode " + format_number(h.decode_tps) + " tok/s (" + mix + ")\n";
+    std::string others;
+    for (size_t k = 1; k < h.decode_mixes.size(); ++k) others += "; " + h.decode_mixes[k].first + " " + format_number(h.decode_mixes[k].second) + " tok/s";
+    out += std::string(kIndent) + "headline: decode " + format_number(h.decode_tps) + " tok/s (" + mix + ")" + others + "\n";
   }
   for (const ScenarioResult &s : run.scenarios) out += "\n" + render_scenario(s);
   return out;
@@ -668,9 +683,9 @@ std::string render_compare(const Run &base, const Run &other) {
   if (base.info.corpus_hash != other.info.corpus_hash || base.info.corpus_version != other.info.corpus_version)
     out += "WARNING: the runs used different corpora or prompt sets (" + base.info.corpus + " version " + std::to_string(base.info.corpus_version) + " against " +
            other.info.corpus + " version " + std::to_string(other.info.corpus_version) + "): their prompts differ.\n";
-  if (base.info.mode != other.info.mode || base.info.mode_version != other.info.mode_version)
-    out += "WARNING: the runs measured in different modes (" + base.info.mode + " v" + std::to_string(base.info.mode_version) + " against " + other.info.mode + " v" +
-           std::to_string(other.info.mode_version) + "): their prompts and method differ, so their numbers do not compare.\n";
+  if (method_text(base.info) != method_text(other.info))
+    out += "WARNING: the runs measured by different methods (" + method_text(base.info) + " against " + method_text(other.info) +
+           "): their prompts and method differ, so their numbers do not compare.\n";
   if (base.info.model != other.info.model) out += "note: the runs are of different models.\n";
   if (base.info.reply_length != other.info.reply_length)
     out += "WARNING: the replies were of " + base.info.reply_length + " length against " + other.info.reply_length +

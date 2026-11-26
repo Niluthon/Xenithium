@@ -1,8 +1,11 @@
 // Scenario "decode": one request at a time over the short prompts of every category, sampled as chat clients sample
 // (the run's temperature / top-p / top-k, a seed per request). Decode speed depends on the kind of text - code drafts
-// well, prose does not - so it is reported per category and as one figure for a mix of the categories (weight_mixes):
-// the rate at which that mix of tokens comes out (mix_rate, a weighted harmonic mean), or for the easy mix the weighted
-// mean of the categories' rates. The prompts are the run's set (the mode's: Session::prompts).
+// well, prose does not - so it is reported per category and as figures for mixes of the categories (weight_mixes): the
+// mix the run asks for heads the decode figure, and the benchmark and agentic mixes are always reported beside it
+// (headline_mixes), so the report can switch between them. The benchmark mix is the weighted mean of the categories'
+// rates, as the usual public benchmarks quote it; the agentic mix the rate at which a coding agent's mix of tokens comes
+// out (mix_rate, a weighted harmonic mean). The prompts are the run's (Session::prompts): per category its open tasks and its
+// tasks on given input, every reply ending where the model ends it.
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -17,26 +20,28 @@ namespace {
 
 constexpr ParamSpec kParams[] = {
     {"categories", "", "categories to run, comma separated; empty = all"},
-    {"passes", "3", "times every prompt is sent"},
-    {"warmup", "2", "requests sent first and not counted (the server's first-use costs)"},
-    {"weights", "agent", "the headline's mix of categories: agent (a coding agent's measured output), even, easy (code-led, a plain weighted mean; the easy mode's), or category:share,... (shares of generated tokens)"},
+    {"passes", "2", "times every prompt is sent (seven prompts per category: 14 samples each)"},
+    {"warmup", "3", "requests sent first and not counted (the server's first-use costs)"},
+    {"weights", "benchmark", "the headline's mix of categories: benchmark (the usual public benchmarks' code-led shares, a plain weighted mean), agentic (a coding agent's measured output, the rate it comes out at), even, or category:share,... (shares of generated tokens); benchmark and agentic are reported either way"},
 };
 
 // A mix by its name, or "category:share..." (normalised to sum 1). Throws std:invalid_argument naming the problem.
 struct Mix {
-  std::string name;  // the mix row's label: "agent mix", "even mix", "custom mix"
+  std::string name;  // the mix row's label: "benchmark mix", "agentic mix", "even mix", "custom mix"
   std::vector<std::pair<std::string, double>> weights;
   MixAverage average = MixAverage::harmonic;
 };
 
+Mix named_mix(const WeightMix &mix) {
+  Mix out{std::string(mix.id) + " mix", {}, mix.average};
+  for (const CategoryWeight &w : mix.weights) out.weights.emplace_back(std::string(w.category), w.weight);
+  return out;
+}
+
 Mix mix_of(const Params &params) {
   const std::string spec = params.text("weights");
   for (const WeightMix &mix : weight_mixes())
-    if (mix.id == spec) {
-      Mix out{std::string(mix.id) + " mix", {}, mix.average};
-      for (const CategoryWeight &w : mix.weights) out.weights.emplace_back(std::string(w.category), w.weight);
-      return out;
-    }
+    if (mix.id == spec) return named_mix(mix);
   Mix out{"custom mix", {}};
   double sum = 0;
   for (const std::string &item : params.list("weights")) {
@@ -46,7 +51,7 @@ Mix mix_of(const Params &params) {
     char *end = nullptr;
     const double share = colon == std::string::npos ? -1 : std::strtod(item.c_str() + colon + 1, &end);
     if (!known || colon == std::string::npos || end == item.c_str() + colon + 1 || *end != '\0' || !std::isfinite(share) || share < 0)
-      throw std::invalid_argument("decode.weights: \"" + item + "\" is not category:share with a known category and a share >= 0 (or a mix: agent, even, easy)");
+      throw std::invalid_argument("decode.weights: \"" + item + "\" is not category:share with a known category and a share >= 0 (or a mix: benchmark, agentic, even)");
     out.weights.emplace_back(category, share);
     sum += share;
   }
@@ -60,7 +65,9 @@ class Decode final : public Scenario {
   std::string_view id() const override { return "decode"; }
   std::string_view title() const override { return "Single-stream decode by category (sampled)"; }
   std::string_view about() const override {
-    return "One request at a time over short prompts of eight kinds of output (chat, code, reasoning, maths, prose, JSON, edits, summaries): decode tok/s, TTFT and tokens per streamed update per category, and the rate of a mix of them (by default a coding agent's output, measured).";
+    return "One request at a time over short prompts of eight kinds of output (chat, code, reasoning, maths, prose, JSON, edits, summaries), each kind both written from scratch and "
+           "made from given input, replies ending where the model ends them: decode tok/s, TTFT and tokens per streamed update per category, and the rate of a mix of them: the "
+           "usual public benchmarks' code-led weighting by default, and a coding agent's measured output beside it.";
   }
   std::span<const ParamSpec> params() const override { return kParams; }
   void check(const Params &params) const override { (void)mix_of(params); }
@@ -95,14 +102,20 @@ class Decode final : public Scenario {
         tps[it->first] = summarize(it->second.metric(std::string(metric::kDecode), "tok/s", Better::higher).samples).median;
         result.rows.push_back(std::move(it->second));
       }
-    if (const MixRate rate = mix_rate(mix.weights, tps, mix.average); rate.tps > 0) {
-      Row all = Row::with_labels({{"category", mix.name}});
-      all.metric(std::string(metric::kDecode), "tok/s", Better::higher).samples.push_back(rate.tps);
-      power.add_to(all, result.completion_tokens);
-      if (rate.covered < 1 - 1e-9) all.notes.push_back("the " + mix.name + " over the categories that ran: " + format_number(rate.covered * 100) + " % of its weight");
-      if (mix.average == MixAverage::arithmetic) all.notes.push_back("the " + mix.name + " is the weighted mean of the categories' median rates");
-      result.rows.push_back(std::move(all));
-    }
+    // the asked mix first (it heads the decode figure and carries the power), then benchmark and agentic where not asked
+    std::vector<Mix> mixes = {mix};
+    for (const WeightMix &m : headline_mixes())
+      if (std::string(m.id) + " mix" != mix.name) mixes.push_back(named_mix(m));
+    for (const Mix &m : mixes)
+      if (const MixRate rate = mix_rate(m.weights, tps, m.average); rate.tps > 0) {
+        Row all = Row::with_labels({{"category", m.name}});
+        all.metric(std::string(metric::kDecode), "tok/s", Better::higher).samples.push_back(rate.tps);
+        if (&m == &mixes.front()) power.add_to(all, result.completion_tokens);
+        if (rate.covered < 1 - 1e-9) all.notes.push_back("the " + m.name + " over the categories that ran: " + format_number(std::round(rate.covered * 1000) / 10) + " % of its weight");
+        all.notes.push_back(m.average == MixAverage::arithmetic ? "the " + m.name + " is the weighted mean of the categories' median rates"
+                                                                : "the " + m.name + " is the rate its mix of tokens comes out at (a weighted harmonic mean)");
+        result.rows.push_back(std::move(all));
+      }
     result.charts = {
         {ChartKind::bars, "Decode rate by kind of output", "category", {std::string(metric::kDecode)}, false},
         {ChartKind::bars, "Tokens per streamed update", "category", {std::string(metric::kTokensPerUpdate)}, false},

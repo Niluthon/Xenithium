@@ -116,7 +116,7 @@ double exponential_gap_s(double per_second, std::mt19937_64 &rng);
 // The decode rate of a mix of kinds of output. `weights` are shares of generated tokens per kind, `tps` each kind's
 // rate. By default (harmonic) the mix's rate is the weighted harmonic mean over the kinds that have a weight and a rate
 // - each kind's time per token, weighted, inverted: the rate at which that mix of tokens comes out (an arithmetic mean
-// of the rates reads high). `arithmetic` gives that weighted mean of the rates instead, the easy mix's figure. `covered`
+// of the rates reads high). `arithmetic` gives that weighted mean of the rates instead, the public mix's figure. `covered`
 // is the weight those kinds hold: 1 when every weighted kind ran; {0, 0} when none did.
 struct MixRate {
   double tps = 0, covered = 0;

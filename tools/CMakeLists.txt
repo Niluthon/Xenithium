@@ -18,7 +18,7 @@ target_link_libraries(xenithium_launch PUBLIC xenithium_model xenithium_util Thr
 xenithium_tool(xenithium-launch HOST SOURCES launch/main.cpp LIBS xenithium_launch)
 
 # The benchmark (tools/bench/main.cpp, docs/bench.md): scenarios against any OpenAI-compatible endpoint. Host only, no
-# engine code: JSON and TLS from xenithium_util. The corpus (bench/corpus/<set>/<kind>/<file>, sets medium and hard) is
+# engine code: JSON and TLS from xenithium_util. The corpus (bench/corpus/<set>/<kind>/<file>, sets engine and generic) is
 # embedded through a generator built first, so the tool is one binary. A library so tests/test_bench.cpp and the launcher's Bench tab share the code.
 xenithium_tool(xenithium-bench-embed HOST SOURCES bench/embed/main.cpp)
 file(GLOB_RECURSE XENITHIUM_BENCH_CORPUS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/bench/corpus/*/*/*)
@@ -28,7 +28,7 @@ add_custom_command(OUTPUT ${XENITHIUM_BENCH_CORPUS_CPP}
   DEPENDS xenithium-bench-embed ${XENITHIUM_BENCH_CORPUS}
   COMMENT "Embedding the benchmark corpus")
 add_library(xenithium_bench STATIC
-  bench/stats.cpp bench/format.cpp bench/http_stream.cpp bench/client.cpp bench/corpus.cpp bench/prompts.cpp bench/mode.cpp bench/params.cpp
+  bench/stats.cpp bench/format.cpp bench/http_stream.cpp bench/client.cpp bench/corpus.cpp bench/prompts.cpp bench/params.cpp
   bench/counters.cpp bench/power.cpp bench/image.cpp bench/quality.cpp bench/session.cpp bench/report.cpp bench/svg_charts.cpp
   bench/html_assets.cpp bench/html_report.cpp bench/runner.cpp bench/registry.cpp
   bench/scenarios/common.cpp bench/scenarios/decode.cpp bench/scenarios/concurrency.cpp bench/scenarios/prefill.cpp

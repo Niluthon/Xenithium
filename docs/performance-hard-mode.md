@@ -1,7 +1,7 @@
 # Performance: hard mode
 
-The strict measurement: `xenithium-bench` in its `hard` mode ([guide](bench-guide.md#modes-easy-medium-hard),
-[reference](bench.md#modes)). The [README](../README.md#performance) shows the easy-mode numbers, measured the way the
+The strict measurement: `xenithium-bench` in its former `hard` mode (the tool has since merged its modes into one
+method: [reference](bench.md#the-method); these rows predate it and are rerun with it). The [README](../README.md#performance) shows the easy-mode numbers, measured the way the
 usual public benchmarks do; this page keeps the hard-mode table, the numbers to compare builds with.
 
 > **These rows are a strict measurement of the machine, not the easiest one.** The measured text is this project's own:

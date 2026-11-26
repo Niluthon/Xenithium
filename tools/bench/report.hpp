@@ -28,10 +28,11 @@ struct RunInfo {
   uint64_t seed = 0;
   Sampling sampling;
   std::string thinking;  // "default", "on" or "off"
-  std::string mode = "hard";  // the run's mode (mode.hpp): "easy", "medium" or "hard"
-  int mode_version = 1;
+  int method = 0;  // the measuring method's version (kMethodVersion); 0 = a run from before it, which had a mode
+  std::string mode = {};  // such an older run's mode ("easy", "medium" or "hard") and its version; empty for newer runs
+  int mode_version = 0;
   std::string reply_length = "fixed";  // of the sampled scenarios' replies: "fixed" or "natural" (ReplyLength)
-  std::string corpus;  // the embedded set ("hard", "medium") or the directory the prompts were cut from
+  std::string corpus;  // the embedded set ("engine", "generic") or the directory the prompts were cut from
   int corpus_version = 0;
   std::string corpus_hash;
   Capabilities capabilities;
@@ -47,8 +48,9 @@ struct Run {
 
 // The numbers a run is known by; empty where the run did not measure them.
 struct Headline {
-  double decode_tps = 0;  // the decode figure of the categories' mix
-  std::string decode_mix;  // its row's label: "agent mix" ("weighted" in runs before the mixes)
+  double decode_tps = 0;  // the decode figure: the first mix row's (the mix the run asked for)
+  std::string decode_mix;  // its row's label: "benchmark mix" ("agent mix", "easy mix" in older runs; "weighted" before the mixes)
+  std::vector<std::pair<std::string, double>> decode_mixes;  // every mix row of the run, the headline's first
   std::vector<std::pair<std::string, double>> decode_by_category;
   struct Depth {
     std::string depth;  // "32,000"
@@ -88,6 +90,9 @@ std::string misses_heading(const ScenarioResult &scenario);
 std::string given_text(const Miss &miss);
 // The notes of a scenario's rows in order, each text once (rows of one case often say the same thing).
 std::vector<std::string> unique_notes(const ScenarioResult &scenario);
+
+// "method v1", or for a run from before the one method "mode hard v1": what its prompts and method were.
+std::string method_text(const RunInfo &info);
 
 // One scenario's table with its notes, as printed when it finishes.
 std::string render_scenario(const ScenarioResult &scenario);

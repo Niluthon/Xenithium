@@ -60,16 +60,18 @@ const ModeRow &mode_row(BenchMode m) {
 
 const char *bench_mode_name(BenchMode m) { return mode_row(m).name; }
 
-std::string bench_mode_text(const BenchRun &r) {
+std::string bench_method_text(const BenchRun &r) {
+  if (r.method > 0) return "v" + std::to_string(r.method) + " (open tasks and tasks on given input, natural replies, benchmark and agentic weighting), corpus " + r.corpus;
   struct Gloss {
     std::string_view mode, corpus, about;
   };
-  static constexpr Gloss kGlosses[] = {{"easy", "medium", "tasks that repeat or reshape their input, natural-length replies"},
-                                       {"medium", "medium", "conventional code and prose"},
-                                       {"hard", "hard", "the engine's own code and docs"}};
+  static constexpr Gloss kGlosses[] = {{"easy", "generic", "tasks that repeat or reshape their input, natural-length replies"},
+                                       {"medium", "generic", "conventional code and prose"},
+                                       {"hard", "engine", "the engine's own code and docs"}};
   for (const Gloss &g : kGlosses)
-    if (g.mode == r.mode) return r.mode + " (" + std::string(g.about) + (r.corpus == g.corpus ? ")" : "; corpus " + r.corpus + ")");
-  return r.mode + ", corpus " + r.corpus;
+    if (g.mode == r.mode)
+      return "older, mode " + r.mode + " (" + std::string(g.about) + (r.corpus == g.corpus ? ")" : "; corpus " + r.corpus + ")") + ": does not compare with newer runs";
+  return "older, mode " + r.mode + ", corpus " + r.corpus;
 }
 const char *bench_mode_title(BenchMode m) { return mode_row(m).title; }
 std::vector<std::string> bench_mode_args(BenchMode m) { return mode_row(m).args; }
@@ -151,12 +153,15 @@ void read_env(const json::Value &v, BenchRun &r) {
   if (const auto *config = v.get_object("config")) {
     if (const auto *s = config->get_string("corpus")) r.corpus = *s;
     if (const auto *s = config->get_string("mode")) r.mode = *s;
+    if (const auto *m = config->get("method"); m && m->is_number()) r.method = static_cast<int>(m->num);
   }
-  if (r.corpus.empty()) r.corpus = "hard";  // runs from before the second set read the engine's own code
-  if (r.mode.empty()) {  // runs from before the modes: the set named "easy" then is the medium corpus now
-    if (r.corpus == "easy") r.corpus = "medium";
-    r.mode = r.corpus == "medium" ? "medium" : "hard";
+  if (r.method == 0) {  // a run from before the one method
+    if (r.corpus.empty()) r.corpus = "hard";  // runs from before the second set read the engine's own code
+    if (r.mode.empty()) r.mode = r.corpus == "hard" ? "hard" : "medium";  // before the modes: the corpus said which
   }
+  // the sets' names before the modes were merged
+  if (r.corpus == "hard") r.corpus = "engine";
+  else if (r.corpus == "medium" || r.corpus == "easy") r.corpus = "generic";
 }
 
 // The run's `summary.
@@ -165,6 +170,9 @@ void read_summary(const json::Value &v, BenchRun &r) {
   if (!summary) return;
   r.decode_tps = number_at(*summary, "decode_tps");
   if (const std::string *mix = summary->get_string("decode_mix")) r.decode_mix = *mix;
+  if (const json::Value *mixes = summary->get_array("decode_mixes"))
+    for (const json::Value &m : mixes->arr)
+      if (const std::string *name = m.get_string("mix")) r.decode_mixes.push_back({*name, number_at(m, "decode_tps")});
   r.tokens_per_joule = number_at(*summary, "best_tokens_per_joule");
   if (const json::Value *quality = summary->get("quality_pct"); quality && quality->is_number()) r.quality_pct = quality->num;
   if (const json::Value *misses = summary->get_array("quality_misses"))

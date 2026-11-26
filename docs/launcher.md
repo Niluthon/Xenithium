@@ -120,7 +120,7 @@ Four tabs, `1`-`4` or `Tab`; the Chat tab is hidden for now, so the header shows
   every table in `report.txt` (`xenithium-bench report <run>`; `xenithium-bench compare A B` sets two runs side by
   side). `Esc` goes back. A run started from the launcher samples the cards' power (the server is on this machine).
 - `r` runs `xenithium-bench` ([bench.md](bench.md)) against the running server (the served model's name from
-  `/v1/models`) after a pick of what to measure, on the mode `m` set. A suite's tag is the run name's suffix:
+  `/v1/models`) after a pick of what to measure. A suite's tag is the run name's suffix:
   - **Standard** (`standard`, ~13 min): decode by category, concurrency 1-16, prefill to 128K tokens, decode at 32K
     and 109K of context, an agent session on the prefix cache, JSON-schema output, answer quality. The numbers to quote
     for a build;
@@ -154,12 +154,9 @@ Four tabs, `1`-`4` or `Tab`; the Chat tab is hidden for now, so the header shows
   setting of `build/launch/launch.env` when the launcher started the server. A server started outside the
   launcher records its command line as `server_cmd` instead. The report (`Enter`) lists the notes as
   `KEY=value` pairs.
-- `m` picks the mode (`xenithium-bench --mode`, [bench.md](bench.md#modes)): **Easy** (the default) measures the
-  way the usual public benchmarks do - tasks that repeat or reshape their input, replies that end where the model ends
-  them, a code-led weighted mean; **Medium** is the hard method over conventional template-made code and prose;
-  **Hard** is this engine's own code and documentation (the published numbers). The bottom line shows the mode; it
-  applies to the next runs of the session, each run's tag ends in `-easy` / `-medium` / `-hard`, and its report
-  (`Enter`) names it. Runs of different modes do not compare.
+- Every run measures by the tool's one method ([bench.md](bench.md#the-method)); a run's report (`Enter`) names its
+  version, and a run made before it (with a mode: easy, medium or hard) is marked as older: its numbers do not compare
+  with newer runs.
 - `x` stops a run the tab started — `Esc` deliberately does not, so an accidental press can't
   kill a run. The binary and the runs directory come from `--bench-bin` and `--bench-runs` (defaults
   `build/xenithium-bench` and `$XEN_BENCH_RUNS`, else `~/.xenithium/bench/runs`).
@@ -179,7 +176,7 @@ A first start without a settings file opens a short welcome: pick a model, check
 | `u` | undo |
 | `i` | the problems of the current values; `Enter` goes to the setting |
 | `/` | find a setting by name, key or flag (this model's settings whose switch is off too, marked n/a); with no name match it searches the help text |
-| `m` | the model list (Settings tab; on Benchmark `m` picks the benchmark mode) |
+| `m` | the model list (Settings tab) |
 | `p` | settings files: `server.env`, the per-model files (`models/*.env` and the presets no file of yours replaces; opening one switches to its model) and the profiles; `n` saves the current values as a new profile, `x` deletes one |
 | `s` / `S` | save to the open file (the model's own file, and `server.env` then names it) / save as (the model's file, a profile, a new profile) |
 | `r` (F5) | launch, after the checks |

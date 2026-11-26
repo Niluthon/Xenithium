@@ -23,7 +23,8 @@
 Measured with the project's own benchmark, `xenithium-bench`, in its **easy mode**: the way the usual public
 benchmarks measure (tasks that repeat or reshape their input, replies that end where the model ends them, a code-led
 weighted mean). Every row is one standard-suite run against a live server on one machine with 4x Arc Pro B70,
-**power-capped to 220 W per card**.
+**power-capped to 220 W per card**. The tool has since merged its modes into one method ([docs/bench.md](docs/bench.md#the-method));
+these rows predate it and are rerun with it.
 
 > **Looking for the strict numbers?** The [hard-mode results](docs/performance-hard-mode.md) measure the same
 > models on this project's own code and documentation, every reply run to its full length. Their decode numbers are
@@ -46,7 +47,7 @@ weighted mean). Every row is one standard-suite run against a live server on one
 | --- | --- |
 | Cards / Slots | The cards the model runs on, and the requests it serves at once (`XEN_SLOTS`). |
 | Drafter | The speculative drafter the server ran: DFlash 2 (a block drafter) or DSpine b16 (16-token blocks); `none` = plain decoding. |
-| Decode | The headline: single-stream decode tok/s, the easy mix of the categories (code 30 %, reasoning 20 %, prose 15 %, JSON 15 %, edits 10 %, summaries 10 %). |
+| Decode | The headline: single-stream decode tok/s, the benchmark mix of the categories (code 30 %, reasoning 20 %, prose 15 %, JSON 15 %, edits 10 %, summaries 10 %, a weighted mean). |
 | Throughput | Tokens per second of all streams together at 1 / 4 / 8 / 16 requests in flight. `-` = more streams than the setup has slots, so not measured. |
 | Prefill | Prompt tokens read per second at 8K / 32K / 128K tokens, prefix cache defeated. |
 | Decode at depth | Decode tok/s with a 32K / 109K-token document in context. |
@@ -58,11 +59,11 @@ Each model name links its self-contained HTML report in `docs/benchmark/`;
 your own cards, start a server and run:
 
 ```bash
-build/xenithium-bench run --mode easy                                     # the standard suite
-build/xenithium-bench run --mode easy --set concurrency.levels=1,2,4,8    # a server with 8 slots
+build/xenithium-bench run                                     # the standard suite
+build/xenithium-bench run --set concurrency.levels=1,2,4,8    # a server with 8 slots
 ```
 
-The [benchmarking guide](docs/bench-guide.md) explains modes, suites and scenarios; [docs/bench.md](docs/bench.md) is
+The [benchmarking guide](docs/bench-guide.md) explains how it measures, suites and scenarios; [docs/bench.md](docs/bench.md) is
 the full reference.
 
 ## Supported models

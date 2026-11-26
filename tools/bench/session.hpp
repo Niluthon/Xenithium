@@ -18,10 +18,10 @@
 
 namespace xenithium::bench {
 
-// How long the replies of the sampled scenarios are. `fixed`: the endpoint is asked to ignore the end-of-sequence token
-// (where it takes ignore_eos), so every reply runs to its max_tokens and a rate is over the same number of tokens on
-// every build - but the tokens after the model's own end are text no user reads, and a draft model predicts them badly.
-// `natural`: the reply ends where the model ends it, as a chat client sees it.
+// How long the replies of the sampled scenarios are. `natural` (the method's): the reply ends where the model ends it,
+// as a chat client sees it. `fixed`: the endpoint is asked to ignore the end-of-sequence token (where it takes
+// ignore_eos), so every reply runs to its max_tokens - the same number of tokens on every build, but the tokens after
+// the model's own end are text no user reads, and a draft model predicts them badly or, in a loop, very well.
 enum class ReplyLength { fixed, natural };
 
 struct SessionOptions {
@@ -32,9 +32,9 @@ struct SessionOptions {
   int64_t kv_pool_tokens = 0;  // tokens of context the endpoint holds for all requests at once (0 = not known)
   std::function<void(std::string_view)> progress;  // one line per finished step of a scenario (may be empty)
   PowerMeter *power = nullptr;  // the cards' power meter when the run samples power (not owned)
-  ReplyLength reply_length = ReplyLength::fixed;
-  std::span<const ShortPrompt> prompts = short_prompts();  // the run's short prompts (the mode's set)
-  bool fresh_prompts = false;  // a unique first line on every short prompt: no reply starts from the prefix cache
+  ReplyLength reply_length = ReplyLength::natural;
+  std::span<const ShortPrompt> prompts = measured_prompts();  // the short prompts of decode, concurrency and arrivals
+  bool fresh_prompts = true;  // a unique first line on every short prompt: no reply starts from the prefix cache
 };
 
 class Session {

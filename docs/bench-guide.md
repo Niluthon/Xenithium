@@ -10,7 +10,7 @@ and how each number is computed.
 - [What you get](#what-you-get)
 - [Build it](#build-it)
 - [Your first run](#your-first-run)
-- [Modes: easy, medium, hard](#modes-easy-medium-hard)
+- [How it measures](#how-it-measures)
 - [Suites: what to run](#suites-what-to-run)
 - [Scenarios](#scenarios)
 - [Benchmark another endpoint](#benchmark-another-endpoint)
@@ -58,7 +58,6 @@ Start a server (see the [launcher guide](launcher.md)), then:
 ```bash
 build/xenithium-bench run --suite quick                  # ~3 min: every headline number once
 build/xenithium-bench run                                # ~13 min: the standard suite, the numbers to quote
-build/xenithium-bench run --mode easy --suite quick      # the same numbers, measured the way public benchmarks do
 ```
 
 The default address is `http://127.0.0.1:8000/v1`, and the model is the first one the server lists.
@@ -66,44 +65,40 @@ The default address is `http://127.0.0.1:8000/v1`, and the model is the first on
 Other commands:
 
 ```bash
-build/xenithium-bench list                       # every mode, suite and scenario, with each parameter's default
+build/xenithium-bench list                       # every suite and scenario, with each parameter's default
 build/xenithium-bench report  RUN                # a finished run's tables again (RUN = its directory)
 build/xenithium-bench compare RUN_A RUN_B        # B against A, metric by metric
 build/xenithium-bench html    RUN                # write the run's HTML page again
 build/xenithium-bench help                       # every option
 ```
 
-## Modes: easy, medium, hard
+## How it measures
 
 An engine with speculative decoding is fast when its draft guesses the next tokens right. How often that happens
-depends a lot on the text. The same server can show 180 tok/s on one benchmark and 250 tok/s on another. The mode
-fixes how much the measurement helps the draft:
+depends a lot on the text, on where replies stop, and on how the categories are averaged: the same server can show
+180 tok/s on one benchmark and 250 tok/s on another. This tool measures one way, chosen to be what real work looks like:
 
-| | **easy** | **medium** | **hard** (default) |
-|---|---|---|---|
-| In one line | Measured the way the usual public benchmarks do | The hard method on easier text | Strict: real text, every reply full length |
-| Short tasks (decode, concurrency) | Tasks whose answer repeats or reshapes the input: return a diff, fix the given code, turn CSV into JSON, continue a chat | Open tasks written from scratch: write a function, an essay, a proof | Same as medium |
-| Reply length | Ends where the model ends it | Runs to the full budget | Runs to the full budget |
-| Long prompts | Conventional code and prose (CRUD layers, tests, guides) | Conventional code and prose | This engine's own source code and documentation |
-| Decode headline | Weighted average led by code (code 30 %, reasoning 20 %, prose 15 %, JSON 15 %, edits 10 %, summaries 10 %) | The rate of a coding agent's output (63 % reasoning) | Same as medium |
-| Use it to | Put your numbers next to other benchmarks' | See how much easier text helps long-context work | Compare builds; the numbers this project publishes |
-
-Choose with `--mode`:
-
-```bash
-build/xenithium-bench run --mode easy
-build/xenithium-bench run --mode medium
-build/xenithium-bench run --mode hard
-```
+| | |
+|---|---|
+| Short tasks (decode, concurrency) | Per kind of output, both kinds of task real work holds: open tasks written from scratch (write a function, an essay, a proof) and tasks on given input (return a diff, fix the given code, turn CSV into JSON, continue a chat) |
+| Reply length | Ends where the model ends it |
+| Prefix cache | Every request starts with a new line, so no reply comes from the cache |
+| Long prompts | This engine's own source code and documentation |
+| Decode headline | Two weightings of the same per-category speeds, switchable on the report page: **benchmark** (the default: code 30 %, reasoning 20 %, prose 15 %, JSON 15 %, edits 10 %, summaries 10 %, a plain average, as the usual public benchmarks weigh) and **agentic** (a coding agent's output: 63 % reasoning, 19 % code; the speed that mix of tokens comes out at) |
 
 Some things to know:
 
-- The mode only sets defaults. `--corpus`, `--reply-length` and `--set` still override them.
-- Every run records its mode. `compare` warns when two runs used different modes: their numbers do not compare.
-- A model that thinks before it answers often spends the whole reply budget thinking, even in easy mode: the
-  measured text is then its reasoning. `--thinking off` measures the answers alone (where the server has the switch).
-- In easy mode the decode scenario takes 20 samples per category (9 in the standard suite of the other modes), so it
-  runs a few minutes longer. A suite's own setting still wins: `quick` keeps one pass.
+- Every run records the method's version. `compare` warns when two runs differ in it: their numbers do not compare.
+  Runs made before it had a mode (easy, medium, hard); their reports say so.
+- **benchmark or agentic?** Benchmark is the number to put next to other benchmarks'. Agentic is what a coding agent
+  gets: it weighs reasoning most and averages by time per token, so slow kinds of output count for the time they take,
+  and it reads lower. `--set decode.weights=agentic` makes it the headline; both are in every report either way.
+- `--reply-length fixed` makes every reply run to its full budget, past the model's end, so two builds do the same
+  work. The text past the end is no user's and drafts unlike real text: it is not the method's number.
+- A model that thinks before it answers often spends the whole reply budget thinking: the measured text is then its
+  reasoning. `--thinking off` measures the answers alone (where the server has the switch).
+- The decode scenario takes 14 samples per category (seven prompts, two passes). A suite's own setting still wins:
+  `quick` keeps one pass.
 
 ## Suites: what to run
 
@@ -200,7 +195,7 @@ build/xenithium-bench run --url https://gateway.example.com/v1 --model my-model 
 **A hosted API**
 
 ```bash
-build/xenithium-bench run --url https://api.example.com/v1 --model some-model --strict --suite quick --mode easy
+build/xenithium-bench run --url https://api.example.com/v1 --model some-model --strict --suite quick
 ```
 
 `--strict` sends standard OpenAI fields only, with nothing extra. Use it for an API that rejects unknown fields.
@@ -231,16 +226,16 @@ through another address, add `--power on`.
 Run the same command against both, then compare:
 
 ```bash
-build/xenithium-bench run --url http://192.0.2.10:8000/v1 --mode easy --suite standard --name server-a
-build/xenithium-bench run --url http://192.0.2.11:8000/v1 --mode easy --suite standard --name server-b
+build/xenithium-bench run --url http://192.0.2.10:8000/v1 --suite standard --name server-a
+build/xenithium-bench run --url http://192.0.2.11:8000/v1 --suite standard --name server-b
 
 build/xenithium-bench compare ~/.xenithium/bench/runs/*-server-a ~/.xenithium/bench/runs/*-server-b
 ```
 
 For a fair comparison:
 
-- **Same mode, same model, same seed.** Requests use seed N + k, so both servers draw the same samples where their
-  outputs agree. `compare` warns when the modes, the reply lengths or the corpora differ.
+- **Same tool version, same model, same seed.** Requests use seed N + k, so both servers draw the same samples where
+  their outputs agree. `compare` warns when the method's version, the reply lengths or the corpora differ.
 - **Look at each category, not only the headline.** One weak category can hide inside a good average.
 - **Trust a change only when it is marked.** `compare` marks a change `better` or `WORSE` only when it is larger than
   0.5 % and larger than the run's own spread. An unmarked change is noise.
@@ -249,14 +244,13 @@ For a fair comparison:
 Add notes so you remember later what each run was:
 
 ```bash
-build/xenithium-bench run --mode easy --note gpu=2xB70 --note build=a1b2c3d --note kv=int8
+build/xenithium-bench run --note gpu=2xB70 --note build=a1b2c3d --note kv=int8
 ```
 
 ## From the launcher, or with one script
 
 **In the launcher** ([launcher.md](launcher.md)), open the Benchmark tab with `3`:
 
-- `m` chooses the mode: Easy (the default), Medium or Hard.
 - `r` chooses what to run (Standard, Quick look, Long contexts, Load, Agents, ...) and starts it against the running
   server.
 - `Enter` opens a run's report, and `x` stops a running one.
@@ -267,7 +261,7 @@ Each run records the server's settings as notes.
 
 ```bash
 scripts/bench.sh                                        # standard suite on a fresh server from server.env
-BENCH_ARGS="--mode easy --suite quick" scripts/bench.sh easy-quick
+BENCH_ARGS="--suite quick" scripts/bench.sh quick
 URL=http://192.0.2.10:8000/v1 scripts/bench.sh lan      # an endpoint that already runs: nothing is started
 ```
 
@@ -285,9 +279,9 @@ URL=http://192.0.2.10:8000/v1 scripts/bench.sh lan      # an endpoint that alrea
 Table cells show the median. Latencies with four or more samples show `median / max`. Yes / no checks show
 `yes/total`.
 
-The headline decode number is a mix of the eight categories. In hard and medium mode it is the speed at which a
-coding agent's output comes out (63 % of it reasoning). In easy mode it is a weighted average led by code, the figure
-public benchmarks quote. The report says which one it is.
+The headline decode number is a mix of the eight categories: by default the benchmark mix, a weighted average led by
+code, the figure public benchmarks quote. The agentic mix (the speed of a coding agent's output, 63 % of it reasoning)
+is reported beside it; the page's Decode figure switches between the two and its decode section explains both.
 
 **Before sharing a report**, set a lab name so the page does not show your machine's hostname:
 
@@ -316,7 +310,7 @@ Other useful options:
 | `--out DIR` | Write runs somewhere else (or set `$XEN_BENCH_RUNS`). |
 | `--temperature 0` | Greedy decoding everywhere (the default is 0.7, as chat clients send). |
 | `--thinking on\|off` | Turn the model's thinking on or off, if the server supports the switch. |
-| `--reply-length natural` | Let replies end where the model ends them, in any mode. |
+| `--reply-length fixed` | Run every reply to its full budget, past the model's end: the same work on every build (not the method's number). |
 | `--seed N` | Draw a different, but still repeatable, set of samples. |
 | `--timeout SECONDS` | Per request (default 1800). |
 

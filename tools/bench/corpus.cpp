@@ -27,8 +27,8 @@ constexpr std::string_view kFileFooter = "\n```\n\n";
 
 namespace {
 constexpr std::array kSets = {
-    CorpusSet{"hard", kCorpusVersion, "this engine's own sources and documentation: real code and text, guessed least well"},
-    CorpusSet{"medium", kMediumCorpusVersion, "conventional template-made code and prose (CRUD layers, tests, guides): guessed well"},
+    CorpusSet{"engine", kCorpusVersion, "this engine's own sources and documentation: real code and text"},
+    CorpusSet{"generic", kGenericCorpusVersion, "conventional template-made code and prose (CRUD layers, tests, guides, manuals)"},
 };
 }  // namespace
 

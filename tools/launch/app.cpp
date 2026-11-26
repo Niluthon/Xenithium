@@ -714,7 +714,6 @@ struct App::Impl {
   LogTail bench_log;  // the run's output (state_dir/bench.log), tailed in the lower panel
   int bench_log_scroll = 0;  // display lines up from the bottom; 0 = follow
   std::string bench_streams_last = "1,8,16,32";  // the Streams mode's last stream counts (the input's start value)
-  std::string bench_difficulty = "easy";  // m: the benchmark mode, how easy the measured text is (xenithium-bench --mode)
   bool bench_log_wrap = true;
 
   void rebuild_bench() {
@@ -3225,25 +3224,7 @@ struct App::Impl {
             std::move(picks));
   }
 
-  // m: the mode of the next runs (xenithium-bench --mode). Easy (the default) = the public-benchmark style; medium =
-  // the hard method over conventional template-made text; hard = this engine's own code and docs, the published numbers.
-  void bench_mode_menu() {
-    std::vector<std::pair<std::string, std::function<void()>>> picks;
-    for (const auto &[id, title] : {std::pair<std::string, std::string>{"easy", "Easy: tasks that repeat or reshape their input, replies end where the model ends them"},
-                                    {"medium", "Medium: conventional code and prose (CRUD layers, tests, guides) - drafters guess it well"},
-                                    {"hard", "Hard: this engine's own code and documentation - real text, guessed least well"}})
-      picks.push_back({title + (id == bench_difficulty ? "  (now)" : ""), [this, id] {
-                         bench_difficulty = id;
-                         say("benchmark mode: " + id, th::dim);
-                       }});
-    picks.push_back({"Cancel", nullptr});
-    confirm("Benchmark mode",
-            {"How easy the measured text is for a draft model (xenithium-bench --mode).", "Easy measures the way the usual public benchmarks do; hard gives the published numbers.",
-             "Runs of different modes do not compare."},
-            std::move(picks));
-  }
-
-  // The run's notes: the mode, the engine's git revision, and the settings the server runs with: the launcher's
+  // The run's notes: what it runs, the engine's git revision, and the settings the server runs with: the launcher's
   // launch.env when the launcher started this server, else the server's command line (started outside it).
   std::vector<std::pair<std::string, std::string>> bench_notes(const Snapshot &s, pid_t rp, BenchMode mode) const {
     std::vector<std::pair<std::string, std::string>> notes = {{"bench_mode", bench_mode_name(mode)}};
@@ -3327,14 +3308,13 @@ struct App::Impl {
     for (char c : model) tag += (std::isalnum(static_cast<unsigned char>(c)) ? c : '-');
     while (tag.size() > 1 && tag.back() == '-') tag.pop_back();
     if (tag.empty()) tag = "run";
-    tag += std::string("-") + bench_mode_name(mode) + "-" + bench_difficulty;
+    tag += std::string("-") + bench_mode_name(mode);
     if (!is_file(cfg.bench_bin)) {
       say("no " + tilde(cfg.bench_bin) + " (scripts/build-host.sh xenithium-bench, or --bench-bin)", th::err);
       return;
     }
     std::vector<std::string> extra = bench_mode_args(mode);
     extra.insert(extra.end(), more.begin(), more.end());
-    extra.insert(extra.end(), {"--mode", bench_difficulty});
     extra.insert(extra.end(), {"--out", cfg.bench_runs});
     auto notes = bench_notes(s, rp, mode);
     notes.insert(notes.end(), more_notes.begin(), more_notes.end());
@@ -3367,12 +3347,17 @@ struct App::Impl {
     };
     line("run       " + r.dir, th::plain);
     line("model     " + r.model, th::plain);
-    line("mode      " + bench_mode_text(r), th::plain);
+    line("method    " + bench_method_text(r), th::plain);
     if (!r.endpoint.empty()) line("endpoint  " + r.endpoint, th::dim);
     if (!r.host.empty()) line("host      " + r.host, th::dim);
     line("decode    " + fmt1(r.decode_tps) + " t/s   " +
              (r.decode_mix.empty() || r.decode_mix == "weighted" ? std::string("(weighted mean of the per-category medians)") : "(the " + r.decode_mix + " of the per-category rates)"),
          th::ok);
+    if (r.decode_mixes.size() > 1) {  // the other weightings the run reports (the page switches between them)
+      std::string t = "          ";
+      for (size_t k = 1; k < r.decode_mixes.size(); ++k) t += r.decode_mixes[k].first + " " + fmt1(r.decode_mixes[k].second) + " t/s  ";
+      line(t, th::dim);
+    }
     if (!r.per_cat.empty()) {
       std::string t = "          ";
       for (const auto &[cat, tps] : r.per_cat) t += cat + " " + fmt1(tps) + "  ";
@@ -3468,7 +3453,6 @@ struct App::Impl {
       for (int i = 0; i < lh && start + i < total; ++i) c.put(ly + 1 + i, 2, disp[start + i].first, disp[start + i].second, W - 4);
     }
     std::vector<std::pair<std::string, std::string>> hints = {{"↑↓", "list"}, {"⏎", "report"}, {"r", "run"},
-                                                              {"m", "mode: " + bench_difficulty},
                                                               {"x", "stop"},
                                                               {"j/k", "log"}, {"G", "follow"}, {"w", "wrap"},
                                                               {"tab", "next tab"}};
@@ -3528,10 +3512,6 @@ struct App::Impl {
     }
     if (k.is('r') || k.type == Key::F5) {
       bench_menu();
-      return true;
-    }
-    if (k.is('m')) {
-      bench_mode_menu();
       return true;
     }
     if (k.is('x')) {

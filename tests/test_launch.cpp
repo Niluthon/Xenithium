@@ -1359,20 +1359,11 @@ void test_bench(const std::string &root) {
   s = run({Key::of(Key::Enter)});
   expect(!has(s, "Run the benchmark") && !has(s, "Concurrency at your stream counts") && has(s, "no ready server"),
          "bench: the stream-count mode without a ready server warns instead of asking for counts");
-  // m on Benchmark picks the mode (xenithium-bench --mode): easy by default, then medium and hard. The tab stays: a
-  // letter acts only on the tab whose hint row shows it (m once jumped to Settings' model list).
-  // (the hint row shows "m mode: easy" / "hard"; a toast covers it here, so the menu's "(now)" mark is read instead)
+  // one measuring method: no mode menu. A letter acts only on the tab whose hint row shows it (m once jumped to
+  // Settings' model list), so m does nothing on Benchmark
   s = run({ch('m')});
-  expect(app.tab() == 3 && app.popup_open() && has(s, "Benchmark mode") && has(s, "Easy: tasks that repeat") && has(s, "Medium: conventional code") &&
-             has(s, "Hard: this engine's own code") && has(s, "model ends them  (now)") && !has(s, "guess it well  (now)") && !has(s, "guessed least well  (now)") &&
-             !has(s, "dense-b"),
-         "bench: m opens the mode menu on the Benchmark tab (easy by default), not the model list");
-  s = run({Key::of(Key::Down), Key::of(Key::Down), Key::of(Key::Enter)});
-  expect(app.tab() == 3 && !app.popup_open() && has(s, "benchmark mode: hard"), "bench: picking Hard sets the mode; the tab stays");
-  s = run({ch('m')});
-  expect(has(s, "guessed least well  (now)"), "bench: the menu marks the mode now in use");
-  s = run({Key::of(Key::Enter)});
-  expect(has(s, "benchmark mode: easy"), "bench: picking Easy sets it back");
+  expect(app.tab() == 3 && !app.popup_open() && !has(s, "Benchmark mode") && !has(s, "m mode") && !has(s, "dense-b"),
+         "bench: m does nothing on the Benchmark tab (no mode menu, no model list)");
   s = run({Key::of(Key::Down), Key::of(Key::Down), Key::of(Key::Enter), ch('m'), ch('r')});
   expect(app.tab() == 3 && !app.popup_open(), "bench: in a run's report m and r do nothing (no model list, no launch checks)");
   run({Key::of(Key::Esc)});

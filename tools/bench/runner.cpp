@@ -41,13 +41,6 @@ void apply_override(RunPlan &plan, const std::string &item) {
   if (!applied) throw std::invalid_argument("--set " + item + ": the run has no scenario \"" + s.scenario + "\"");
 }
 
-// A mode's "scenario.key=value" onto the steps of that scenario that do not set the key themselves.
-void apply_default(RunPlan &plan, std::string_view item) {
-  const Setting s = setting_of(item);
-  for (SuiteStep &step : plan.steps)
-    if (step.scenario == s.scenario && !step.params.has(s.key)) step.params.set(s.key, s.value);
-}
-
 // Seconds the cards are watched before the first scenario for the run's idle power.
 constexpr double kIdleWindowS = 1.0;
 // Points of the power-over-time trace kept in the run file: enough for a chart as wide as a page.
@@ -87,7 +80,7 @@ ScenarioResult run_step(const Scenario &scenario, const SuiteStep &step, Session
 
 }  // namespace
 
-RunPlan make_plan(const std::string &suite, const std::string &scenarios, const std::vector<std::string> &overrides, std::span<const std::string_view> defaults) {
+RunPlan make_plan(const std::string &suite, const std::string &scenarios, const std::vector<std::string> &overrides) {
   RunPlan plan;
   const auto all = all_scenarios();
   if (!scenarios.empty()) {
@@ -99,7 +92,6 @@ RunPlan make_plan(const std::string &suite, const std::string &scenarios, const 
     plan.suite = it->id;
     plan.steps = it->steps;
   }
-  for (const std::string_view item : defaults) apply_default(plan, item);
   for (const std::string &item : overrides) apply_override(plan, item);
   for (const SuiteStep &step : plan.steps) {
     const Scenario *scenario = find(all, step.scenario);

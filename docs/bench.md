@@ -1,6 +1,6 @@
 # xenithium-bench
 
-New to the tool? Start with the [benchmarking guide](bench-guide.md): modes, suites, scenarios and how to bench another
+New to the tool? Start with the [benchmarking guide](bench-guide.md): suites, scenarios and how to bench another
 endpoint, step by step. This page is the full reference.
 
 The engine's benchmark. One host binary (`build/xenithium-bench`, C++, no GPU and no engine code) that talks to an
@@ -49,12 +49,11 @@ same binary against the server it started ([launcher.md](launcher.md)).
 | `--seed N` | `1` | Request k of the run samples with seed N + k, so two builds draw the same tokens where their logits agree. |
 | `--temperature` `--top-p` `--top-k` | `0.7` `0.95` `20` | Sampling of the sampled scenarios. `--temperature 0` makes every scenario greedy. |
 | `--thinking default\|on\|off` | `default` | The model's thinking switch (`chat_template_kwargs.enable_thinking`), where the endpoint has one. |
-| `--mode easy\|medium\|hard` | `hard` | How easy the measured text is for a draft model, and so how high a drafting engine's decode rate reads: `hard` gives the published numbers, `easy` measures the way the usual public benchmarks do. A mode sets the defaults of `--corpus`, `--reply-length` and some scenario parameters; those options still override it. Recorded in the run file; `compare` warns when two runs differ in it. See [Modes](#modes). |
-| `--reply-length fixed\|natural` | the mode's: `fixed` for hard and medium, `natural` for easy | The sampled scenarios' replies. `fixed` sends `ignore_eos`: every reply runs to its `max_tokens`, so two builds are timed over the same number of tokens. `natural` lets the model end its reply, as a chat client sees it (rates then cover only the tokens that came). Greedy checks stay fixed. Recorded in the run file; `compare` warns when two runs differ in it. Read below why the two give different decode rates. |
+| `--reply-length natural\|fixed` | `natural` | The sampled scenarios' replies. `natural` lets the model end its reply, as a chat client sees it. `fixed` sends `ignore_eos`: every reply runs on to its `max_tokens` past the model's own end, so two builds generate the same number of tokens; the text past the end is no user's and drafts unlike real text (see [The method](#the-method)). Greedy checks stay fixed. Recorded in the run file; `compare` warns when two runs differ in it. |
 | `--context TOKENS` | the endpoint's `max_model_len` | The longest prompt to send. Depths past it are skipped and named in the report. An endpoint that does not report its context needs this, or every depth is tried. |
 | `--kv-pool TOKENS` | the endpoint's `kv_pool_tokens` | Tokens of context the endpoint holds for all requests at once. `long-agents` sizes its documents from it; this server reports it in `/v1/models`. |
 | `--timeout SECONDS` | `1800` | Per request. |
-| `--corpus hard\|medium\|DIR` | the mode's: `hard` for hard, `medium` for medium and easy | The text long prompts are cut from: `hard` = this engine's own code and documentation, `medium` = conventional template-made code and prose, `DIR` = another corpus (`DIR/<kind>/<files>`). The set, its version and hash are recorded; runs on different corpora do not compare. |
+| `--corpus engine\|generic\|DIR` | `engine` | The text long prompts are cut from: `engine` = this engine's own code and documentation, `generic` = conventional template-made code and prose, `DIR` = another corpus (`DIR/<kind>/<files>`). The set, its version and hash are recorded; runs on different corpora do not compare. |
 | `--power auto\|on\|off` | `auto` | Sample the GPUs' board power and clock while the run goes (below). `auto` = on when the URL is this machine's loopback address; `on` for a server on this machine reached by another address. |
 | `--strict` | off | Send OpenAI fields only: no probing for the extensions below. |
 
@@ -122,32 +121,38 @@ Suites:
 
 Times are for the dense 27B on two cards; a suite takes as long as the endpoint is slow.
 
-### The decode headline's mix
+### The decode headline's mixes
 
-The decode scenario's one figure is the rate of a mix of its eight categories: `decode.weights` names the mix, each
-weight the share of generated tokens of that kind. The figure is the rate at which that mix of tokens comes out, the
-weighted harmonic mean of the categories' median rates (each kind's time per token, weighted, inverted). An arithmetic
-mean of rates reads high: half the tokens at 300 tok/s and half at 100 come out at 150, not 200.
+The decode scenario reports its eight categories' rates and two figures that weigh them into one, from the same
+per-category medians:
 
-| `decode.weights` | chat | code | reasoning | maths | prose | json | edit | summary |
-|---|---|---|---|---|---|---|---|---|
-| `agent` (default) | 4 % | 19 % | 63 % | 0 | 3 % | 3 % | 4 % | 4 % |
-| `even` | 12.5 % | 12.5 % | 12.5 % | 12.5 % | 12.5 % | 12.5 % | 12.5 % | 12.5 % |
-| `easy` (the easy mode's) | 0 | 30 % | 20 % | 0 | 15 % | 15 % | 10 % | 10 % |
+| mix | chat | code | reasoning | maths | prose | json | edit | summary | average |
+|---|---|---|---|---|---|---|---|---|---|
+| `benchmark` (the default headline) | 0 | 30 % | 20 % | 0 | 15 % | 15 % | 10 % | 10 % | weighted mean of the rates |
+| `agentic` | 4 % | 19 % | 63 % | 0 | 3 % | 3 % | 4 % | 4 % | rate of the mix (weighted harmonic mean) |
+| `even` (on request) | 12.5 % | 12.5 % | 12.5 % | 12.5 % | 12.5 % | 12.5 % | 12.5 % | 12.5 % | rate of the mix |
 
-`easy` is the exception to the harmonic mean: its figure is the weighted arithmetic mean of the categories' median
-rates, the figure the usual public benchmarks quote, and its row in the report says so.
+- **benchmark** weighs the categories the way the usual public benchmarks do (code first, chat and maths left out) and
+  takes a plain weighted mean of their rates, as they quote it. It is the figure to set beside other benchmarks'.
+- **agentic** weighs them by what a coding agent generated in measured sessions: the thinking (reasoning), shell
+  commands, scripts and source files written (code), patches (edit), tool-call arguments and envelopes (json), notes
+  and docs (prose), the narration beside tool calls (chat) and the report that ends a turn of work (summary). Its
+  figure is the rate that mix of tokens comes out at, the time per token weighted and inverted: the tokens per second
+  an agent gets over its work. The shares differ by model mostly in the thinking: the 27B spent 69 % of its tokens on
+  it, Flash-Next 47 %.
+- The two differ in shares and in averaging. A plain mean of rates reads high: half the tokens at 300 tok/s and half
+  at 100 come out at 150, not 200. So `benchmark` reads above `agentic` on most servers, and more so where JSON and
+  code decode fast and reasoning slowly.
 
-Or your own shares: `--set decode.weights=code:1,reasoning:3` (normalised to sum 1; a category left out weighs 0; an
-unknown name, category or share is refused before anything is sent).
+`decode.weights` picks the mix that heads the figure (`benchmark` by default, `agentic`, `even`, or your own shares:
+`--set decode.weights=code:1,reasoning:3`, normalised to sum 1; a category left out weighs 0; an unknown name, category
+or share is refused before anything is sent). `benchmark` and `agentic` are reported either way, each as a row of the
+decode table labelled with its name (`benchmark mix`, `agentic mix`), so `compare` never sets two different mixes
+against each other. The HTML page's Decode figure switches between them, and the decode section shows both mixes'
+shares and figures.
 
-`agent` is the mix of a coding agent's output, not one you choose: what an agent harness reading, editing, building
-and testing code generates, split by what was generated: the thinking (reasoning), shell commands, scripts and source
-files written (code), patches (edit), other tool-call arguments and the call envelopes (json), notes and docs written
-(prose), the narration beside tool calls (chat), and the report that ends a turn of work (summary). Maths is left out. The shares differ by model mostly in the thinking: the 27B spent 69 % of its tokens on it,
-Flash-Next 47 %. The mix's row is labelled with its name (`agent mix`), so `compare` never sets two different mixes
-against each other; runs made before the mixes have a `weighted` row (code 30 %, the rest 10 % each, an arithmetic
-mean) and the report reads it as such.
+Older runs have one mix row: `agent mix` (the agentic shares), `easy mix` (the benchmark shares), or before the mixes
+`weighted` (code 30 %, the rest 10 % each, an arithmetic mean); the report reads each as such.
 
 ## Power and clock
 
@@ -203,62 +208,64 @@ code.
 
 ### Against other benchmarks
 
-A benchmark that lets the model end its replies reports a higher decode rate for an engine with speculative decoding
-than this tool's default does, on the same server. The decode step is the same in both; the tokens per step are not:
+The same server reads differently in different benchmarks. The decode step is the same; the tokens per step are not:
 
-- `--reply-length fixed` (the default) sends `ignore_eos`, so every reply runs to its budget. Past the model's own end
-  the text is no longer what the draft was trained to predict, and few draft tokens are accepted there. A benchmark
-  without `ignore_eos` times only the part of the reply the model meant to write. Run with `--reply-length natural` to
-  measure that way; keep `fixed` to compare builds, since natural replies differ in length from build to build.
 - The prompts differ: each benchmark has its own texts, and acceptance differs by text (a code prompt drafts better
-  than a story).
-- The headline is the agent mix (above) as a harmonic mean; a weighted arithmetic mean of the same rates reads higher.
-  Compare per category.
-- `--mode easy` puts all of these on the common footing: natural replies, tasks whose replies repeat or reshape their
-  input, the `easy` mix as a weighted arithmetic mean. Its numbers are the ones to set beside other benchmarks'.
+  than a story, a reply that copies its prompt better than one written from scratch).
+- A benchmark that sends `ignore_eos` times text past the model's own end, which drafts unlike real text.
+- The headline here is the benchmark mix, weighed as the usual public benchmarks weigh; the agentic mix beside it
+  reads lower (above). Compare per category where the categories differ.
 - A run with failed requests has blank or partial rows (`errors` in the report): it is not a result.
 
+## The method
 
+A drafting engine's decode rate depends on how well its draft guesses the text, so how a benchmark picks its text,
+ends its replies and averages its categories moves the number as much as the engine does. The tool measures one way,
+recorded in the run file as the method's version (`compare` warns across versions):
 
-## Modes
+| | |
+|---|---|
+| short prompts (decode, concurrency, arrivals) | per category, three open tasks written from scratch and four tasks on given input (a diff, a whole edited file, JSON from given data, a fix of given code, a chat that goes on): real work holds both |
+| replies | end where the model ends them, each budget above the reply its task asks for |
+| prefix cache on the short prompts | every request starts with a new line: none is served from the cache, a repeat pass is a cold request too |
+| decode samples per category | 14 (7 prompts x `passes` 2, after 3 warm-up requests) |
+| decode headline | the `benchmark` mix (the usual public benchmarks' code-led shares, weighted mean); the `agentic` mix (a coding agent's measured output, the rate it comes out at) beside it, and the page switches between them |
+| long prompts | the `engine` corpus: this engine's own code and documentation |
 
-A drafting engine's decode rate depends on how well its draft guesses the text: the same build reads very differently
-on different prompts and with different ways of counting. `--mode` fixes one way, recorded in the run file with its
-version (`compare` warns across modes):
+Why each choice:
 
-| | `hard` (default) | `medium` | `easy` |
-|---|---|---|---|
-| long prompts | the `hard` corpus: this engine's own code and docs | the `medium` corpus: conventional template-made code and prose | the `medium` corpus |
-| short prompts (decode, concurrency, arrivals) | open tasks written from scratch, three per category | the same | tasks whose reply mostly repeats or reshapes the prompt's input (a diff, a whole edited file, JSON from given data, a fix of given code, a chat that goes on), four per category, shorter reply budgets |
-| replies | `fixed`: run to `max_tokens` | `fixed` | `natural`: end where the model ends them |
-| prefix cache on the short prompts | the same prompt is sent every pass | the same | every request starts with a new line: none is served from the cache |
-| decode samples per category | 9 (3 prompts x `passes` 3) | 9 | 20 (4 prompts x 5 passes, after 3 warm-up requests) |
-| decode headline | `agent` mix, harmonic mean | the same | `easy` mix, weighted arithmetic mean |
+- **Natural replies.** With `ignore_eos` a reply runs past the model's end into text no user reads: a fake new turn, a
+  restart, a loop. A draft predicts it badly (or, in a loop, very well), so the tail moves the rate by what the model
+  does after it is done. Measured on Flash-Next, four cards, DFlash 2, the same prompts both ways, thinking off: the
+  natural replies ended early (32,346 of 41,000 tokens) and read 415 tok/s on the benchmark mix against 356 with
+  `ignore_eos` (code 490 against 417, JSON 557 against 396). With thinking on, nearly every reply ran to its budget
+  while thinking and the two read alike (329 and 329).
+- **Both kinds of prompts.** Open tasks alone miss the copying real work does (edits, conversions, follow-ups); tasks on
+  given input alone read high because their replies repeat the prompt.
+- **Two weightings.** The benchmark mix sets the figure beside other benchmarks'; the agentic mix is what an agent
+  gets (the shares it generates, the rate they come out at). Both come from the same samples (see the mixes above).
+- **A fresh first line.** Without it a repeated prompt can be served from the prefix cache and its TTFT reads low.
 
-`hard` gives the published numbers. `easy` measures the way the usual public benchmarks do, so its numbers are the ones
-to set beside theirs; it is not a measure of an agent's experience. `medium` sits between: the hard method over text
-a drafter guesses well, which moves the long-context scenarios more than the decode headline (prefill speed depends on
-the token count, not on the text).
-
-A mode only sets defaults. `--corpus`, `--reply-length` and `--set` override them (a suite's own parameter, such as
-`quick`'s single decode pass, stays as the suite sets it). The launcher's Benchmark tab picks the mode with `m`
-([launcher.md](launcher.md)), easy by default. Changing a prompt of the easy set changes the easy mode's numbers: bump
-its version in `tools/bench/mode.cpp` with it.
+`--reply-length fixed` is still there for comparing the work of two builds over equal lengths; the method's numbers are
+natural. Runs made before the method had a mode (`easy`, `medium`, `hard`); the reports name it, the launcher marks
+them as older, and their numbers do not compare with newer runs. Changing a short prompt, the reply rule or the mix
+changes every later number: bump `kMethodVersion` (`tools/bench/corpus.hpp`) with it.
 
 ## The corpus
 
 Long prompts are cut from text embedded in the binary, two sets of `code` and `prose` in `tools/bench/corpus/<set>/`:
 
-- `hard` (the hard mode's, version 4): frozen snapshots of this engine's sources and of its documentation. Real text a
-  drafter guesses least well: the strict measurement.
-- `medium` (the medium and easy modes', version 1): conventional, template-made code and prose - entity classes, CRUD
-  repositories and services, their tests, API clients, UI components, SQL, manifests; a travel guide, product manuals,
-  recipes, help-centre articles, local news. Regular text of the kind most public benchmarks use, made to be guessed
-  well by a drafter: its long-document numbers do not compare with `hard` runs. Runs made before the modes name this
-  set `easy`; the tool reads them as the medium mode.
+- `engine` (the default, version 4): frozen snapshots of this engine's sources and of its documentation. Real code and
+  text.
+- `generic` (version 1): conventional, template-made code and prose - entity classes, CRUD repositories and services,
+  their tests, API clients, UI components, SQL, manifests; a travel guide, product manuals, recipes, help-centre
+  articles, local news. Regular text of the kind most public benchmarks use: its long-document numbers do not compare
+  with `engine` runs.
+
+Older runs name the sets `hard` and `medium` (and before that `easy`); the tool reads them under the new names.
 
 The sets are not kept in step with the tree, since two builds compare only on the same text. Changing a file of a set
-changes every prompt cut from it: bump its version (`kCorpusVersion` for hard, `kMediumCorpusVersion` for medium) and
+changes every prompt cut from it: bump its version (`kCorpusVersion` for engine, `kGenericCorpusVersion` for generic) and
 the hash pinned in `tests/test_bench.cpp` with it. A depth past the set's size repeats the text and the report says so
 (a repeated document is easier to process for some engines).
 

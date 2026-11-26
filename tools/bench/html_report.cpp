@@ -194,11 +194,27 @@ std::optional<Chart> chart_of(const ScenarioResult &scenario, const ChartSpec &s
 
 // ---- the page's parts ----
 
+// One way to weigh the decode figure (a mix row of the decode scenario): its name, value and the figure's line.
+struct MixOption {
+  std::string name;  // "benchmark" (the row "benchmark mix")
+  std::string value, detail;
+};
+
 struct Figure {
   std::string label, value, unit, detail;
   std::string href;  // the scenario the figure comes from
   std::string alert;  // failures behind the figure ("1 wrong answer"): a line of its own in the failure colour
+  std::vector<MixOption> mixes = {};  // the decode figure's weightings the reader can switch between (two or more)
 };
+
+// "benchmark mix" -> "benchmark"
+std::string mix_name(const std::string &row_label) { return row_label.ends_with(" mix") ? row_label.substr(0, row_label.size() - 4) : row_label; }
+
+// The decode figure's line for one mix: "one stream, the benchmark mix of 8 kinds of output".
+std::string mix_detail(const std::string &row_label, size_t kinds) {
+  const std::string mix = row_label.empty() || row_label == "weighted" ? "weighted over " : "the " + row_label + " of ";
+  return "one stream, " + mix + std::to_string(kinds) + " kinds of output";
+}
 
 // The anchor of a scenario's misses panel.
 std::string misses_anchor(const std::string &scenario_id) { return scenario_id + "-misses"; }
@@ -207,8 +223,13 @@ std::vector<Figure> figures_of(const Run &run) {
   const Headline h = headline(run);
   std::vector<Figure> figures;
   if (h.decode_tps > 0) {
-    const std::string mix = h.decode_mix.empty() || h.decode_mix == "weighted" ? "weighted over " : "the " + h.decode_mix + " of ";
-    figures.push_back({"Decode", format_number(h.decode_tps), "tok/s", "one stream, " + mix + std::to_string(h.decode_by_category.size()) + " kinds of output", "#decode", {}});
+    const size_t kinds = h.decode_by_category.size();
+    Figure decode{"Decode", format_number(h.decode_tps), "tok/s", mix_detail(h.decode_mix, kinds), "#decode", {}};
+    if (h.decode_mixes.size() > 1) {
+      decode.href = "#decode-mix";
+      for (const auto &[label, tps] : h.decode_mixes) decode.mixes.push_back({mix_name(label), format_number(tps), mix_detail(label, kinds)});
+    }
+    figures.push_back(std::move(decode));
   }
   if (h.peak_total_tps > 0) figures.push_back({"Throughput", format_number(h.peak_total_tps), "tok/s", "all streams together, at " + h.peak_streams + " streams", "#concurrency", {}});
   if (!h.prefill.empty() && h.prefill.back().tps > 0)
@@ -226,11 +247,26 @@ std::vector<Figure> figures_of(const Run &run) {
   return figures;
 }
 
+// A switch between the decode figure's weightings: one button per mix, the first pressed. The page's script shows it
+// (hidden without the script: every value is then in the decode table) and keeps the reader's pick for the next report.
+std::string mix_switch_html(const std::vector<MixOption> &mixes) {
+  std::string html = "<div class=\"mixsw\" role=\"group\" aria-label=\"weigh the decode figure\" hidden>";
+  for (size_t k = 0; k < mixes.size(); ++k)
+    html += "<button type=\"button\" data-mix=\"" + escaped(mixes[k].name) + "\" data-v=\"" + escaped(mixes[k].value) + "\" data-d=\"" + escaped(mixes[k].detail) + "\" aria-pressed=\"" +
+            (k == 0 ? "true" : "false") + "\">" + escaped(mixes[k].name) + "</button>";
+  return html + "</div>";
+}
+
 std::string figures_html(const std::vector<Figure> &figures) {
   if (figures.empty()) return {};
   std::string html = "<div class=\"figs\">";
   for (const Figure &f : figures)
-    html += std::string("<a class=\"fig") + (f.alert.empty() ? "" : " bad") + "\" href=\"" + escaped(f.href) + "\"><div class=\"k\">" + escaped(f.label) + "</div><div class=\"n\">" + escaped(f.value) + "<small>" + escaped(f.unit) +
+    if (!f.mixes.empty())  // a card, not a link: it holds the switch (a button may not sit inside a link)
+      html += "<div class=\"fig mixfig\"><div class=\"k\">" + escaped(f.label) + "</div><div class=\"n\"><span class=\"mv\">" + escaped(f.value) + "</span><small>" + escaped(f.unit) +
+              "</small></div><div class=\"d\"><span class=\"md\">" + escaped(f.detail) + "</span> \xC2\xB7 <a href=\"" + escaped(f.href) + "\">how it is weighed</a></div>" +
+              mix_switch_html(f.mixes) + "</div>";
+    else
+      html += std::string("<a class=\"fig") + (f.alert.empty() ? "" : " bad") + "\" href=\"" + escaped(f.href) + "\"><div class=\"k\">" + escaped(f.label) + "</div><div class=\"n\">" + escaped(f.value) + "<small>" + escaped(f.unit) +
             "</small></div><div class=\"d\">" + escaped(f.detail) + "</div>" + (f.alert.empty() ? std::string() : "<div class=\"w\">" + escaped(f.alert) + "</div>") + "</a>";
   return html + "</div>";
 }
@@ -360,6 +396,48 @@ std::string misses_html(const ScenarioResult &scenario) {
   return html + "</ol></div>";
 }
 
+// Under the decode figure's switch: what each weighting is - its shares per category, how it averages, its figure in
+// this run - and when to read which. Only for a run that reports two or more mixes (runs before the switch had one).
+std::string mix_panel_html(const ScenarioResult &decode) {
+  std::vector<MixOption> options;
+  std::vector<const WeightMix *> defs;
+  for (const Row &row : decode.rows) {
+    const std::string *label = label_of(row, "category");
+    const Metric *rate = metric_of(row, metric::kDecode);
+    if (!label || !label->ends_with(" mix") || !rate || rate->samples.empty()) continue;
+    options.push_back({mix_name(*label), format_number(summarize(rate->samples).median), {}});
+    const auto def = std::ranges::find(weight_mixes(), std::string_view(options.back().name), &WeightMix::id);
+    defs.push_back(def == weight_mixes().end() ? nullptr : &*def);
+  }
+  if (options.size() < 2) return {};
+  std::string html = "<div class=\"mixinfo\" id=\"decode-mix\"><div class=\"mbar\"><b>How the decode figure is weighed</b>" + mix_switch_html(options) +
+                     "</div><div class=\"tscroll\"><table><thead><tr><th class=\"l\">mix</th>";
+  for (const CategoryWeight &c : category_weights()) html += "<th>" + escaped(c.category) + "</th>";
+  html += "<th class=\"l\">average</th><th>this run</th></tr></thead><tbody>";
+  for (size_t k = 0; k < options.size(); ++k) {
+    html += "<tr data-mix=\"" + escaped(options[k].name) + "\"" + (k == 0 ? " class=\"on\"" : "") + "><td class=\"l\">" + escaped(options[k].name) + "</td>";
+    for (const CategoryWeight &c : category_weights()) {
+      double share = -1;
+      if (defs[k])
+        for (const CategoryWeight &w : defs[k]->weights)
+          if (w.category == c.category) share = w.weight;
+      html += "<td>" + (share < 0 ? std::string("-") : share == 0 ? std::string("0") : format_number(share * 100) + " %") + "</td>";
+    }
+    const std::string average = !defs[k] ? "as asked" : defs[k]->average == MixAverage::arithmetic ? "plain mean of the rates" : "rate of the mix (harmonic)";
+    html += "<td class=\"l\">" + average + "</td><td>" + escaped(options[k].value) + " tok/s</td></tr>";
+  }
+  html += "</tbody></table></div><ul>"
+          "<li>Both figures come from the same per-category medians in the table below; only the shares and the way they are averaged differ.</li>"
+          "<li><b>benchmark</b> weighs the categories the way the usual public benchmarks do (code first, chat and maths left out) and takes a plain "
+          "weighted mean of their rates. Set it beside other benchmarks' numbers. It reads higher: a fast kind of output (JSON, code) lifts a plain mean "
+          "more than a slow one pulls it down.</li>"
+          "<li><b>agentic</b> weighs them by what a coding agent actually generated in measured sessions (most of it reasoning) and averages time per "
+          "token: the tokens per second an agent gets over its work. A slow kind counts by the time it takes, so it reads lower where reasoning or chat "
+          "decode slowly.</li>"
+          "<li>Half the tokens at 300 tok/s and half at 100: a plain mean reads 200, the rate they come out at is 150.</li></ul></div>";
+  return html;
+}
+
 std::string scenario_html(const ScenarioResult &scenario) {
   std::string html = "<section class=\"sc\" id=\"" + escaped(scenario.id) + "\"><h2><span class=\"ttl\">" + escaped(scenario.title) + "</span> <code>" + escaped(scenario.id) + "</code></h2>";
   if (!scenario.about.empty()) html += "<p class=\"about\">" + escaped(scenario.about) + "</p>";
@@ -367,6 +445,7 @@ std::string scenario_html(const ScenarioResult &scenario) {
   if (scenario.errors) html += std::string(kDot) + "<b>" + std::to_string(scenario.errors) + " failed</b>";
   if (scenario.power) html += std::string(kDot) + escaped(power_line(scenario));
   html += "</p>" + misses_html(scenario);
+  if (scenario.id == "decode") html += mix_panel_html(scenario);
 
   std::string charts;
   for (const ChartSpec &spec : scenario.charts)
@@ -403,7 +482,8 @@ std::string setup_html(const RunInfo &i) {
   html += term("endpoint", i.endpoint) + term("model", i.model);
   html += term("context", i.context_tokens > 0 ? with_thousands(i.context_tokens) + " tokens per request" : "not reported by the endpoint");
   if (i.kv_pool_tokens > 0) html += term("KV pool", with_thousands(i.kv_pool_tokens) + " tokens shared by all requests");
-  html += term("mode", i.mode + ", version " + std::to_string(i.mode_version)) + term("suite", i.suite) + term("sampling", sampling) + term("thinking", i.thinking.empty() ? "default" : i.thinking) + term("replies", replies_text(i));
+  html += term("method", i.method > 0 || i.mode.empty() ? "version " + std::to_string(i.method) : "mode " + i.mode + ", version " + std::to_string(i.mode_version) + " (a run from before the one method)") +
+          term("suite", i.suite) + term("sampling", sampling) + term("thinking", i.thinking.empty() ? "default" : i.thinking) + term("replies", replies_text(i));
   html += term("corpus", (i.corpus.empty() ? std::string() : i.corpus + ", ") + "version " + std::to_string(i.corpus_version) + ", hash " + i.corpus_hash);
   html += term("extensions", extensions);
   if (i.power) {
@@ -437,7 +517,7 @@ std::string nav_html(const Run &run, bool with_anatomy) {
 std::string header_html(const Run &run) {
   const RunInfo &i = run.info;
   const int failed = failed_requests(run);
-  std::string chips = "<li>" + escaped(timestamp_text(i.timestamp)) + "</li><li>mode <b>" + escaped(i.mode) + "</b></li><li>suite <b>" + escaped(i.suite) + "</b></li><li><b>" +
+  std::string chips = "<li>" + escaped(timestamp_text(i.timestamp)) + "</li>" + (i.mode.empty() ? std::string() : "<li>mode <b>" + escaped(i.mode) + "</b></li>") + "<li>suite <b>" + escaped(i.suite) + "</b></li><li><b>" +
                       duration_text(i.seconds) + "</b></li>";
   chips += "<li><b>" + with_thousands(all_requests(run)) + "</b> requests</li>";
   if (failed) chips += "<li class=\"bad\"><b>" + std::to_string(failed) + "</b> failed</li>";

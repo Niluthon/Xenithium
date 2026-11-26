@@ -1,11 +1,11 @@
-// xenithium-bench: the short prompts, by category, in two sets (PromptSet).
+// xenithium-bench: the short prompts, by category, in two kinds (PromptSet) measured together (measured_prompts).
 // A category is a kind of output with its own token statistics (code repeats itself and drafts well, prose does not),
 // so the decode rate is reported per category and combined by a weight mix (weight_mixes). The texts are this
-// project's own. Changing one changes every later decode number: bump kCorpusVersion with a standard prompt
-// (corpus.hpp), the easy mode's version with an easy one (mode.cpp).
+// project's own. Changing one changes every later decode number: bump kMethodVersion (corpus.hpp).
 #include "corpus.hpp"
 
 #include <array>
+#include <vector>
 
 namespace xenithium::bench {
 namespace {
@@ -135,7 +135,7 @@ constexpr std::array kPrompts = {
                 kSummaryTokens},
 };
 
-// The easy set's chats: the turns before each chat prompt's own.
+// The chats of the tasks on given input: the turns before each chat prompt's own.
 constexpr std::array kChatTripDayEarlier = {
     EarlierTurn{"user", "I am visiting Porto for four days in May. I like seafood, viewpoints and long walks, not museums."},
     EarlierTurn{"assistant", "Porto in May suits that well: mild weather, long evenings and plenty of walking between the river, the old town and the coast. Shall I plan it day by day?"},
@@ -153,9 +153,9 @@ constexpr std::array kChatGitEarlier = {
     EarlierTurn{"assistant", "That is easy to fix as long as the commit has not been pushed. Has it?"},
 };
 
-// The easy set: four prompts per category in a row. Each reply mostly repeats or reshapes what its prompt gives, and
-// each max_tokens sits a little above the reply the task asks for, so replies end where the model ends them.
-constexpr std::array kEasyPrompts = {
+// The tasks on given input: four prompts per category in a row. Each reply mostly repeats or reshapes what its prompt
+// gives, and each max_tokens sits a little above the reply the task asks for, so replies end where the model ends them.
+constexpr std::array kGivenPrompts = {
     ShortPrompt{"chat-trip-day", "chat",
                 "Yes, but only day 3 for now: morning to evening, with places to eat.",
                 350, kChatTripDayEarlier},
@@ -385,29 +385,44 @@ constexpr std::array kEvenMix = {
     CategoryWeight{"chat", 0.125}, CategoryWeight{"code", 0.125}, CategoryWeight{"reasoning", 0.125}, CategoryWeight{"math", 0.125},
     CategoryWeight{"prose", 0.125}, CategoryWeight{"json", 0.125}, CategoryWeight{"edit", 0.125}, CategoryWeight{"summary", 0.125},
 };
-// The easy mode's mix, the shares the usual public benchmarks weigh their categories by: led by code, chat and maths
-// not counted. Averaged as they average it (MixAverage::arithmetic).
-constexpr std::array kEasyMix = {
+// The benchmark mix (the default headline): the shares the usual public benchmarks weigh their categories by, led by
+// code, chat and maths not counted, averaged as they average it (MixAverage::arithmetic), so the figure stands beside
+// theirs. It reads higher than the agentic mix: a fast category lifts a plain mean more than a slow one pulls it down.
+constexpr std::array kBenchmarkMix = {
     CategoryWeight{"chat", 0.00}, CategoryWeight{"code", 0.30}, CategoryWeight{"reasoning", 0.20}, CategoryWeight{"math", 0.00},
     CategoryWeight{"prose", 0.15}, CategoryWeight{"json", 0.15}, CategoryWeight{"edit", 0.10}, CategoryWeight{"summary", 0.10},
 };
 constexpr std::array kMixes = {
-    WeightMix{"agent", "a coding agent's generated tokens on Qwen3.8 27B and Flash-Next (measured: 63 % reasoning, 19 % code, 4 % each edit, summary, chat, 3 % each prose, json)", kAgentMix},
+    WeightMix{"benchmark", "the usual public benchmarks' shares: 30 % code, 20 % reasoning, 15 % each prose, json, 10 % each edit, summary; the weighted mean of the categories' rates",
+              kBenchmarkMix, MixAverage::arithmetic},
+    WeightMix{"agentic", "a coding agent's generated tokens on Qwen3.8 27B and Flash-Next (measured: 63 % reasoning, 19 % code, 4 % each edit, summary, chat, 3 % each prose, json); the rate that mix of tokens comes out at",
+              kAgentMix},
     WeightMix{"even", "every kind of output alike", kEvenMix},
-    WeightMix{"easy", "the easy mode's: 30 % code, 20 % reasoning, 15 % each prose, json, 10 % each edit, summary; the weighted mean of the categories' rates", kEasyMix,
-              MixAverage::arithmetic},
 };
 
 }  // namespace
 
 std::span<const ShortPrompt> short_prompts(PromptSet set) {
   switch (set) {
-    case PromptSet::standard: return kPrompts;
-    case PromptSet::easy: return kEasyPrompts;
+    case PromptSet::open: return kPrompts;
+    case PromptSet::given: return kGivenPrompts;
   }
   return kPrompts;
 }
+
+std::span<const ShortPrompt> measured_prompts() {
+  static const std::vector<ShortPrompt> all = [] {
+    std::vector<ShortPrompt> out;
+    for (const CategoryWeight &c : kAgentMix)  // per category in the usual order: its open tasks, then its tasks on given input
+      for (const auto set : {std::span<const ShortPrompt>(kPrompts), std::span<const ShortPrompt>(kGivenPrompts)})
+        for (const ShortPrompt &p : set)
+          if (p.category == c.category) out.push_back(p);
+    return out;
+  }();
+  return all;
+}
 std::span<const WeightMix> weight_mixes() { return kMixes; }
 std::span<const CategoryWeight> category_weights() { return kAgentMix; }
+std::span<const WeightMix> headline_mixes() { return std::span(kMixes).first(2); }
 
 }  // namespace xenithium:bench

@@ -1,6 +1,6 @@
 // xenithium-bench-embed: writes the benchmark corpus into a C++ source file, so the tool is one binary.
 // xenithium-bench-embed CORPUS_DIR OUT.cpp
-// CORPUS_DIR holds <set>/<kind>/<file> (set = "medium", "hard"; kind = "code", "prose"...). The output defines
+// CORPUS_DIR holds <set>/<kind>/<file> (set = "engine", "generic"; kind = "code", "prose"...). The output defines
 // embedded:kFiles (corpus.hpp), in path order so a set's hash does not depend on the file system's listing order.
 // Build-time only.
 #include <algorithm>
