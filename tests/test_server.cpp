@@ -3561,6 +3561,20 @@ void test_server(const std::string &tokdir) {
                  e.get_object("machine")->get_string("kernel") && *e.get_object("machine")->get_string("kernel") == "7.0.0-43-generic" &&
                  e.get_object("machine")->get("memory_gib") && e.get_object("machine")->get("memory_gib")->num == 46,
              "server: /v1/models reports its build, oneAPI, drafter, machine, the cards' driver and its launch (arguments, XEN_ variables)");
+      json::Value one;  // retrieve one model: the same entry, every field
+      json::parse(xenithium::http::request("GET", r.base + "/v1/models/test-model", "", 10).body, one);
+      const json::Value *one_launch = one.get_object("launch");
+      expect(one.get_string("build") && *one.get_string("build") == "abc1234" && one.get_string("drafter") && *one.get_string("drafter") == "dspine+mtp" &&
+                 one.get_array("devices") && one.get_array("devices")->arr.size() == 2 && one.get_object("machine") && one_launch &&
+                 one_launch->get_array("args") && one_launch->get_array("args")->arr.size() == 5,
+             "server: /v1/models/<id> carries the same build, drafter, cards, machine and launch as the list");
+    }
+    {
+      std::istringstream good("MemFree: 1 kB\nMemTotal:       48234496 kB\n"), bad("MemTotal: lots\n"), huge("MemTotal: 99999999999999999999999 kB\n"),
+          none("MemFree: 1 kB\n");
+      expect(xenithium::util::memory_gib_from(good) == 46 && xenithium::util::memory_gib_from(bad) == 0 && xenithium::util::memory_gib_from(none) == 0 &&
+                 xenithium::util::memory_gib_from(huge) > 0,
+             "machine: MemTotal in GiB; a malformed, missing or out-of-range line never throws (0 = not known when it is not a number)");
     }
     expect(xenithium::server::secret_name("XEN_BENCH_API_KEY") && xenithium::server::secret_name("--api-key") && xenithium::server::secret_name("HF_TOKEN") &&
                !xenithium::server::secret_name("XEN_KV_POOL_TOKENS") && !xenithium::server::secret_name("--kv-pool-tokens") && !xenithium::server::secret_name("XEN_KV_LEND_KEEP"),
