@@ -27,6 +27,7 @@
 
 #include "xenithium/core/engine.hpp"
 #include "xenithium/util/machine.hpp"
+#include "xenithium/util/secrets.hpp"
 #include "xenithium/server/http.hpp"
 #include "xenithium/text/chat.hpp"
 #include "xenithium/text/tokenizer.hpp"
@@ -111,23 +112,15 @@ struct Config {
   util::Machine machine;
   // How it was started, only with --report-launch (it shows local paths): the command line's arguments after the
   // program and the XEN_ variables it saw, so a benchmark can show the launch and anyone can start the same. Values of
-  // secret-looking names are hidden before they get here (tools/server/main.cpp). Empty = not reported.
+  // secrets are hidden before they get here (fill_launch below). Empty = not reported.
   std::vector<std::string> launch_args;
   std::vector<std::pair<std::string, std::string>> launch_env;
 };
 
-// A name whose value must not leave the machine (Config:launch_args / launch_env are public in GET /v1/models): one of
-// its parts (split at '_' and '-') is KEY, TOKEN, PASS or the like, or it contains AUTH, BEARER, JWT, SECRET, PASSW,
-// CREDENTIAL or COOKIE anywhere (XEN_AUTHORIZATION). KEY and TOKEN as whole parts only: XEN_KV_POOL_TOKENS is a count.
-bool secret_name(std::string_view name);
-
-// `value` with the password of every URL in it hidden: "http://user:pass@proxy:3128" -> "http://user:(hidden)@proxy:3128"
-// (a proxy setting carries credentials whatever its name).
-std::string hide_url_credentials(std::string value);
-
-// A value that looks like a credential whatever its name: a known token prefix (hf_, sk-, ghp_, github_pat_, xox?-,
-// glpat-, AKIA, a JWT's eyJ...) or "Bearer ...". For a secret passed under an ordinary flag.
-bool secret_value(std::string_view value);
+// What --report-launch hides: util/secrets.hpp (shared with xenithium-bench, which hides the same in a run's notes).
+using util::hide_url_credentials;
+using util::secret_name;
+using util::secret_value;
 
 // How the server was started, as GET /v1/models shows it with --report-launch: `args` (the arguments after the program)
 // with the value of a secret-named flag (--x-token V, --x-token=V) or a secret-looking value hidden, every URL's

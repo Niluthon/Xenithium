@@ -2342,29 +2342,6 @@ struct Server::Impl final : core::EventSink {
 
 // =====================================================================================
 
-bool secret_name(std::string_view name) {
-  std::string part;
-  for (size_t at = 0; at <= name.size(); ++at) {
-    if (at < name.size() && name[at] != '_' && name[at] != '-') {
-      part += static_cast<char>(std::toupper(static_cast<unsigned char>(name[at])));
-      continue;
-    }
-    for (const char* word : {"KEY", "APIKEY", "TOKEN", "PASS", "PWD", "SIG", "SIGNATURE"})
-      if (part == word) return true;
-    for (const char* inside : {"AUTH", "BEARER", "JWT", "SECRET", "PASSW", "CREDENTIAL", "COOKIE"})
-      if (part.find(inside) != std::string::npos) return true;
-    part.clear();
-  }
-  return false;
-}
-
-bool secret_value(std::string_view value) {
-  if (value.rfind("Bearer ", 0) == 0 || value.rfind("bearer ", 0) == 0) return true;
-  for (const char *prefix : {"hf_", "sk-", "ghp_", "gho_", "ghs_", "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA", "eyJ"})
-    if (value.rfind(prefix, 0) == 0 && value.size() >= std::string_view(prefix).size() + 16) return true;
-  return false;
-}
-
 void fill_launch(Config &cfg, const std::vector<std::string> &args, const std::vector<std::string> &env) {
   constexpr const char *hidden = "(hidden)";
   for (size_t a = 0; a < args.size(); ++a) {
@@ -2385,19 +2362,6 @@ void fill_launch(Config &cfg, const std::vector<std::string> &args, const std::v
     cfg.launch_env.push_back({name, secret_name(name) || secret_value(value) ? hidden : hide_url_credentials(value)});
   }
   std::sort(cfg.launch_env.begin(), cfg.launch_env.end());
-}
-
-std::string hide_url_credentials(std::string value) {
-  for (size_t scheme = value.find("://"); scheme != std::string::npos; scheme = value.find("://", scheme + 3)) {
-    const size_t start = scheme + 3;
-    const size_t end = value.find_first_of("/?# ", start);
-    const size_t at = value.rfind('@', end == std::string::npos ? std::string::npos : end);
-    if (at == std::string::npos || at < start) continue;
-    const size_t colon = value.find(':', start);
-    if (colon == std::string::npos || colon > at) continue;  // a user name alone: no password to hide
-    value.replace(colon + 1, at - colon - 1, "(hidden)");
-  }
-  return value;
 }
 
 Server::Server(Config cfg, core::Engine& engine, const text::Tokenizer& tok, const text::ChatFormat* chat)
