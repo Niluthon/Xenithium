@@ -91,8 +91,9 @@ inline esimd::simd<bf16, kOp> v_operand(esimd::simd<bf16, kOp> v) SYCL_ESIMD_FUN
 // and applies the same o / l, bf16 and gate roundings. Whole groups keep their bits. tail = 0: no split.
 // a short call's split: up to 16 units per work-group; a tail's remainder keeps 8
 inline constexpr int kFaSplitMax = 16;
-// a decode call (gqa_attn_fa_decode) on this thread: the slot's page row from a device word, its own tail buffer
-struct FaDec { const int32_t *slot_word = nullptr; int slot_pages = 0; bool on = false; };
+// a decode call (gqa_attn_fa_decode) on this thread: the slot's page row from a device word, its own tail buffer, and
+// for a DDTree segment its record (the parents word: each row reads its ancestors among the block's rows)
+struct FaDec { const int32_t *slot_word = nullptr; int slot_pages = 0; bool on = false; const int32_t *tree_rec = nullptr; };
 thread_local FaDec g_fa_dec;
 struct FaTail {
   int tail = 0, split = 1;
@@ -134,7 +135,7 @@ sycl::event attn_fa(sycl::queue &q, const GqaShape &s, int m, const GqaCache &c,
   const int hq = s.hq(), hkv = s.hkv(), blocks = (m + QB - 1) / QB;
   const uint8_t *kp = c.k, *vp = c.v;
   const float *ksp = c.ks, *vsp = c.vs;
-  const int32_t *pages0 = c.pages, *slot_w = g_fa_dec.slot_word;
+  const int32_t *pages0 = c.pages, *slot_w = g_fa_dec.slot_word, *tree_rec = g_fa_dec.tree_rec;
   const int slot_pg = g_fa_dec.slot_pages;
   const int win = FL ? s.window : 0, ring = FL ? c.ring_pages : 0;
   const int W = blocks * hkv, tail = FL ? 0 : tp.tail, split = tail ? tp.split : 1, whole = W - tail;
@@ -188,6 +189,24 @@ sycl::event attn_fa(sycl::queue &q, const GqaShape &s, int m, const GqaCache &c,
         esimd::simd<int8_t, QK ? kC8 * 256 : 32> qa8;
         esimd::simd<float, 8> sq;
         esimd::simd<int32_t, 8> rpos;
+        // A DDTree segment (decode, one block, r0 = 0): row j's K / V sit at slot p0 + j, its rope at p0 + depth(j). It
+        // reads every slot below p0 and, among the block's own slots, only its ancestors and itself (bit i of ancm =
+        // slot p0 + i): the keys the segment kernel's chain-over-ancestors view reads, in slot order.
+        esimd::simd<uint32_t, 8> ancm(0xffffffffu);
+        bool treeg = false;
+        if (tree_rec) {
+          const uint64_t tw = rec_word(tree_rec, kSegTree, kSegTreeHi);
+          treeg = (tw & kTreeFlag) != 0;
+          if (treeg) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+              uint32_t a = 0;
+              int u = rg * 8 + r < nrows ? rg * 8 + r : 0;
+              for (int d = 0; d < kTreeRows && u >= 0; ++d) a |= 1u << u, u = tree_parent(tw, u);
+              ancm[r] = a;
+            }
+          }
+        }
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
           const int j = rg * 8 + r, jj = j < nrows ? j : 0;
@@ -373,6 +392,14 @@ sycl::event attn_fa(sycl::queue &q, const GqaShape &s, int m, const GqaCache &c,
             if constexpr (I8) sv *= ks;
             const int rp = rpos[r];
             esimd::simd_mask<kTile> dead = (ti + t0 > rp) | (ti >= nt);
+            if (treeg) {  // a block slot that is not this row's ancestor or itself
+              const esimd::simd<int32_t, kTile> rel = ti + (t0 - p0);
+              esimd::simd<int32_t, kTile> rc = rel;
+              rc.merge(esimd::simd<int32_t, kTile>(0), rel < 0);
+              rc.merge(esimd::simd<int32_t, kTile>(31), rel > 31);
+              const esimd::simd<uint32_t, kTile> bit = (esimd::simd<uint32_t, kTile>(static_cast<uint32_t>(ancm[r])) >> esimd::simd<uint32_t, kTile>(rc)) & 1u;
+              dead |= (rel >= 0) & (bit == 0u);
+            }
             if constexpr (TRAINED) {
               const int j = rg * 8 + r;
               const size_t rr = r0 + (j < nrows ? j : 0);
@@ -691,14 +718,15 @@ sycl::event gqa_attn_fa_trained(sycl::queue &q, const GqaShape &s, int m, const 
 }
 
 sycl::event gqa_attn_fa_decode(sycl::queue &q, const GqaShape &s, int m, const GqaCache &c, const int32_t *rec, int stride, const float *y, int ldy,
-                               const gqa_bf16 *qb, gqa_bf16 *attn, bool p_lo, int qk) {
+                               const gqa_bf16 *qb, gqa_bf16 *attn, bool p_lo, int qk, bool tree) {
+  if (tree && stride < kSegRec) throw std::invalid_argument("gqa_attn_fa_decode: a tree segment needs its record");
   if (s.head_dim != 256 || s.grp() != 6 || !s.gate || s.window > 0 || c.ring_pages > 0 || m < 1 || m > 16)
     throw std::invalid_argument("gqa_attn_fa_decode: grp 6 at head_dim 256 with the gate, 1..16 rows of one segment");
   if (qk && !qsa_kv_scaled(s.kv)) throw std::invalid_argument("gqa_attn_fa_decode: int8 q.k needs the int8 KV");
   struct Guard {
-    Guard(const int32_t *w, int sp) { g_fa_dec = FaDec{w, sp, true}; }
+    Guard(const int32_t *w, int sp, const int32_t *tr) { g_fa_dec = FaDec{w, sp, true, tr}; }
     ~Guard() { g_fa_dec = FaDec{}; }
-  } guard(stride >= kSegRec && c.slot_pages ? rec + kSegSlot : nullptr, c.slot_pages);
+  } guard(stride >= kSegRec && c.slot_pages ? rec + kSegSlot : nullptr, c.slot_pages, tree ? rec : nullptr);
   GqaCache c0 = c;
   c0.slot_pages = 0;
   return fa_kv<6, 16>(q, s, m, c0, rec + kSegPos, y, ldy, qb, attn, p_lo, qk);

@@ -403,8 +403,9 @@ sycl::event gqa_attn_fa(sycl::queue &q, const GqaShape &s, int m, const GqaCache
                         const GqaPageSets *page_sets = nullptr);
 // gqa_attn_fa (16 rows per group) on a decode step's one segment of m <= 16 rows: positions and slot from the
 // segment record rec (stride >= kSegRec; stride 0: rec is a bare position word, slot 0) over c's slot page table.
+// tree: the segment may be a DDTree (record kSegTree): each row reads the context below the segment and its ancestors.
 sycl::event gqa_attn_fa_decode(sycl::queue &q, const GqaShape &s, int m, const GqaCache &c, const int32_t *rec, int stride, const float *y, int ldy,
-                               const gqa_bf16 *qb, gqa_bf16 *attn, bool p_lo, int qk);
+                               const gqa_bf16 *qb, gqa_bf16 *attn, bool p_lo, int qk, bool tree = false);
 // The rows per work-group gqa_attn_fa runs for rows_per_group (0 = the shape's default): the row block that shares a page set.
 int gqa_attn_fa_rows(const GqaShape &s, int rows_per_group);
 sycl::event gqa_attn_fa_trained(sycl::queue &q, const GqaShape &s, int m, const GqaCache &c, const int32_t *pos_word,
