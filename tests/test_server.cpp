@@ -3565,6 +3565,34 @@ void test_server(const std::string &tokdir) {
     expect(xenithium::server::secret_name("XEN_BENCH_API_KEY") && xenithium::server::secret_name("--api-key") && xenithium::server::secret_name("HF_TOKEN") &&
                !xenithium::server::secret_name("XEN_KV_POOL_TOKENS") && !xenithium::server::secret_name("--kv-pool-tokens") && !xenithium::server::secret_name("XEN_KV_LEND_KEEP"),
            "server: secret-looking names (key, token) are hidden from the launch report, counts of tokens are not");
+    {
+      namespace sv = xenithium::server;
+      expect(sv::secret_name("XEN_AUTHORIZATION") && sv::secret_name("XEN_JWT") && sv::secret_name("XEN_OAUTH_CLIENT") &&
+                 sv::secret_name("XEN_DB_PASSWORD") && sv::secret_name("XEN_SESSION_COOKIE") && !sv::secret_name("XEN_PREFILL_SHARE"),
+             "server: AUTH, JWT, PASSW, COOKIE inside a name hide it (XEN_AUTHORIZATION), ordinary names stay");
+      expect(sv::hide_url_credentials("http://user:pa55@proxy:3128") == "http://user:(hidden)@proxy:3128" &&
+                 sv::hide_url_credentials("a=https://u:p@x/y,b=http://plain/z") == "a=https://u:(hidden)@x/y,b=http://plain/z" &&
+                 sv::hide_url_credentials("http://user@host/x") == "http://user@host/x" && sv::hide_url_credentials("/models/q@1") == "/models/q@1",
+             "server: a URL's password is hidden, a user name alone and a path with @ are kept");
+      expect(sv::secret_value("hf_abcdefghijklmnopqrstuvwxyz") && sv::secret_value("Bearer abc") &&
+                 sv::secret_value("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig") && !sv::secret_value("hf_short") &&
+                 !sv::secret_value("/models/Qwen/Qwen3.8-27B") && !sv::secret_value("sk-x"),
+             "server: token-looking values (hf_, Bearer, a JWT) are secret whatever their name, paths and short words are not");
+      sv::Config c;
+      sv::fill_launch(c,
+                      {"--model", "/m", "--api-key", "k1", "--x-token=k2", "--served-model-name", "hf_abcdefghijklmnopqrstuvwxyz",
+                       "--name=sk-abcdefghijklmnopqrstuv", "--proxy", "http://u:p@h:1"},
+                      {"XEN_B=1", "XEN_AUTHORIZATION=abc", "XEN_HTTP_PROXY=http://u:p@h:1", "HOME=/home/x", "XEN_A=ghp_abcdefghijklmnopqrstu"});
+      const std::vector<std::string> want_args = {"--model", "/m", "--api-key", "(hidden)", "--x-token=(hidden)", "--served-model-name",
+                                                  "(hidden)", "--name=(hidden)", "--proxy", "http://u:(hidden)@h:1"};
+      const std::vector<std::pair<std::string, std::string>> want_env = {
+          {"XEN_A", "(hidden)"}, {"XEN_AUTHORIZATION", "(hidden)"}, {"XEN_B", "1"}, {"XEN_HTTP_PROXY", "http://u:(hidden)@h:1"}};
+      bool env_ok = c.launch_env.size() == want_env.size();
+      for (size_t k = 0; env_ok && k < want_env.size(); ++k) env_ok = c.launch_env[k].first == want_env[k].first && c.launch_env[k].second == want_env[k].second;
+      expect(c.launch_args == want_args && env_ok,
+             "server: the launch report hides a secret flag's value (both forms), a token passed under an ordinary flag, a URL's "
+             "password, and keeps only XEN_ variables, sorted");
+    }
     expect(xenithium::http::request("GET", r.base + "/nope", "", 10).status == 404, "server: unknown path 404");
   }
   const std::string script_text = "Let me think.</think>The answer is 4.";

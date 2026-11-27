@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 
@@ -42,7 +43,9 @@ inline Machine this_machine() {
   if (std::ifstream mem("/proc/meminfo"); mem)
     while (std::getline(mem, line))
       if (line.rfind("MemTotal:", 0) == 0) {
-        m.memory_gib = static_cast<int>(std::lround(std::stod(line.substr(9)) / (1024.0 * 1024.0)));  // kB
+        // kB; strtoll, not stod: a malformed line (a container's shim) reads as 0 = not known, never throws at startup
+        const long long kb = std::strtoll(line.c_str() + 9, nullptr, 10);
+        if (kb > 0) m.memory_gib = static_cast<int>(std::lround(static_cast<double>(kb) / (1024.0 * 1024.0)));
         break;
       }
   return m;

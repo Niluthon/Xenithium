@@ -163,14 +163,12 @@ std::string Loader::driver_version_text(size_t i) const {
   void *fn = nullptr;
   if (zeDriverGetExtensionFunctionAddress(driver_of(i), "zeIntelGetDriverVersionString", &fn) == ZE_RESULT_SUCCESS && fn) {
     const auto get = reinterpret_cast<GetVersionString>(fn);
+    // a fixed buffer, one byte more than the size the driver may fill, so it ends in a 0 whatever the driver writes
+    char text[257] = {};
     size_t size = 0;
-    if (get(driver_of(i), nullptr, &size) == ZE_RESULT_SUCCESS && size > 0 && size < 256) {
-      std::string text(size, '\0');
-      if (get(driver_of(i), text.data(), &size) == ZE_RESULT_SUCCESS) {
-        text.resize(std::strlen(text.c_str()));
-        if (!text.empty()) return text;
-      }
-    }
+    if (get(driver_of(i), nullptr, &size) == ZE_RESULT_SUCCESS && size > 0 && size <= 256 &&
+        get(driver_of(i), text, &size) == ZE_RESULT_SUCCESS && text[0] != '\0')
+      return std::string(text, strnlen(text, 256));
   }
   // else the build number, the one part of driverVersion every Intel driver fills the same way (low 16 bits)
   const uint32_t v = driver_version(i);

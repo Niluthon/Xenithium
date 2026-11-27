@@ -67,28 +67,10 @@ std::string oneapi_version() {
 #endif
 }
 
-// How this server was started, for GET /v1/models with --report-launch: the arguments after the program (a
-// secret-looking flag's value hidden) and every XEN_ variable of the environment (a secret-looking one's value hidden),
-// sorted by name.
 // The XEN_ variables as the server was started with them, taken first thing in main: the server sets some of its own
 // later (XEN_EMU_CARD), which are not part of how it was started.
 std::vector<std::string> g_start_env;
 
-void fill_launch(xenithium::server::Config &cfg, int argc, char **argv) {
-  for (int a = 1; a < argc; ++a) {
-    const std::string arg = argv[a];
-    const size_t eq = arg.find('=');
-    if (arg.rfind("--", 0) == 0 && eq != std::string::npos && secret_name(arg.substr(0, eq))) cfg.launch_args.push_back(arg.substr(0, eq) + "=(hidden)");
-    else cfg.launch_args.push_back(a > 1 && std::string(argv[a - 1]).rfind("--", 0) == 0 && secret_name(argv[a - 1]) ? "(hidden)" : arg);
-  }
-  for (const std::string &kv : g_start_env) {
-    const size_t eq = kv.find('=');
-    if (eq == std::string::npos || kv.rfind("XEN_", 0) != 0) continue;
-    const std::string name = kv.substr(0, eq);
-    cfg.launch_env.push_back({name, secret_name(name) ? "(hidden)" : kv.substr(eq + 1)});
-  }
-  std::sort(cfg.launch_env.begin(), cfg.launch_env.end());
-}
 
 void on_signal(int) {
   if (g_server) g_server->stop();
@@ -337,7 +319,7 @@ int server_main(int argc, char **argv) {
   scfg.oneapi = oneapi_version();
   scfg.machine = xenithium::util::this_machine();
   if (backend) scfg.drafter = backend->drafter();
-  if (o.report_launch) fill_launch(scfg, argc, argv);  // and how it was started (opt-in: it shows local paths)
+  if (o.report_launch) fill_launch(scfg, std::vector<std::string>(argv + 1, argv + argc), g_start_env);  // and how it was started (opt-in: it shows local paths)
   scfg.fetch.enabled = o.media_urls != 0;  // Http(s) media URLs
   scfg.fetch.allowed_domains = xenithium::util::split_domains(o.media_domains);
   scfg.fetch.timeout_s = o.media_timeout_s;
