@@ -2,10 +2,11 @@
 
 # The OpenAI-compatible server (docs/server-env.md): options, then the arch's serving backend. build_rev.cpp holds the
 # checkout's `git describe` (cmake/BuildRev.cmake, refreshed at every build, rewritten only when it changes): the
-# server reports it in GET /v1/models.
+# server reports it in GET /v1/models. Without a checkout (a Docker build) -DXENITHIUM_BUILD_REV=REV gives it.
+set(XENITHIUM_BUILD_REV "" CACHE STRING "The revision to report when the source has no git checkout (Docker builds)")
 set(XENITHIUM_BUILD_REV_CPP ${CMAKE_CURRENT_BINARY_DIR}/build_rev.cpp)
 add_custom_target(xenithium-build-rev
-  COMMAND ${CMAKE_COMMAND} -DSRC=${PROJECT_SOURCE_DIR} -DOUT=${XENITHIUM_BUILD_REV_CPP} -P ${PROJECT_SOURCE_DIR}/cmake/BuildRev.cmake
+  COMMAND ${CMAKE_COMMAND} -DSRC=${PROJECT_SOURCE_DIR} -DREV=${XENITHIUM_BUILD_REV} -DOUT=${XENITHIUM_BUILD_REV_CPP} -P ${PROJECT_SOURCE_DIR}/cmake/BuildRev.cmake
   BYPRODUCTS ${XENITHIUM_BUILD_REV_CPP}
   COMMENT "Reading the build's git revision"
   VERBATIM)

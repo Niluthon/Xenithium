@@ -346,7 +346,8 @@ std::string drafter_name(const std::string &block_dir, bool mtp) {
   try {
     for (const std::string &a : model::ModelConfig::load(block_dir).architectures())
       if (arch::is_dspine_arch(a)) kind = "dspine";
-  } catch (const std::exception &) {  // the load read it already: kept as dflash2 if a second read fails
+  } catch (const std::exception &e) {  // the load read it already: kept as dflash2 if a second read fails, said so
+    std::fprintf(stderr, "server: warning: the drafter's config could not be read again (%s); GET /v1/models says dflash2\n", e.what());
   }
   return mtp ? kind + "+mtp" : kind;
 }
