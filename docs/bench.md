@@ -38,7 +38,7 @@ same binary against the server it started ([launcher.md](launcher.md)).
 |---|---|---|
 | `--url URL` | `http://127.0.0.1:8000/v1` | The API base. `http://host:port` gets `/v1`; a URL with a path keeps it (`https://host/openai/v1`). `https` is supported. |
 | `--model ID` | the endpoint's first model | The model name sent with every request. |
-| `--api-key KEY` | `$XEN_BENCH_API_KEY`, else `$OPENAI_API_KEY` | Sent as `Authorization: Bearer KEY`. Prefer the variable: an argument is visible in the process list. The run file never holds the key: a key from the variables is not recorded at all, one given as `--api-key` is recorded as `(hidden)` and left out of the page's "Run this yourself" command. |
+| `--api-key KEY` | `$XEN_BENCH_API_KEY`, else `$OPENAI_API_KEY` | Sent as `Authorization: Bearer KEY`. Prefer the variable: an argument is visible in the process list. The run file never holds the key: a key from the variables is not recorded at all, one given as `--api-key` is recorded as `(hidden)` and left out of the page's "Run this yourself" command. Notes get the server's rules (`util/secrets.hpp`): a key, token or URL password in a `server_cmd` note or any `--note` is recorded as `(hidden)`, and older runs are hidden the same way on their page. |
 | `--suite ID` | `standard` | The scenarios to run and their parameters (below). |
 | `--scenario a,b` | | Run these scenarios with their defaults instead of a suite. |
 | `--set scenario.key=value` | | Change one parameter of one scenario of the run. Repeatable. An unknown scenario or key is refused before anything is sent. |

@@ -474,6 +474,19 @@ void test_report() {
               facts.find("<dt>model</dt><dd><ul class=\"chips\"><li>ckpt-w4</li>") != std::string::npos &&
               facts.find("<pre class=\"cmd\">source scripts/oneapi-env.sh\nXEN_TRAINED_QSA_DELTA_DIR=/m/qsa-sidecar build/xenithium-server") != std::string::npos,
           "html report: the facts rows read the notes (XEN_SLOTS) and a hand-started server's command line (env words, flags), the command to copy below");
+    CHECK(b::hide_command_secrets("XEN_API_KEY=abc  build/x --api-key k1 --x-token=k2 --name hf_abcdefghijklmnopqrstuvwxyz\n  --proxy http://u:pw@h:1 --model /m") ==
+              "XEN_API_KEY=(hidden)  build/x --api-key (hidden) --x-token=(hidden) --name (hidden)\n  --proxy http://u:(hidden)@h:1 --model /m" &&
+              b::hide_command_secrets("XEN_AUTHORIZATION='Bearer x' a") == "XEN_AUTHORIZATION=(hidden) a" &&
+              b::hide_command_secrets("XEN_NOTE=\"two words\" --x-token \"Bearer y z\" b") == "XEN_NOTE=\"two words\" --x-token (hidden) b" && b::hide_note("XEN_API_KEY", "abc") == "(hidden)" &&
+              b::hide_note("purpose", "report-e2e") == "report-e2e" && b::hide_command_secrets("") == "",
+          "run file: a command line's secrets hidden by the server's rules (NAME=V, --flag=V, --flag V, token-looking words, URL passwords), its spacing kept");
+    b::Run keyed = on;  // a hand-written server_cmd note with keys in it (a run from before the bench hid them)
+    keyed.info.notes.push_back({"server_cmd", "XEN_API_KEY=abc123 build/xenithium-server --model /m/ckpt --api-key sekrit --served-model-name hf_abcdefghijklmnopqrstuvwxyz"});
+    const std::string keyed_page = b::render_html(keyed);
+    CHECK(keyed_page.find("abc123") == std::string::npos && keyed_page.find("sekrit") == std::string::npos && keyed_page.find("hf_abcdefghij") == std::string::npos &&
+              keyed_page.find("XEN_API_KEY=(hidden) build/xenithium-server --model /m/ckpt --api-key (hidden)") != std::string::npos &&
+              keyed_page.find("Where it shows <code>(hidden)</code>, it held a key, token or password") != std::string::npos,
+          "html report: a server_cmd note's keys are hidden in the server step and the recorded section, with the put-your-own hint");
     const std::string bare = b::render_html(run);
     CHECK(bare.find("<dt>speculation</dt>") == std::string::npos &&
               bare.find("<section id=\"setup\"><h2><span class=\"ttl\">Everything the run recorded</span></h2><dl class=\"setup\">") != std::string::npos &&

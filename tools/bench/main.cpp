@@ -166,8 +166,13 @@ Number number_of(const std::string &flag, const std::string &value) {
 
 Options parse_run_options(int argc, char **argv) {
   Options o;
-  for (int i = 2; i < argc; ++i)  // the command as typed, for the run file (the key's value hidden)
-    o.command.push_back(i > 2 && std::string(argv[i - 1]) == "--api-key" ? std::string("(hidden)") : std::string(argv[i]));
+  for (int i = 2; i < argc; ++i) {  // the command as typed, for the run file (the key's value and a note's secrets hidden)
+    const std::string arg = argv[i], before = i > 2 ? argv[i - 1] : "";
+    const size_t eq = arg.find('=');
+    if (before == "--api-key") o.command.emplace_back("(hidden)");
+    else if (before == "--note" && eq != std::string::npos) o.command.push_back(arg.substr(0, eq + 1) + bench::hide_note(arg.substr(0, eq), arg.substr(eq + 1)));
+    else o.command.push_back(arg);
+  }
   for (int i = 2; i < argc; ++i) {
     const std::string flag = argv[i];
     if (flag == "--strict") {
@@ -201,7 +206,7 @@ Options parse_run_options(int argc, char **argv) {
     else if (flag == "--note") {
       const size_t eq = value.find('=');
       if (eq == std::string::npos) usage_error("--note takes KEY=VALUE");
-      o.notes.emplace_back(value.substr(0, eq), value.substr(eq + 1));
+      o.notes.emplace_back(value.substr(0, eq), bench::hide_note(value.substr(0, eq), value.substr(eq + 1)));  // never a key in the run file
     } else usage_error("unknown option " + flag);
   }
   if (o.api_key.empty()) o.api_key = env_or("XEN_BENCH_API_KEY", env_or("OPENAI_API_KEY", ""));

@@ -78,6 +78,13 @@ struct Headline {
 Headline headline(const Run &run);
 
 std::string to_json(const Run &run);
+
+// A command line with what must not leave the machine hidden (util/secrets.hpp, the server's rules): the value of a
+// secret-named NAME=V, --flag=V or --flag V, a token-looking word, a URL's password. The spacing is kept.
+std::string hide_command_secrets(std::string_view command);
+// A note's value as it may be recorded and shown: "(hidden)" for a secret name or value, else hide_command_secrets (a
+// server_cmd note is a command line the user wrote).
+std::string hide_note(std::string_view key, std::string_view value);
 std::optional<Run> run_from_json(std::string_view text, std::string &err);
 
 // "1x Intel Arc Pro B65 Graphics, 32 GB": the cards, equal neighbours counted once ("(R)" and "(TM)" dropped), the

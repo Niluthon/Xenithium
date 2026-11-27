@@ -8,6 +8,7 @@
 #include "scenario.hpp"
 #include "stats.hpp"
 #include "xenithium/util/json.hpp"
+#include "xenithium/util/secrets.hpp"
 
 namespace xenithium::bench {
 namespace {
@@ -572,6 +573,49 @@ std::string devices_text(const std::vector<Device> &devices, int tensor_parallel
   std::string out = gpus_text(devices);
   if (tensor_parallel > 0) out += (out.empty() ? "TP " : "; TP ") + std::to_string(tensor_parallel);
   return out.empty() ? std::string(missing) : out;
+}
+
+std::string hide_command_secrets(std::string_view command) {
+  std::string out;
+  bool after_secret_flag = false;  // the previous word was --some-token: this one is its value
+  size_t at = 0;
+  while (at < command.size()) {
+    const size_t start = command.find_first_not_of(" \t\n\r", at);
+    out.append(command.substr(at, (start == std::string_view::npos ? command.size() : start) - at));  // the spacing
+    if (start == std::string_view::npos) break;
+    size_t end = start;  // a word ends at a space outside quotes: XEN_X='Bearer abc' is one word
+    for (char quote = 0; end < command.size(); ++end) {
+      const char c = command[end];
+      if (quote) {
+        if (c == quote) quote = 0;
+      } else if (c == '\'' || c == '"') {
+        quote = c;
+      } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+        break;
+      }
+    }
+    const std::string word(command.substr(start, end - start));
+    std::string bare = word;  // without quotes, for the checks
+    std::erase_if(bare, [](char c) { return c == '\'' || c == '"'; });
+    const size_t eq = bare.find('=');
+    std::string shown;
+    if (after_secret_flag || util::secret_value(bare)) {
+      shown = "(hidden)";
+    } else if (eq != std::string::npos && eq > 0 && (util::secret_name(bare.substr(0, eq)) || util::secret_value(std::string_view(bare).substr(eq + 1)))) {
+      shown = bare.substr(0, eq) + "=(hidden)";
+    } else {
+      shown = util::hide_url_credentials(word);
+    }
+    after_secret_flag = bare.rfind("--", 0) == 0 && eq == std::string::npos && util::secret_name(bare);
+    out += shown;
+    at = end;
+  }
+  return out;
+}
+
+std::string hide_note(std::string_view key, std::string_view value) {
+  if (util::secret_name(key) || util::secret_value(value)) return "(hidden)";
+  return hide_command_secrets(value);
 }
 
 std::string to_json(const Run &run) {

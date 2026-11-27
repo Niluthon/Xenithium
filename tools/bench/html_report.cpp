@@ -417,7 +417,7 @@ std::string setup_html(const RunInfo &i) {
       cards += (cards.empty() ? "" : ", ") + card.name + (card.cap_watts > 0 ? " (limit " + format_number(card.cap_watts) + " W)" : "");
     html += term("power", cards + "; idle " + format_number(i.power->idle_watts) + " W before the run");
   }
-  for (const Label &note : i.notes) html += term(note.first, note.second);
+  for (const Label &note : i.notes) html += term(note.first, hide_note(note.first, note.second));  // runs from before hid nothing
   for (const Label &var : i.server_env) html += term(var.first, var.second);
   return html + "</dl></section>";
 }
@@ -450,7 +450,7 @@ struct Settings {
 
   std::string note(std::string_view key) const {
     for (const auto &[k, v] : *notes)
-      if (k == key) return v;
+      if (k == key) return hide_note(k, v);  // a key in a run from before the bench hid them
     return {};
   }
   // The XEN_ key's value, else its flag's; "" = not known.
@@ -659,7 +659,7 @@ std::string rerun_html(const Run &run, const Settings &s) {
   std::vector<std::string> launcher_env;  // a Bench-tab run (settings_file names its launch.env): XEN_* notes start-server.sh reads
   if (const std::string file = s.note("settings_file"); !file.empty() && file[0] != '(')
     for (const auto &[k, v] : i.notes)
-      if (k.rfind("XEN_", 0) == 0) launcher_env.push_back(k + "=" + shell_word(v));
+      if (k.rfind("XEN_", 0) == 0) launcher_env.push_back(k + "=" + shell_word(hide_note(k, v)));
   if (s.reported) {
     std::vector<std::string> env;
     std::vector<std::string> hidden;  // a key or token the server would not show: left out, the reader sets their own
@@ -680,9 +680,14 @@ std::string rerun_html(const Run &run, const Settings &s) {
     step("Start the server", "Exactly as this run's was started: the server reported its own command line.",
          oneapi + command_lines(env, "build/xenithium-server", i.server_args), about);
   } else if (!launcher_env.empty()) {
-    step("Start the server", "With the launcher settings this run used.", command_lines(launcher_env, "scripts/start-server.sh", {}), wait);
+    step("Start the server", "With the launcher settings this run used.", command_lines(launcher_env, "scripts/start-server.sh", {}),
+         wait + (std::any_of(launcher_env.begin(), launcher_env.end(), [](const std::string &e) { return e.find("(hidden)") != std::string::npos; })
+                     ? std::string(" Where it shows <code>(hidden)</code>, it held a key, token or password: put your own there.")
+                     : std::string()));
   } else if (const std::string cmd = s.note("server_cmd"); !cmd.empty()) {
-    step("Start the server", "With the command line recorded with this run.", oneapi + cmd, wait);
+    step("Start the server", "With the command line recorded with this run.", oneapi + cmd,
+         wait + (cmd.find("(hidden)") != std::string::npos ? std::string(" Where it shows <code>(hidden)</code>, it held a key, token or password: put your own there.")
+                                                           : std::string()));
   } else {
     step("Start the server", "<b>This run did not record how its server was started</b>, so your numbers may differ.",
          xenithium ? oneapi + (files.empty() ? std::string("build/xenithium-server --model /path/to/the/model") : "build/xenithium-server --model " + shell_word(files[0].second)) : "",
