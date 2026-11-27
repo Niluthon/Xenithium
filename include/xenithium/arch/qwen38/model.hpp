@@ -96,8 +96,11 @@ inline constexpr int kPfFetchPer4K = 96;
 // The fetch's buffers per card, layer l's in buffer l % kPfFetchBufs: with three, layer l + 2's fetch starts behind
 // layer l's MoE (its buffer's last reader was layer l - 1's), two layers of compute before its own MoE.
 inline constexpr int kPfFetchBufs = 3;
-inline constexpr int kPfTwoLaneRows = 384;
-inline constexpr int kPfFourLaneRows = 1536;
+// Lane thresholds by a sweep of one call from position 0 (W4A8 experts, the MoE and GDN inputs by owner): one lane
+// up to 639 rows (384 / 448 / 576 rows 78 / 91 / 94 -> 68 / 75 / 89 ms against two lanes; 640 rows: 95 against 87),
+// two up to 2,047 (1,536 rows 172 -> 161 ms against four; 1,024 rows on four 153-155 against 114-116).
+inline constexpr int kPfTwoLaneRows = 640;
+inline constexpr int kPfFourLaneRows = 2048;
 inline constexpr int kPfMoeTwoCallRows = 2560;
 inline constexpr int kPfLaneAlign = 64;
 inline constexpr int kPfLanesMax = 4;  // (a card's split buffers are wired per lane)
