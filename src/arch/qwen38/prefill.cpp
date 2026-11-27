@@ -507,10 +507,10 @@ void Model::pf_lane_wait(int lane) {
   if (spans) R.split_span.push_back(span);
 }
 
-void Model::pf_lane_sum(int lane) {
+bool Model::pf_lane_sum(int lane, k::QuadOwnerSum *into) {
   PfRun &R = *pf_run_;
   PfRun::Lane &ln = R.lanes[static_cast<size_t>(lane)];
-  if (ln.pend_kind < 0) return;
+  if (ln.pend_kind < 0) return false;
   const bool moe = ln.pend_kind == 2;
   const size_t at = static_cast<size_t>(ln.r0) * cfg_.hidden;
   sycl::queue *q[kMaxCards], *side[kMaxCards];
@@ -539,8 +539,13 @@ void Model::pf_lane_sum(int lane) {
     }
   }
   if (spans) R.split_span.push_back(span);
-  k::pair_split_finish(q, side, ln.m, cfg_.hidden, part, out, sp, ln.pend_seq, moe ? add : nullptr, k::SplitRows::owner);
+  if (into) {
+    for (int c = 0; c < nc_; ++c) into[c] = k::pair_split_owner_sum(ln.m, cfg_.hidden, part[c], out[c], sp[c], ln.pend_seq, moe ? &add[c] : nullptr);
+  } else {
+    k::pair_split_finish(q, side, ln.m, cfg_.hidden, part, out, sp, ln.pend_seq, moe ? add : nullptr, k::SplitRows::owner);
+  }
   ln.pend_kind = -1;
+  return true;
 }
 
 void Model::pf_lane_mixers(int layer, PfMixer which) {
@@ -551,16 +556,22 @@ void Model::pf_lane_mixers(int layer, PfMixer which) {
   const bool has_block = !attention || (layer > 0 && layer != ps_.layer);
   const int feature = attention && dflash_ ? df_feat_at_[static_cast<size_t>(layer)] : -1;  // a drafter feature
   auto weights_of = [&](int c) -> const k::HcWeights & { return attention ? hs_.attn[c][layer] : hs_.mlp[c][layer]; };
+  // The block's pending sum (the previous module's: the MoE's into ym, GDN / QSA's into ya) made by the mixer's first
+  // launch, which waits for the other cards' partials itself: two launches less a lane, the same bits.
+  const bool sum_in_mixer = has_block && k::hc_sum_norm_supported(hs_.shape);
   for (int j = 0; j < static_cast<int>(R.lanes.size()); ++j) {
     const PfRun::Lane &ln = R.lanes[static_cast<size_t>(j)];
-    pf_lane_sum(j);
+    k::QuadOwnerSum block_sum[kMaxCards];
+    const bool sum_taken = pf_lane_sum(j, sum_in_mixer ? block_sum : nullptr) && sum_in_mixer;
     sycl::event written[kMaxCards];  // per card: its last kernel that writes the rows shared below
     for (int c = 0; c < nc_; ++c) {
       Card &K = *cards_[static_cast<size_t>(c)];
       const RowRange own = lane_own_rows(c, nc_, ln.r0, ln.m);
       const k::HcState &st = R.cs[static_cast<size_t>(c)];
       const bf16 *block = has_block ? (attention ? K.pf.ym : K.pf.ya) : nullptr;
-      written[c] = k::hc_mixer_rows_part(fab_.compute(c), hs_.shape, own.lo, own.hi, st, block, weights_of(c), K.pf.hc, attention ? K.pf.xa : K.pf.xm).up;
+      written[c] = k::hc_mixer_rows_part(fab_.compute(c), hs_.shape, own.lo, own.hi, st, block, weights_of(c), K.pf.hc, attention ? K.pf.xa : K.pf.xm,
+                                         sum_taken ? &block_sum[c] : nullptr)
+                       .up;
       // the feature = the streams' mean: the card's own rows of the whole mean into pf.ya (free until this layer's
       // GDN / QSA sum), shared below; pf_lane_attention then takes each card's columns of it
       if (feature >= 0)

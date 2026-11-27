@@ -9,6 +9,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 
 #include "comm/mailbox_esimd.hpp"
+#include "comm/split_sum_esimd.hpp"
 
 namespace xenithium::kernels {
 namespace {
@@ -17,6 +18,7 @@ namespace esimd = sycl::ext::intel::esimd;
 using bf16 = sycl::ext::oneapi::bfloat16;
 constexpr int kM = kPairRows;
 constexpr int kCols = 64;  // columns per work-item
+static_assert(kCols == split::kCols, "the split sum's operand width");
 
 template <bool WIRE, bool B16, int COLS, bool QUAD>
 class PairReduceK;
@@ -183,9 +185,7 @@ template <bool ADD, bool B16, int W>
 class QuadSumK;  // the four-card owner sum
 class QuadWaitK;  // the wait for the other cards' flag lines
 constexpr int kSumCols = 256;  // the split sum's columns per item
-// the peer-written split buffers: past L1 (incoherent per core), through L2 like every other peer-copied buffer
-constexpr auto kPeerLd = esimd::properties{esimd::cache_hint_L1<esimd::cache_hint::uncached>, esimd::cache_hint_L2<esimd::cache_hint::cached>,
-                                           esimd::alignment<128>};
+using split::kPeerLd;
 class PairSendBf16K;
 class QuadSendBf16K;
 
@@ -225,27 +225,8 @@ sycl::event flag_wait(sycl::queue &q, const uint32_t *line, uint32_t seq, uint64
 sycl::event flag_wait_others(sycl::queue &q, const uint32_t *base, int card, int cards, uint32_t seq, uint64_t wait_cycles, uint32_t *error,
                              uint64_t *span = nullptr) {
   return q.parallel_for<QuadWaitK>(sycl::range<1>(1), [=](sycl::id<1>) SYCL_ESIMD_KERNEL {
-    const uint64_t t0 = esimd::rdtsc();
-    bool timed_out = false;
-    for (int s = 0; s < cards; ++s) {
-      if (s == card) continue;
-      const uint32_t *line = base + 4 * s;
-      esimd::simd<uint32_t, 4> v = esimd::block_load<uint32_t, 4>(line, mail::kUc);
-      while (v[0] != seq && !timed_out) {
-        esimd::fence<esimd::memory_kind::global, esimd::fence_flush_op::none, esimd::fence_scope::system>();
-        v = esimd::block_load<uint32_t, 4>(line, mail::kUc);
-        if (v[0] != seq && esimd::rdtsc() - t0 > wait_cycles) {
-          error[0] = 1u;
-          timed_out = true;
-        }
-      }
-    }
-    if (span) {
-      esimd::simd<uint64_t, 2> sp;
-      sp[0] = t0;
-      sp[1] = esimd::rdtsc();
-      sp.copy_to(span);
-    }
+    const uint64_t t0 = split::wait_flag_lines(base, card, cards, seq, wait_cycles, error);
+    if (span) split::write_span(span, t0);
   });
 }
 
@@ -398,26 +379,25 @@ sycl::event pair_split_send(sycl::queue &q, sycl::queue *side, int card, int m, 
 }
 
 namespace {
-// One operand of the four-card owner sum: this card's fp32 partial (bf16 wire: rounded to bf16), or a source card's slot
-// (peer-copied: past L1; bf16 wire: packed bf16).
-template <bool B16>
-inline esimd::simd<float, kCols> quad_operand(bool own, const float *a, const float *slot, size_t off) SYCL_ESIMD_FUNCTION {
-  if (own) {
-    const esimd::simd<float, kCols> mine = esimd::block_load<float, kCols>(a + off);
-    if constexpr (B16) {
-      const esimd::simd<bf16, kCols> mb = mine;
-      return esimd::simd<float, kCols>(mb);
-    } else {
-      return mine;
-    }
-  }
-  if constexpr (B16) {
-    const esimd::simd<uint32_t, kCols / 2> got =
-        esimd::block_load<uint32_t, kCols / 2>(reinterpret_cast<const uint32_t *>(reinterpret_cast<const bf16 *>(slot) + off), kPeerLd);
-    return esimd::simd<float, kCols>(mail::unpack_bf16<kCols>(got));
-  } else {
-    return esimd::block_load<float, kCols>(slot + off, kPeerLd);
-  }
+// Card sp.card's operands of the four-card owner sum (no checks: the callers make them).
+QuadOwnerSum owner_sum_of(int m, int n, const float *part, bf16 *out, const PairSplit &sp, uint32_t seq, const PairSplitAdd *add) {
+  int r0 = 0, r1 = 0;
+  pair_split_owner_rows(sp.card, m, &r0, &r1, sp.cards);
+  QuadOwnerSum os;
+  const size_t at = static_cast<size_t>(r0) * n;
+  os.own = part + at;
+  for (int s = 0; s < sp.cards; ++s)  // (bf16 wire: bf16 slots at the same element offsets, as the sender writes them)
+    os.slot[s] = sp.bf16 ? reinterpret_cast<const float *>(reinterpret_cast<const bf16 *>(sp.recv) + quad_slot(sp, s)) : sp.recv + quad_slot(sp, s);
+  os.recv_flags = sp.flags + kPairSplitRecvWord;
+  if (add) os.add_p = add->p + at, os.add_scale = add->scale + r0;
+  os.out = out + at;
+  os.card = sp.card, os.rows = r1 - r0, os.n = n;
+  os.seq = seq;
+  os.bf16 = sp.bf16;
+  os.wait_cycles = sp.wait_cycles;
+  os.error = sp.error;
+  os.wait_span = sp.wait_span;
+  return os;
 }
 
 // pair_split_finish for four cards (PairSplit::cards 4).
@@ -437,14 +417,11 @@ PairSplitEvents quad_split_finish(sycl::queue *const q[], sycl::queue *const sid
     ev.recv[c] = flag_wait_others(*q[c], sp[c].flags + kPairSplitRecvWord, c, C, seq, sp[c].wait_cycles, sp[c].error, sp[c].wait_span);
     sycl::queue &cq = side && side[c] ? *side[c] : *q[c];
     if (rn > 0) {
-      const float *a = part[c] + static_cast<size_t>(r0) * n;
-      const float *b[C];
-      for (int s2 = 0; s2 < C; ++s2)  // (bf16 wire: bf16 slots at the same element offsets, as the sender writes them)
-        b[s2] = sp[c].bf16 ? reinterpret_cast<const float *>(reinterpret_cast<const bf16 *>(sp[c].recv) + quad_slot(sp[c], s2)) : sp[c].recv + quad_slot(sp[c], s2);
-      const float *b0 = b[0], *b1 = b[1], *b2 = b[2], *b3 = b[3];
-      bf16 *o = out[c] + static_cast<size_t>(r0) * n;
-      const float *ap = add ? add[c].p + static_cast<size_t>(r0) * n : nullptr;
-      const float *as = add ? add[c].scale + r0 : nullptr;
+      const QuadOwnerSum os = owner_sum_of(m, n, part[c], out[c], sp[c], seq, add ? &add[c] : nullptr);
+      const float *a = os.own;
+      const float *b0 = os.slot[0], *b1 = os.slot[1], *b2 = os.slot[2], *b3 = os.slot[3];
+      bf16 *o = os.out;
+      const float *ap = os.add_p, *as = os.add_scale;
       const int own = c;
       const uint32_t opaque0 = static_cast<uint32_t>(m < 0);  // 0 (m >= 1): a kernel argument, unknown to the compiler
       // (p0 + p1) + (p2 + p3) per element, the four-card mailbox's order (bf16 wire: each p bf16, the sums fp32)
@@ -458,20 +435,11 @@ PairSplitEvents quad_split_finish(sycl::queue *const q[], sycl::queue *const sid
           const size_t id = it.get_global_id(0);
           const int r = static_cast<int>(id / wch);
           const size_t base = static_cast<size_t>(r) * n + (id % wch) * kW;
+          const float *const b[kWireCardsMax] = {b0, b1, b2, b3};
 #pragma unroll
           for (int p = 0; p < kP; ++p) {
             const size_t off = base + p * kCols;
-            const esimd::simd<float, kCols> x0 = quad_operand<kB16>(own == 0, a, b0, off), x1 = quad_operand<kB16>(own == 1, a, b1, off),
-                                            x2 = quad_operand<kB16>(own == 2, a, b2, off), x3 = quad_operand<kB16>(own == 3, a, b3, off);
-            // the mailbox's order exactly: the build's fast floating point reassociates four register operands (a clang fp
-            // pragma does not stop it), so each pair's sum passes through an XOR with a runtime zero the compiler cannot
-            // see through, then the two are added
-            esimd::simd<float, kCols> acc = mail::opaque<kCols>(x0 + x1, opaque0) + mail::opaque<kCols>(x2 + x3, opaque0);
-            if constexpr (kAdd) {  // bf16(opq(p x scale) + opq(sum)): moe_rows' four-card combine writes the same
-              const esimd::simd<float, kCols> pv = esimd::block_load<float, kCols>(ap + off);
-              acc = mail::opaque<kCols>(pv * as[r], opaque0) + mail::opaque<kCols>(acc, opaque0);
-            }
-            const esimd::simd<bf16, kCols> v = acc;
+            const esimd::simd<bf16, kCols> v = split::owner_value<kAdd, kB16>(own, a, b, ap, kAdd ? as[r] : 0.f, off, opaque0);
             v.copy_to(o + off);
           }
         });
@@ -503,6 +471,17 @@ PairSplitEvents quad_split_finish(sycl::queue *const q[], sycl::queue *const sid
   return ev;
 }
 }  // namespace
+
+QuadOwnerSum pair_split_owner_sum(int m, int n, const float *part, bf16 *out, const PairSplit &sp, uint32_t seq, const PairSplitAdd *add) {
+  check_split(m, n, sp);
+  if (sp.cards != kWireCardsMax) throw std::invalid_argument("pair_split_owner_sum: four cards");
+  if (seq == 0 || seq >= kPairSplitSeqs) throw std::invalid_argument("pair_split_owner_sum: seq");
+  if (!part || !out || !sp.recv || !sp.flags || !sp.error || (add && (!add->p || !add->scale)))
+    throw std::invalid_argument("pair_split_owner_sum: the partial, out, recv, flags, error word and the add term's buffers");
+  if (reinterpret_cast<uintptr_t>(sp.flags + kPairSplitRecvWord) % 64)  // a consumer polls the four lines in one load
+    throw std::invalid_argument("pair_split_owner_sum: the recv flag lines must start a 64-byte line");
+  return owner_sum_of(m, n, part, out, sp, seq, add);
+}
 
 PairSplitEvents pair_split_finish(sycl::queue *const q[2], sycl::queue *const side[2], int m, int n, const float *const part[2], bf16 *const out[2], const PairSplit sp[2],
                                   uint32_t seq, const PairSplitAdd *add, SplitRows rows) {

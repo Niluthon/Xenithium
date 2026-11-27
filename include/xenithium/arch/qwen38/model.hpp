@@ -55,6 +55,9 @@
 namespace xenithium::arch {
 class VisionStore;
 }
+namespace xenithium::kernels {
+struct QuadOwnerSum;
+}
 
 namespace xenithium::arch::qwen38 {
 
@@ -872,7 +875,9 @@ class Model {
   void pf_lane_mixers(int layer, PfMixer which); // per lane: its pending sum, the mixer on each card's own rows, the output shared
   void pf_lane_attention(int lane, int layer);   // GDN or QSA over the lane's rows; its sum stays pending
   void pf_lanes_moe(int lane0, int count, int layer);  // one MoE call over `count` lanes' rows; each lane's sum stays pending
-  void pf_lane_sum(int lane);                    // the lane's pending sum, each card's own rows
+  // The lane's pending sum, each card's own rows (false: none pending). into null: its two launches a card
+  // (pair_split_finish); else into[c] = card c's sum for the next mixer's first launch to wait for and make itself.
+  bool pf_lane_sum(int lane, kernels::QuadOwnerSum *into = nullptr);
   // The MoE input by owner (PfRun::moe_routed): card c's routing and int8 rows [lo, hi) of the MLP mixer's output, and the
   // buffers its share copies instead of the bf16 rows.
   sycl::event pf_moe_route_own(int c, int lo, int hi, int layer);

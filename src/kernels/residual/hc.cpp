@@ -170,7 +170,7 @@ sycl::event hc_gate_mix16(sycl::queue &q, const HcShape &s, int rows, const hc_b
 }  // namespace
 
 HcEvents hc_mixer_rows_part(sycl::queue &q, const HcShape &s, int r0, int r1, const HcState &st, const hc_bf16 *block, const HcWeights &w,
-                            const HcRowsScratch &sc, hc_bf16 *out) {
+                            const HcRowsScratch &sc, hc_bf16 *out, const QuadOwnerSum *block_sum) {
   if (w.down.k != s.width() || w.down.n < s.lowrank || w.up.n != s.width() || w.up.k != s.lowrank)
     throw std::invalid_argument("hc_mixer_rows: weight shapes do not match the mixer");
   if (block && st.lora_ld < s.lowrank + s.streams) throw std::invalid_argument("hc_mixer_rows: no injection logits pending for the combine");
@@ -183,7 +183,12 @@ HcEvents hc_mixer_rows_part(sycl::queue &q, const HcShape &s, int r0, int r1, co
   float *lora = st.lora[st.lcur ^ 1] + static_cast<size_t>(r0) * dn;
   hc_bf16 *res = st.res[st.cur] + static_cast<size_t>(r0) * W;
   const hc_bf16 *blk = block ? block + static_cast<size_t>(r0) * H : nullptr;
-  e.norm = hc_combine_norm_fast(q, s, m, res, blk, inj, st.lora_ld, s.lowrank, w.norm, sc.xn);
+  if (block_sum) {
+    if (!blk || block_sum->out != blk || block_sum->rows != m) throw std::invalid_argument("hc_mixer_rows: the pending sum is not block's rows [r0, r1)");
+    e.norm = hc_sum_combine_norm(q, s, *block_sum, res, inj, st.lora_ld, s.lowrank, w.norm, sc.xn);
+  } else {
+    e.norm = hc_combine_norm_fast(q, s, m, res, blk, inj, st.lora_ld, s.lowrank, w.norm, sc.xn);
+  }
   const int groups = (w.down.k + 127) / 128;
   const int ks = std::min(kHcDownKs, groups);  // by shape, never by rows: any row split keeps every bit
   pf_dense_splitk(q, m, w.down, sc.xn, W, sc.part, dn, ks, 0, sc.a8.on());

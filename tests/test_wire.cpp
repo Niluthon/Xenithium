@@ -1,5 +1,6 @@
 // The two-card sums' bits on both cards for every row count and slot width.
-// The four-card forms (test_quad: the mailbox; test_quad_split: the split sum) when four cards are visible.
+// The four-card forms (test_quad: the mailbox; test_quad_split: the split sum; test_quad_sum_norm: a pending owner sum
+// taken into the HC mixer's combine + norm) when four cards are visible.
 // pair_reduce (1-8 rows) and pair_reduce_rows (9-63 rows) on the fp32 and bf16 wires, n 2,560 / 5,120 / 1,152 (the
 // widths pair_cols picks, including a halved one), several calls back to back alternating the parity with new data each
 // call: out == the host's bf16(p0 + p1) (fp32 wire) or bf16(bf16(p0) + bf16(p1)) (bf16 wire) on both cards, no timeout.
@@ -16,6 +17,7 @@
 #include <sycl/sycl.hpp>
 
 #include "xenithium/kernels/comm/wire.hpp"
+#include "xenithium/kernels/residual/hc.hpp"
 #include "xenithium/rt/fabric.hpp"
 
 namespace k = xenithium::kernels;
@@ -264,6 +266,161 @@ static void test_quad_split(const xenithium::l0::Loader &loader) {
                                                         (touched ? " (an owner-only sum wrote " + std::to_string(touched) + " words of other owners' rows)" : "") +
                                                         (e ? " TIMEOUT" : ""));
         }
+  for (int c = 0; c < kC; ++c) {
+    f.compute(c).wait();
+    side[static_cast<size_t>(c)].wait();
+  }
+}
+
+// A pending four-card owner sum taken into the HC mixer's first launch (hc_sum_combine_norm) against the two-step form
+// it replaces (pair_split_finish with SplitRows::owner, then hc_combine_norm_fast on the card's own rows): on every
+// card the sum's own rows, the combined residual and the normalised streams byte-equal, the other rows of the sum
+// untouched (a sentinel), no timeout. The fp32, bf16 and fp32 + shared-term sums; owner row counts equal and unequal.
+// The last card's partials leave only after the other cards' consumers are queued, so their in-kernel waits spin.
+static void test_quad_sum_norm(const xenithium::l0::Loader &loader) {
+  constexpr int kC = 4, kRowsMax = 1040, kH = 2560, kS = 4, kW = kS * kH, kLora = 352, kInjCol = 320;
+  const k::HcShape hs{kS, kH, kInjCol, 1e-6f};
+  xenithium::Fabric f(loader, {0, 1, 2, 3}, false);
+  float *part[kC], *addp[kC], *adds[kC], *inj[kC];
+  bf16 *out[kC], *res[kC], *xn[kC], *normw[kC];
+  k::PairSplit sp[kC];
+  std::vector<sycl::queue> side;
+  for (int c = 0; c < kC; ++c) side.emplace_back(f.card_context(c), f.device(c), xenithium::Fabric::queue_props(false));
+  for (int c = 0; c < kC; ++c) {
+    auto &q = f.compute(c);
+    part[c] = static_cast<float *>(f.alloc(c, size_t(kRowsMax) * kH * 4));
+    addp[c] = static_cast<float *>(f.alloc(c, size_t(kRowsMax) * kH * 4));
+    adds[c] = static_cast<float *>(f.alloc(c, size_t(kRowsMax) * 4));
+    inj[c] = static_cast<float *>(f.alloc(c, size_t(kRowsMax) * kLora * 4));
+    out[c] = static_cast<bf16 *>(f.alloc(c, size_t(kRowsMax) * kH * 2));
+    res[c] = static_cast<bf16 *>(f.alloc(c, size_t(kRowsMax) * kW * 2));
+    xn[c] = static_cast<bf16 *>(f.alloc(c, size_t(kRowsMax) * kW * 2));
+    normw[c] = static_cast<bf16 *>(f.alloc(c, size_t(kW) * 2));
+    k::PairSplit &s = sp[c];
+    s.cards = kC, s.card = c, s.rows_max = kRowsMax, s.n_max = kH;
+    s.recv = static_cast<float *>(f.alloc(c, k::pair_split_recv_elems(kRowsMax, kH, kC) * 4));
+    s.flags = static_cast<uint32_t *>(f.alloc_mailbox(c, k::kPairSplitFlagBytes));
+    q.memset(s.flags, 0, k::kPairSplitFlagBytes).wait();
+    s.error = static_cast<uint32_t *>(f.alloc(c, 4096));
+    q.memset(s.error, 0, 64).wait();
+    s.stage = static_cast<bf16 *>(f.alloc(c, k::pair_split_stage_elems(kRowsMax, kH, kC) * 2));
+    auto *tab = static_cast<uint32_t *>(f.alloc(c, k::kPairSplitSeqTabBytes));
+    k::pair_split_seq_tab_init(q, tab).wait();
+    s.seq_tab = tab;
+  }
+  for (int c = 0; c < kC; ++c)
+    for (int d = 0; d < kC; ++d) sp[c].recv_of[d] = sp[d].recv, sp[c].flags_of[d] = sp[d].flags;
+  std::mt19937 rng(29);
+  std::normal_distribution<float> nd(0.f, 1.f);
+  auto bf16_bits = [&](size_t n, float scale) {
+    std::vector<bf16> v(n);
+    for (auto &x : v) x = bf16(nd(rng) * scale);
+    return v;
+  };
+  {
+    const std::vector<bf16> w = bf16_bits(kW, 0.3f);
+    for (int c = 0; c < kC; ++c) f.compute(c).memcpy(normw[c], w.data(), w.size() * 2).wait();
+  }
+  uint32_t seq = 0;
+  struct Mode {
+    bool b16, add;
+    const char *name;
+  };
+  constexpr uint16_t kPoison = 0x7fc1;
+  for (const Mode md : {Mode{false, false, "fp32"}, Mode{true, false, "bf16"}, Mode{false, true, "fp32 + add"}})
+    for (const int rows : {64, 61, 256, 1031}) {
+      size_t differ = 0, touched = 0;
+      // the same inputs through both forms; per card: the sum's rows, res and xn of the own rows
+      std::vector<uint16_t> got[2][kC][3];
+      std::vector<float> h[kC], ap(size_t(rows) * kH), as(static_cast<size_t>(rows)), lg(size_t(rows) * kLora);
+      for (int c = 0; c < kC; ++c) {
+        h[c].resize(size_t(rows) * kH);
+        for (auto &v : h[c]) v = nd(rng);
+      }
+      for (auto &v : ap) v = nd(rng);
+      for (auto &v : as) v = nd(rng);
+      for (auto &v : lg) v = nd(rng) * 2.f;
+      const std::vector<bf16> r0 = bf16_bits(size_t(rows) * kW, 1.f);
+      for (int form = 0; form < 2; ++form) {
+        const std::vector<uint16_t> poison(size_t(rows) * kH, kPoison);
+        for (int c = 0; c < kC; ++c) {
+          auto &q = f.compute(c);
+          q.memcpy(part[c], h[c].data(), h[c].size() * 4).wait();
+          q.memcpy(addp[c], ap.data(), ap.size() * 4).wait();
+          q.memcpy(adds[c], as.data(), as.size() * 4).wait();
+          q.memcpy(inj[c], lg.data(), lg.size() * 4).wait();
+          q.memcpy(res[c], r0.data(), r0.size() * 2).wait();
+          q.memcpy(out[c], poison.data(), poison.size() * 2).wait();
+        }
+        seq = k::pair_split_next_seq(seq);
+        sycl::queue *qs[kC], *sd[kC];
+        const float *pp[kC];
+        bf16 *oo[kC];
+        k::PairSplit ss[kC];
+        k::PairSplitAdd ad[kC];
+        for (int c = 0; c < kC; ++c) {
+          qs[c] = &f.compute(c), sd[c] = &side[static_cast<size_t>(c)], pp[c] = part[c], oo[c] = out[c];
+          ss[c] = sp[c], ss[c].bf16 = md.b16;
+          ad[c] = k::PairSplitAdd{addp[c], adds[c]};
+        }
+        // the card's own rows of res / inj / xn, at its first own row
+        auto at_own = [&](int c, int *own_rows) {
+          int lo = 0, hi = 0;
+          k::pair_split_owner_rows(c, rows, &lo, &hi, kC);
+          *own_rows = hi - lo;
+          return lo;
+        };
+        if (form == 0) {
+          for (int c = 0; c < kC; ++c) k::pair_split_send(*qs[c], sd[c], c, rows, kH, pp[c], ss[c], seq);
+          k::pair_split_finish(qs, sd, rows, kH, pp, oo, ss, seq, md.add ? ad : nullptr, k::SplitRows::owner);
+          for (int c = 0; c < kC; ++c) {
+            int n_own = 0;
+            const size_t lo = static_cast<size_t>(at_own(c, &n_own));
+            k::hc_combine_norm_fast(*qs[c], hs, n_own, res[c] + lo * kW, out[c] + lo * kH, inj[c] + lo * kLora, kLora, kInjCol, normw[c], xn[c] + lo * kW);
+          }
+        } else {
+          auto consumer = [&](int c) {
+            int n_own = 0;
+            const size_t lo = static_cast<size_t>(at_own(c, &n_own));
+            const k::QuadOwnerSum os = k::pair_split_owner_sum(rows, kH, pp[c], oo[c], ss[c], seq, md.add ? &ad[c] : nullptr);
+            k::hc_sum_combine_norm(*qs[c], hs, os, res[c] + lo * kW, inj[c] + lo * kLora, kLora, kInjCol, normw[c], xn[c] + lo * kW);
+          };
+          // the last card's partials leave after the other cards' consumers are queued: their waits spin in the kernel
+          for (int c = 0; c < kC - 1; ++c) k::pair_split_send(*qs[c], sd[c], c, rows, kH, pp[c], ss[c], seq);
+          for (int c = 0; c < kC - 1; ++c) consumer(c);
+          k::pair_split_send(*qs[kC - 1], sd[kC - 1], kC - 1, rows, kH, pp[kC - 1], ss[kC - 1], seq);
+          consumer(kC - 1);
+        }
+        for (int c = 0; c < kC; ++c) {
+          f.compute(c).wait_and_throw();
+          side[static_cast<size_t>(c)].wait_and_throw();
+          int lo = 0, hi = 0;
+          k::pair_split_owner_rows(c, rows, &lo, &hi, kC);
+          std::vector<uint16_t> o(size_t(rows) * kH), r(size_t(hi - lo) * kW), x(size_t(hi - lo) * kW);
+          f.compute(c).memcpy(o.data(), out[c], o.size() * 2).wait();
+          f.compute(c).memcpy(r.data(), res[c] + size_t(lo) * kW, r.size() * 2).wait();
+          f.compute(c).memcpy(x.data(), xn[c] + size_t(lo) * kW, x.size() * 2).wait();
+          for (int rr = 0; rr < rows; ++rr) {
+            if (rr >= lo && rr < hi) continue;
+            for (int e = 0; e < kH; ++e) touched += o[size_t(rr) * kH + e] != kPoison;
+          }
+          got[form][c][0] = std::move(o), got[form][c][1] = std::move(r), got[form][c][2] = std::move(x);
+        }
+      }
+      for (int c = 0; c < kC; ++c)
+        for (int t = 0; t < 3; ++t)
+          for (size_t e = 0; e < got[0][c][t].size(); ++e) differ += got[0][c][t][e] != got[1][c][t][e];
+      uint32_t e = 0;
+      for (int c = 0; c < kC; ++c) {
+        uint32_t x = 0;
+        f.compute(c).memcpy(&x, sp[c].error, 4).wait();
+        e |= x;
+      }
+      expect(differ == 0 && touched == 0 && e == 0, std::string("hc_sum_combine_norm four cards, ") + md.name + ", " + std::to_string(rows) +
+                                                        " rows: the sum's rows, res and xn == pair_split_finish (owner) + hc_combine_norm_fast" +
+                                                        (differ ? " (" + std::to_string(differ) + " words differ)" : "") +
+                                                        (touched ? " (" + std::to_string(touched) + " words of other owners' rows written)" : "") + (e ? " TIMEOUT" : ""));
+    }
   for (int c = 0; c < kC; ++c) {
     f.compute(c).wait();
     side[static_cast<size_t>(c)].wait();
@@ -580,7 +737,7 @@ int main() {
                                                                     (differ ? " (" + std::to_string(differ) + " words differ between the cards)" : "") +
                                                                     (over ? " (" + std::to_string(over) + " over the bound)" : "") + (e[0] | e[1] ? " TIMEOUT" : ""));
     }
-  if (loader.size() >= 4) test_quad(loader), test_quad_split(loader), test_owner(loader);
+  if (loader.size() >= 4) test_quad(loader), test_quad_split(loader), test_quad_sum_norm(loader), test_owner(loader);
   else std::printf("[SKIP] four-card wires: %zu card(s) visible\n", loader.size());
   std::printf("wire: %d checks, %d failed\n", g_checks, g_fail);
   return g_fail ? 1 : 0;

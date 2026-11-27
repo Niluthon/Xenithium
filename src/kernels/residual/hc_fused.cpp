@@ -9,6 +9,8 @@
 
 #include "xenithium/kernels/residual/hc.hpp"
 
+#include "comm/split_sum_esimd.hpp"
+
 namespace xenithium::kernels {
 namespace {
 
@@ -101,11 +103,60 @@ sycl::event norm_fast(sycl::queue &q, const HcShape &s, int rows, bf16 *res, con
       });
 }
 
+// The combine's scale of stream st's block on a row: 2 sigmoid(bf16(inj_s) / S).
+inline float combine_scale(const float *inj_row, int inj_col, int st, int S) SYCL_ESIMD_FUNCTION {
+  const float l = static_cast<float>(bf16(inj_row[inj_col + st]));
+  esimd::simd<float, 1> lv(l / static_cast<float>(S));
+  return 2.f * static_cast<float>(sigmoid_v<1>(lv)[0]);
+}
+
+// norm_reg's body for one item: PER values of one (row, stream) at res + base (and xn + base), the stream's norm
+// weights at w_st. block_chunk(j) gives the block's j-th kNormChunk values of the item's part (COMBINE only). The
+// kNormParts items of the stream store their partial sums of squares at SLM byte slm_parts + 4 p and every item adds
+// them in part order after a barrier of the whole work-group (all its items must call this).
+template <bool COMBINE, int PER, class BlockChunk>
+inline void norm_part(bf16 *res, size_t base, BlockChunk block_chunk, float m, const bf16 *w_st, uint32_t slm_parts, int p, int H, float eps,
+                      bf16 *xn) SYCL_ESIMD_FUNCTION {
+  static_assert(PER % kNormChunk == 0, "whole chunks per item");
+  constexpr int kCh = PER / kNormChunk;
+  esimd::simd<float, PER> vals;
+  esimd::simd<float, kNormChunk> acc(0.f);
+#pragma unroll
+  for (int j = 0; j < kCh; ++j) {
+    esimd::simd<float, kNormChunk> v = esimd::block_load<bf16, kNormChunk>(res + base + j * kNormChunk);
+    if constexpr (COMBINE) {
+      const esimd::simd<float, kNormChunk> b = block_chunk(j);
+      const esimd::simd<bf16, kNormChunk> r = b * m + v;  // one mad per element, as norm_fast
+      v = r;
+    }
+    vals.template select<kNormChunk, 1>(j * kNormChunk) = v;
+    acc += v * v;
+  }
+  esimd::simd<bf16, PER> wv;
+#pragma unroll
+  for (int j = 0; j < kCh; ++j)
+    wv.template select<kNormChunk, 1>(j * kNormChunk) = esimd::block_load<bf16, kNormChunk>(w_st + p * PER + j * kNormChunk);
+  esimd::slm_block_store<float, 1>(slm_parts + static_cast<uint32_t>(p * sizeof(float)), esimd::simd<float, 1>(esimd::reduce<float>(acc, std::plus<>())));
+  esimd::barrier();
+  const esimd::simd<float, kNormParts> parts = esimd::slm_block_load<float, kNormParts>(slm_parts);
+  float ss = 0.f;
+#pragma unroll
+  for (int i = 0; i < kNormParts; ++i) ss += parts[i];
+  const esimd::simd<float, 1> mean(ss / static_cast<float>(H) + eps);
+  const float rr = esimd::div_ieee(esimd::simd<float, 1>(1.f), esimd::sqrt_ieee(mean))[0];
+#pragma unroll
+  for (int j = 0; j < kCh; ++j) {
+    const esimd::simd<float, kNormChunk> v = vals.template select<kNormChunk, 1>(j * kNormChunk);
+    if constexpr (COMBINE) esimd::block_store<bf16, kNormChunk>(res + base + j * kNormChunk, esimd::simd<bf16, kNormChunk>(v));
+    const esimd::simd<float, kNormChunk> y = v * rr;
+    const esimd::simd<float, kNormChunk> wf = wv.template select<kNormChunk, 1>(j * kNormChunk);
+    esimd::block_store<bf16, kNormChunk>(xn + base + j * kNormChunk, esimd::simd<bf16, kNormChunk>(y * wf + y));  // Gemma (1 + w)
+  }
+}
+
 template <bool COMBINE, int PER>
 sycl::event norm_reg(sycl::queue &q, const HcShape &s, int rows, bf16 *res, const bf16 *block, const float *inj, int inj_ld, int inj_col,
                      const bf16 *w, bf16 *xn) {
-  static_assert(PER % kNormChunk == 0, "whole chunks per item");
-  constexpr int kCh = PER / kNormChunk;
   const int S = s.streams, H = s.hidden;
   const float eps = s.eps;
   return q.parallel_for<HcNormReg<COMBINE, PER>>(
@@ -115,45 +166,66 @@ sycl::event norm_reg(sycl::queue &q, const HcShape &s, int rows, bf16 *res, cons
         const int row = static_cast<int>(it.get_group(0)), st = static_cast<int>(it.get_group(1)), p = static_cast<int>(it.get_local_id(1));
         const size_t base = (static_cast<size_t>(row) * S + st) * H + static_cast<size_t>(p) * PER;
         const size_t bbase = static_cast<size_t>(row) * H + static_cast<size_t>(p) * PER;
-        float m = 0.f;
-        if constexpr (COMBINE) {
-          const float l = static_cast<float>(bf16(inj[static_cast<size_t>(row) * inj_ld + inj_col + st]));
-          esimd::simd<float, 1> lv(l / static_cast<float>(S));
-          m = 2.f * static_cast<float>(sigmoid_v<1>(lv)[0]);
+        const float m = COMBINE ? combine_scale(inj + static_cast<size_t>(row) * inj_ld, inj_col, st, S) : 0.f;
+        auto block_chunk = [&](int j) SYCL_ESIMD_FUNCTION { return esimd::simd<float, kNormChunk>(esimd::block_load<bf16, kNormChunk>(block + bbase + j * kNormChunk)); };
+        norm_part<COMBINE, PER>(res, base, block_chunk, m, w + static_cast<size_t>(st) * H, 0, p, H, eps, xn);
+      });
+}
+
+// ---- the combine + norm whose block is a pending four-card owner sum (hc_sum_combine_norm) ----
+// One work-group per own row: kStreams x kNormParts items. Item 0 waits for the other cards' partials (the flag lines,
+// split::wait_flag_line_quad: every work-group waits for itself), then every item sums its kSumCols-column chunks of the
+// row (split::owner_value: pair_split_finish's arithmetic, the copied rows read past L2), writes them to the sum's rows
+// and to SLM, and after a barrier each (stream, part) item runs norm_reg's body with its block values from SLM.
+constexpr int kSumNormHidden = 2560, kSumNormPer = kSumNormHidden / kNormParts;  // norm_reg's 320 values per item
+constexpr int kSumNormItems = kStreams * kNormParts;
+constexpr int kSumCols = split::kCols, kSumChunks = kSumNormHidden / kSumCols;
+constexpr uint32_t kSumNormBlockBytes = kSumNormHidden * sizeof(bf16);  // SLM: the row's block, then the partials
+static_assert(kSumNormHidden % kSumCols == 0 && kSumNormPer % kNormChunk == 0 && kSumCols % kNormChunk == 0, "whole chunks");
+
+template <bool ADD, bool B16>
+class HcSumNorm;
+
+template <bool ADD, bool B16>
+sycl::event sum_norm(sycl::queue &q, const HcShape &s, const QuadOwnerSum &os, bf16 *res, const float *inj, int inj_ld, int inj_col, const bf16 *w,
+                     bf16 *xn) {
+  constexpr int S = kStreams, H = kSumNormHidden;
+  const float eps = s.eps;
+  const float *own = os.own, *b0 = os.slot[0], *b1 = os.slot[1], *b2 = os.slot[2], *b3 = os.slot[3], *ap = os.add_p, *as = os.add_scale;
+  const uint32_t *flags = os.recv_flags;
+  const int card = os.card;
+  const uint32_t seq = os.seq;
+  const uint64_t wait_cycles = os.wait_cycles;
+  uint32_t *error = os.error;
+  uint64_t *span = os.wait_span;
+  bf16 *out = os.out;
+  const uint32_t zero = static_cast<uint32_t>(os.rows < 0);  // 0: a kernel argument, unknown to the compiler (mail::opaque)
+  return q.parallel_for<HcSumNorm<ADD, B16>>(
+      sycl::nd_range<1>(static_cast<size_t>(os.rows) * kSumNormItems, kSumNormItems), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        esimd::slm_init<kSumNormBlockBytes + kSumNormItems * sizeof(float)>();
+        const int row = static_cast<int>(it.get_group(0)), lid = static_cast<int>(it.get_local_id(0));
+        if (lid == 0) {
+          const uint64_t t0 = split::wait_flag_line_quad(flags, card, seq, wait_cycles, error);
+          if (span && row == 0) split::write_span(span, t0);
         }
-        esimd::simd<float, PER> vals;
-        esimd::simd<float, kNormChunk> acc(0.f);
-#pragma unroll
-        for (int j = 0; j < kCh; ++j) {
-          esimd::simd<float, kNormChunk> v = esimd::block_load<bf16, kNormChunk>(res + base + j * kNormChunk);
-          if constexpr (COMBINE) {
-            const esimd::simd<float, kNormChunk> b = esimd::block_load<bf16, kNormChunk>(block + bbase + j * kNormChunk);
-            const esimd::simd<bf16, kNormChunk> r = b * m + v;  // one mad per element, as norm_fast
-            v = r;
-          }
-          vals.template select<kNormChunk, 1>(j * kNormChunk) = v;
-          acc += v * v;
-        }
-        esimd::simd<bf16, PER> wv;
-#pragma unroll
-        for (int j = 0; j < kCh; ++j)
-          wv.template select<kNormChunk, 1>(j * kNormChunk) = esimd::block_load<bf16, kNormChunk>(w + static_cast<size_t>(st) * H + p * PER + j * kNormChunk);
-        esimd::slm_block_store<float, 1>(static_cast<uint32_t>(p * sizeof(float)), esimd::simd<float, 1>(esimd::reduce<float>(acc, std::plus<>())));
         esimd::barrier();
-        const esimd::simd<float, kNormParts> parts = esimd::slm_block_load<float, kNormParts>(0);
-        float ss = 0.f;
-#pragma unroll
-        for (int i = 0; i < kNormParts; ++i) ss += parts[i];
-        const esimd::simd<float, 1> mean(ss / static_cast<float>(H) + eps);
-        const float rr = esimd::div_ieee(esimd::simd<float, 1>(1.f), esimd::sqrt_ieee(mean))[0];
-#pragma unroll
-        for (int j = 0; j < kCh; ++j) {
-          const esimd::simd<float, kNormChunk> v = vals.template select<kNormChunk, 1>(j * kNormChunk);
-          if constexpr (COMBINE) esimd::block_store<bf16, kNormChunk>(res + base + j * kNormChunk, esimd::simd<bf16, kNormChunk>(v));
-          const esimd::simd<float, kNormChunk> y = v * rr;
-          const esimd::simd<float, kNormChunk> wf = wv.template select<kNormChunk, 1>(j * kNormChunk);
-          esimd::block_store<bf16, kNormChunk>(xn + base + j * kNormChunk, esimd::simd<bf16, kNormChunk>(y * wf + y));  // Gemma (1 + w)
+        const float *const b[kWireCardsMax] = {b0, b1, b2, b3};
+        for (int j = lid; j < kSumChunks; j += kSumNormItems) {
+          const size_t off = static_cast<size_t>(row) * H + static_cast<size_t>(j) * kSumCols;
+          const esimd::simd<bf16, kSumCols> v = split::owner_value<ADD, B16, true>(card, own, b, ap, ADD ? as[row] : 0.f, off, zero);
+          v.copy_to(out + off);
+          esimd::slm_block_store<bf16, kSumCols>(static_cast<uint32_t>(j * kSumCols * sizeof(bf16)), v);
         }
+        esimd::barrier();
+        const int st = lid / kNormParts, p = lid % kNormParts;
+        const size_t base = (static_cast<size_t>(row) * S + st) * H + static_cast<size_t>(p) * kSumNormPer;
+        const float m = combine_scale(inj + static_cast<size_t>(row) * inj_ld, inj_col, st, S);
+        auto block_chunk = [&](int j) SYCL_ESIMD_FUNCTION {
+          const uint32_t at = static_cast<uint32_t>((p * kSumNormPer + j * kNormChunk) * sizeof(bf16));
+          return esimd::simd<float, kNormChunk>(esimd::slm_block_load<bf16, kNormChunk>(at));
+        };
+        norm_part<true, kSumNormPer>(res, base, block_chunk, m, w + static_cast<size_t>(st) * H,
+                                     kSumNormBlockBytes + static_cast<uint32_t>(st * kNormParts * sizeof(float)), p, H, eps, xn);
       });
 }
 
@@ -462,6 +534,21 @@ sycl::event hc_combine_norm_fast(sycl::queue &q, const HcShape &s, int rows, hc_
                  : norm_reg<false, 320>(q, s, rows, res, nullptr, nullptr, 0, 0, norm_w, xn);
   return block ? norm_fast<true>(q, s, rows, res, block, inj, inj_ld, inj_col, norm_w, xn)
                : norm_fast<false>(q, s, rows, res, nullptr, nullptr, 0, 0, norm_w, xn);
+}
+
+bool hc_sum_norm_supported(const HcShape &s) { return s.streams == kStreams && s.hidden == kSumNormHidden; }
+
+sycl::event hc_sum_combine_norm(sycl::queue &q, const HcShape &s, const QuadOwnerSum &sum, hc_bf16 *res, const float *inj, int inj_ld, int inj_col,
+                                const hc_bf16 *norm_w, hc_bf16 *xn) {
+  if (!hc_sum_norm_supported(s) || sum.n != s.hidden) throw std::invalid_argument("hc_sum_combine_norm: 4 streams of 2560, the sum over hidden");
+  if (sum.rows < 1 || !sum.own || !sum.out || !sum.recv_flags || !sum.error || !inj || !res || !norm_w || !xn)
+    throw std::invalid_argument("hc_sum_combine_norm: rows, the sum's buffers, the injection logits, res, the norm weights and xn");
+  for (int c = 0; c < kWireCardsMax; ++c)
+    if (c != sum.card && !sum.slot[c]) throw std::invalid_argument("hc_sum_combine_norm: every source card's slot");
+  const bool add = sum.add_p != nullptr;
+  if (add != (sum.add_scale != nullptr)) throw std::invalid_argument("hc_sum_combine_norm: the shared term's rows and scales together");
+  if (add) return sum.bf16 ? sum_norm<true, true>(q, s, sum, res, inj, inj_ld, inj_col, norm_w, xn) : sum_norm<true, false>(q, s, sum, res, inj, inj_ld, inj_col, norm_w, xn);
+  return sum.bf16 ? sum_norm<false, true>(q, s, sum, res, inj, inj_ld, inj_col, norm_w, xn) : sum_norm<false, false>(q, s, sum, res, inj, inj_ld, inj_col, norm_w, xn);
 }
 
 sycl::event hc_up_mix(sycl::queue &q, const HcShape &s, int rows, const float *lora, int lora_ld, const DenseWeights &up, const hc_bf16 *xn,

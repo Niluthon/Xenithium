@@ -276,6 +276,27 @@ enum class SplitRows : uint8_t {
 PairSplitEvents pair_split_finish(sycl::queue *const q[2], sycl::queue *const side[2], int m, int n, const float *const part[2],
                                   sycl::ext::oneapi::bfloat16 *const out[2], const PairSplit sp[2], uint32_t seq, const PairSplitAdd *add = nullptr,
                                   SplitRows rows = SplitRows::all);
+// One card's four-card sum with SplitRows::owner, resolved for a consumer kernel that runs the wait for the other
+// cards' partials and the sum of its own rows itself (hc_sum_combine_norm), instead of pair_split_finish's two launches
+// (a wait kernel, then the sum kernel). The consumer writes bf16((p0 + p1) + (p2 + p3)) (+ the shared term) into `out`
+// exactly as pair_split_finish does, so the sum's other readers find the same rows.
+struct QuadOwnerSum {
+  const float *own = nullptr;                           // this card's partial at its first own row (row stride n)
+  const float *slot[kWireCardsMax] = {};                // each source card's recv slot at the same row (bf16 wire: bf16)
+  const uint32_t *recv_flags = nullptr;                 // this card's recv flag lines (one per source card)
+  const float *add_p = nullptr, *add_scale = nullptr;  // the shared term at the first own row, or null
+  sycl::ext::oneapi::bfloat16 *out = nullptr;          // the sum at the first own row
+  int card = 0, rows = 0, n = 0;                        // rows: the card's own rows of the m-row sum
+  uint32_t seq = 0;
+  bool bf16 = false;
+  uint64_t wait_cycles = 0;
+  uint32_t *error = nullptr;
+  uint64_t *wait_span = nullptr;  // as PairSplit::wait_span: [0, 1] = the wait for the partials
+};
+// The QuadOwnerSum of card sp.card for the m-row sum pair_split_finish(..., SplitRows::owner) would finish with the
+// same arguments; refuses what that call refuses, and recv flag lines that do not start a 64-byte line.
+QuadOwnerSum pair_split_owner_sum(int m, int n, const float *part, sycl::ext::oneapi::bfloat16 *out, const PairSplit &sp, uint32_t seq,
+                                  const PairSplitAdd *add = nullptr);
 // With SplitRows::deferred, pair_split_finish leaves out's peer rows pending (done[] unset): a
 // card may run its consumer on its own rows (pair_split_owner_rows) first, then must call this on
 // its queue before anything reads the peer's rows. Its event is that card's done.

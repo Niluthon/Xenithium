@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
+#include "xenithium/kernels/comm/wire.hpp"
 #include "xenithium/kernels/gemm/dense.hpp"
 
 namespace xenithium::kernels {
@@ -52,6 +53,13 @@ sycl::event hc_combine_norm_fast(sycl::queue &q, const HcShape &s, int rows, hc_
 // ksplit: work-items per stream sharing the k calls (1, 2 or 4; 0 = the default).
 sycl::event hc_up_mix(sycl::queue &q, const HcShape &s, int rows, const float *lora, int lora_ld, const DenseWeights &up, const hc_bf16 *xn,
                       hc_bf16 *out, int ksplit = 0);
+// hc_combine_norm_fast with a pending block whose rows are still a four-card owner sum (comm/wire.hpp QuadOwnerSum):
+// one launch waits for the other cards' partials, writes the sum's own rows (pair_split_finish's bits; its other readers
+// find them as before) and combines + norms those rows, the same bits as pair_split_finish + hc_combine_norm_fast on
+// res / inj / xn at the sum's first own row. Saves the sum's wait and sum launches. 4 streams of hidden 2560.
+bool hc_sum_norm_supported(const HcShape &s);
+sycl::event hc_sum_combine_norm(sycl::queue &q, const HcShape &s, const QuadOwnerSum &sum, hc_bf16 *res, const float *inj, int inj_ld, int inj_col,
+                                const hc_bf16 *norm_w, hc_bf16 *xn);
 // ---- one whole mixer ------------------------------------------------------------------------
 struct HcWeights {
   const hc_bf16 *norm = nullptr;  // [S * hidden]
@@ -133,8 +141,10 @@ HcEvents hc_mixer_rows(sycl::queue &q, const HcShape &s, int m, HcState &st, con
 // chunk's buffers (res, lora, block, out at row r0; the scratch from its start, so parts must run in
 // order on one queue) and leaves st as it is; after the last part, hc_mixer_rows_flip(st, w) once.
 // Use: start on the rows a card already holds while the peer's rows of `block` still arrive.
+// block_sum: null, or the pending owner sum that writes block's rows [r0, r1) (its out at block + r0 x hidden, its rows
+// r1 - r0): the first launch is then hc_sum_combine_norm (hc_sum_norm_supported shapes), the same bits.
 HcEvents hc_mixer_rows_part(sycl::queue &q, const HcShape &s, int r0, int r1, const HcState &st, const hc_bf16 *block, const HcWeights &w,
-                            const HcRowsScratch &sc, hc_bf16 *out);
+                            const HcRowsScratch &sc, hc_bf16 *out, const QuadOwnerSum *block_sum = nullptr);
 void hc_mixer_rows_flip(HcState &st, const HcWeights &w);
 
 // ---- host reference ------------------------------------------------------------------------
