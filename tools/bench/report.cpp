@@ -389,18 +389,19 @@ RunPower run_power_from(const json::Value &obj) {
                              .reads_temp = flag_at(card, "reads_temp"), .reads_throttle = flag_at(card, "reads_throttle")});
   power.idle_watts = number_at(obj, "idle_watts");
   constexpr size_t kTraceHead = 2;  // seconds and clock come before the cards' watts
+  // trace_temp_c and trace_throttle hold one entry per trace row: taken by the row's own index, so a row skipped as
+  // malformed does not shift the later ones onto the wrong points
+  const json::Value *temps = obj.get_array("trace_temp_c"), *throttles = obj.get_array("trace_throttle");
   if (const json::Value *trace = obj.get_array("trace"))
-    for (const json::Value &row : trace->arr) {
+    for (size_t r = 0; r < trace->arr.size(); ++r) {
+      const json::Value &row = trace->arr[r];
       if (row.arr.size() < kTraceHead) continue;
       PowerPoint point{.at_s = row.arr[0].num, .watts = {}, .mhz = row.arr[1].num};
       for (size_t i = kTraceHead; i < row.arr.size(); ++i) point.watts.push_back(row.arr[i].num);
+      if (temps && r < temps->arr.size() && temps->arr[r].is_number()) point.temp_c = temps->arr[r].num;
+      if (throttles && r < throttles->arr.size() && throttles->arr[r].is_string()) point.throttle = throttles->arr[r].str;
       power.trace.push_back(std::move(point));
     }
-  const json::Value *temps = obj.get_array("trace_temp_c"), *throttles = obj.get_array("trace_throttle");
-  for (size_t p = 0; p < power.trace.size(); ++p) {
-    if (temps && p < temps->arr.size() && temps->arr[p].is_number()) power.trace[p].temp_c = temps->arr[p].num;
-    if (throttles && p < throttles->arr.size() && throttles->arr[p].is_string()) power.trace[p].throttle = throttles->arr[p].str;
-  }
   return power;
 }
 

@@ -672,8 +672,11 @@ std::string rerun_html(const Run &run, const Settings &s) {
       for (const std::string &h : hidden) names += (names.empty() ? "" : ", ") + code(h);
       about += " Left out: " + names + ", which held a key or token (hidden by the server): set your own if your setup needs it.";
     }
-    if (std::find(i.server_args.begin(), i.server_args.end(), "(hidden)") != i.server_args.end())
-      about += " A flag's value shows <code>(hidden)</code>: it was a key or token, put your own there.";
+    // any (hidden) left in the command: a flag's value (--key V, --key=V) or part of one (a URL's password)
+    auto has_hidden = [](const std::string &text) { return text.find("(hidden)") != std::string::npos; };
+    const bool hidden_left = std::any_of(i.server_args.begin(), i.server_args.end(), has_hidden) ||
+                             std::any_of(env.begin(), env.end(), has_hidden);
+    if (hidden_left) about += " Where the command shows <code>(hidden)</code>, it held a key, token or password: put your own there.";
     step("Start the server", "Exactly as this run's was started: the server reported its own command line.",
          oneapi + command_lines(env, "build/xenithium-server", i.server_args), about);
   } else if (!launcher_env.empty()) {

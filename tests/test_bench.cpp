@@ -495,7 +495,7 @@ void test_report() {
     reported.info.engine = "xenithium", reported.info.engine_build = "abc1234-dirty", reported.info.engine_oneapi = "2025.3.0", reported.info.engine_drafter = "dspine";
     reported.info.notes = {{"XEN_KV", "bf16"}};  // the launcher said otherwise: the server's own report wins
     reported.info.server_args = {"--model", "/m/ckpt-w4", "--kv", "int8-v4", "--chat-template", "a b"};
-    reported.info.server_env = {{"XEN_BENCH_API_KEY", "(hidden)"}, {"XEN_QSA_GATHER", "1"}};
+    reported.info.server_env = {{"XEN_BENCH_API_KEY", "(hidden)"}, {"XEN_HTTP_PROXY", "http://u:(hidden)@h:1"}, {"XEN_QSA_GATHER", "1"}};
     reported.info.command = {"--url", "http://x:8000/v1", "--suite", "quick", "--out", "/srv/mine/runs", "--api-key", "(hidden)"};
     reported.info.devices[0].driver = "1.17.39395+16";
     const auto reported_back = b::run_from_json(b::to_json(reported), err);
@@ -520,7 +520,8 @@ void test_report() {
               rerun.find("<dt>XEN_QSA_GATHER</dt><dd>1</dd>") != std::string::npos && rerun.find("XEN_BENCH_API_KEY=") == std::string::npos &&
               rerun.find("Left out: <code>XEN_BENCH_API_KEY</code>, which held a key or token") != std::string::npos &&
               rerun.find("/srv/mine/runs") == std::string::npos && rerun.find("your results go to <code>~/.xenithium/bench/runs</code>") != std::string::npos &&
-              rerun.find("add <code>--api-key YOUR_KEY</code>") != std::string::npos,
+              rerun.find("add <code>--api-key YOUR_KEY</code>") != std::string::npos &&
+              rerun.find("Where the command shows <code>(hidden)</code>") != std::string::npos,
           "html report: run this yourself - clone at the run's revision (dirty flagged), install, build, the model files and a check, the server as it "
           "reported its launch (quoted where needed), the "
           "benchmark as typed; the engine row names the build and oneAPI, the speculation row the reported drafter, the hardware row the driver and where the "
@@ -538,6 +539,17 @@ void test_report() {
               measured_back->info.bench_machine.kernel == "7.1.0" && measured_back->info.power->cards[0].max_mhz == 2800 && measured_back->info.power->cards[1].reads_throttle &&
               measured_back->info.power->trace[2].temp_c == 80 && measured_back->info.power->trace[2].throttle == "pl1 thermal" && measured_back->info.power->trace[0].throttle.empty(),
           "run file: both machines, the cards' max clock and sensors, and each point's temperature and throttle reasons survive the round trip");
+    {  // the first trace row damaged (one number): it is skipped, and the later points keep their own temperature and reasons
+      std::string text = b::to_json(measured);
+      const size_t trace = text.find("\"trace\": [");
+      const size_t open = text.find('[', trace + 10), close = text.find(']', open + 1);
+      CHECK(trace != std::string::npos && open != std::string::npos && close != std::string::npos, "run file: the test finds the trace's first row");
+      text.replace(open + 1, close - open - 1, "1");
+      const auto damaged = b::run_from_json(text, err);
+      CHECK(damaged && damaged->info.power->trace.size() == measured.info.power->trace.size() - 1 && damaged->info.power->trace[0].temp_c == 70 &&
+                damaged->info.power->trace[0].throttle == "pl1" && damaged->info.power->trace[1].temp_c == 80 && damaged->info.power->trace[1].throttle == "pl1 thermal",
+            "run file: a malformed trace row is skipped without shifting the later points' temperature and throttle reasons");
+    }
     const std::string hw = b::render_html(measured);
     CHECK(hw.find("<dt>machine</dt><dd><ul class=\"chips\"><li>Ubuntu 26.04.1 LTS</li><li>kernel 7.0.0-43-generic</li><li>AMD EPYC 7282 16-Core Processor (16 threads)</li><li>46 GiB RAM</li>") !=
                   std::string::npos &&

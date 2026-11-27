@@ -89,8 +89,11 @@ std::unique_ptr<PowerMeter> PowerMeter::open(const std::string &drm_root) {
       if (f.clock_path.empty() && fs::exists(card / clock, ec)) f.clock_path = (card / clock).string();
     if (fs::exists(card / kThrottleFile, ec)) f.throttle_path = (card / kThrottleFile).string();
     double max_mhz = 0;
-    for (const char *max : kMaxClockFiles)
-      if (max_mhz == 0) max_mhz = static_cast<double>(read_number((card / max).string()).value_or(0));
+    for (const char *max : kMaxClockFiles)  // the first that exists, like the clock: a 0 there is "not known", not "next"
+      if (fs::exists(card / max, ec)) {
+        max_mhz = static_cast<double>(read_number((card / max).string()).value_or(0));
+        break;
+      }
     cards.push_back({.name = name, .cap_watts = static_cast<double>(read_number(hwmon + "/power1_cap").value_or(0)) * kMicro, .max_mhz = max_mhz,
                      .reads_temp = !f.temp_path.empty(), .reads_throttle = !f.throttle_path.empty()});
     files.push_back(std::move(f));
