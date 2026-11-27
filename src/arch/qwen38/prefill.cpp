@@ -473,7 +473,7 @@ Model::PfShared Model::pf_shared(BufOf buf_of, size_t row_bytes) {
   return set;
 }
 
-void Model::pf_lane_share(int lane, std::span<const PfShared> sets, std::span<const sycl::event> written) {
+void Model::pf_lane_share(int lane, std::span<const PfShared> sets, std::span<const sycl::event> written, int tail) {
   PfRun::Lane &ln = pf_run_->lanes[static_cast<size_t>(lane)];
   std::vector<PfShared> at_lane(sets.begin(), sets.end());  // the lane's rows of each buffer
   std::vector<k::SplitShare> shares;
@@ -485,7 +485,7 @@ void Model::pf_lane_share(int lane, std::span<const PfShared> sets, std::span<co
   for (int c = 0; c < nc_; ++c) {
     Card &K = *cards_[static_cast<size_t>(c)];
     const sycl::event *after = written.empty() ? nullptr : &written[static_cast<size_t>(c)];
-    k::pair_split_share(fab_.compute(c), &*K.pf.side, c, ln.m, shares, K.pf.lane[lane], ln.share_seq, after);
+    k::pair_split_share(fab_.compute(c), &*K.pf.side, c, ln.m, shares, K.pf.lane[lane], ln.share_seq, after, tail);
   }
 }
 
@@ -776,21 +776,48 @@ void Model::pf_lanes_moe(int lane0, int count, int layer) {
   pf_moe_parity_ ^= 1;
 }
 
+// Each owner range (>= kPfOwnerMinRows / kMaxCards rows) holds a neighbour's conv window and, the last one, the ring's rows.
+static_assert(k::kPleRing >= k::kPleDil * (k::kPleTaps - 1) && k::kPleRing * kMaxCards <= kPfOwnerMinRows, "PLE tail rows by owner");
+
 void Model::pf_owner_ple(int layer) {
   PfRun &R = *pf_run_;
-  // The block's conv reads the rows before a row (gated by their residual streams) and leaves its history in the slot's
-  // ring on every card: every card needs every row's streams here. Before the first layer they are the embeddings
-  // (every card has them); later the owners share the chunk's state first.
-  if (layer > 0) pf_owner_state();
+  // Each row on its owner, as the mixers: the pending combine and the block's kv GEMM and gate on the card's own rows
+  // (the rows' residual streams live there), then each owner's last rows of conv inputs to every card (a row's conv
+  // reads the 9 inputs before it, and the ring takes the chunk's last kPleRing), then the conv on the own rows. The same
+  // bits as the block on every row: each row's arithmetic is its own (the kv GEMM's rows do not depend on the call).
+  const int lanes = static_cast<int>(R.lanes.size());
+  if (layer > 0)
+    for (int j = 0; j < lanes; ++j) pf_lane_sum(j);
   pf_ple_rows();
+  const bf16 *emb = reinterpret_cast<const bf16 *>(pf_ple_);
+  const int C = ps_.shape.width();
+  for (int j = 0; j < lanes; ++j) {
+    const PfRun::Lane &ln = R.lanes[static_cast<size_t>(j)];
+    sycl::event gated[kMaxCards];
+    for (int c = 0; c < nc_; ++c) {
+      auto &q = fab_.compute(c);
+      Card &K = *cards_[static_cast<size_t>(c)];
+      const RowRange own = lane_own_rows(c, nc_, ln.r0, ln.m);
+      k::HcState st = R.cs[static_cast<size_t>(c)];  // each lane's rows from the same buffers (the flip after every lane)
+      if (layer > 0) k::hc_combine_at(q, hs_.shape, k::RowRange{own.lo, own.hi}, st, K.pf.ym);
+      gated[c] = k::ple_rows_gate(q, ps_.shape, own.lo, own.hi, emb, ps_.w[c], K.pf.ple, st.residual()).gate;
+    }
+    const PfShared x = pf_shared([](Card &K) { return K.pf.ple.x; }, static_cast<size_t>(C) * sizeof(bf16));
+    pf_lane_share(j, std::span<const PfShared>(&x, 1), std::span<const sycl::event>(gated, static_cast<size_t>(nc_)), k::kPleRing);
+  }
+  if (layer > 0)
+    for (int c = 0; c < nc_; ++c) R.cs[static_cast<size_t>(c)].cur ^= 1;
+  for (int j = 0; j < lanes; ++j) pf_lane_wait(j);
   for (int c = 0; c < nc_; ++c) {
     auto &q = fab_.compute(c);
     Card &K = *cards_[static_cast<size_t>(c)];
-    k::HcState &st = R.cs[static_cast<size_t>(c)];
-    if (layer > 0) k::hc_combine(q, hs_.shape, R.m, st, K.pf.ym);
     k::PleState ps = K.ple_st;
     ps.ring += static_cast<size_t>(R.slot) * ps.slot_elems;
-    k::ple_rows(q, ps_.shape, R.m, R.pos0, reinterpret_cast<const bf16 *>(pf_ple_), ps_.w[c], ps, K.pf.ple, st.residual());
+    for (int j = 0; j < lanes; ++j) {
+      const PfRun::Lane &ln = R.lanes[static_cast<size_t>(j)];
+      const RowRange own = lane_own_rows(c, nc_, ln.r0, ln.m);
+      k::ple_rows_conv(q, ps_.shape, own.lo, own.hi, R.m, R.pos0, ps_.w[c], ps, K.pf.ple, R.cs[static_cast<size_t>(c)].residual(), j == lanes - 1);
+    }
   }
   pf_mark(1);
 }

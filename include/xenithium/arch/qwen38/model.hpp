@@ -866,9 +866,9 @@ class Model {
   PfShared pf_shared(BufOf buf_of, size_t row_bytes);  // buf_of(Card &) = that card's buffer
   int pf_lane_count(int m) const;                // the lanes of a call of m rows; 0 = not by owner
   void pf_layers_owner(int count);
-  void pf_owner_ple(int layer);                  // the PLE layer's block, on every row on every card
+  void pf_owner_ple(int layer);                  // the PLE layer's block, each row on its owner
   void pf_ple_rows();                            // the pending call's PLE rows on the host, once (as the PLE layer is next)
-  void pf_owner_state();                         // every card gets every row of the chunk's state (the PLE block, the call's end)
+  void pf_owner_state();                         // every card gets every row of the chunk's state (the call's end)
   void pf_lane_mixers(int layer, PfMixer which); // per lane: its pending sum, the mixer on each card's own rows, the output shared
   void pf_lane_attention(int lane, int layer);   // GDN or QSA over the lane's rows; its sum stays pending
   void pf_lanes_moe(int lane0, int count, int layer);  // one MoE call over `count` lanes' rows; each lane's sum stays pending
@@ -885,7 +885,7 @@ class Model {
   void pf_gdn_owner_init();
   // each card's own rows of the lane to the other cards; written: per card the event of its last kernel that writes them
   // (empty = the copies follow everything on the card's queue so far)
-  void pf_lane_share(int lane, std::span<const PfShared> sets, std::span<const sycl::event> written = {});
+  void pf_lane_share(int lane, std::span<const PfShared> sets, std::span<const sycl::event> written = {}, int tail = 0);
   void pf_lane_wait(int lane);                   // each card waits for the other owners' rows of the lane's last share
   template <class PartOf, class OutOf>
   void pf_split_sum(PartOf part_of, OutOf out_of, bool add, int kind, const sycl::event *sent = nullptr);  // prefill.cpp

@@ -110,5 +110,15 @@ struct PleRowsScratch {
 // from it, so one recorded launch serves every position and slot. The same bits.
 PleEvents ple_rows(sycl::queue &q, const PleShape &s, int m, int64_t pos0, const ple_bf16 *emb_host, const PleWeights &w, const PleState &st,
                    const PleRowsScratch &sc, ple_bf16 *res, const int32_t *rec = nullptr);
+// ple_rows in two parts on the chunk's rows [lo, hi) (rows by owner: a card runs its own rows; the scratch and res rows
+// at their places in the chunk, the same bits as ple_rows' rows). ple_rows_gate: the rows' host rows up, the kv GEMM, the
+// gate (conv inputs into sc.x). ple_rows_conv: the conv of rows [lo, hi), which reads the kPleDil * (kPleTaps - 1) = 9
+// conv inputs before each row (sc.x rows of the chunk, or the ring before pos0): rows another card gated must be in this
+// card's sc.x first. ring_tail: then the chunk's last kPleRing rows of sc.x (all present) into the ring (ev.kv: that
+// launch). m: the chunk's rows.
+PleEvents ple_rows_gate(sycl::queue &q, const PleShape &s, int lo, int hi, const ple_bf16 *emb_host, const PleWeights &w, const PleRowsScratch &sc,
+                        const ple_bf16 *res);
+PleEvents ple_rows_conv(sycl::queue &q, const PleShape &s, int lo, int hi, int m, int64_t pos0, const PleWeights &w, const PleState &st,
+                        const PleRowsScratch &sc, ple_bf16 *res, bool ring_tail, const int32_t *rec = nullptr);
 
 }  // namespace xenithium::kernels

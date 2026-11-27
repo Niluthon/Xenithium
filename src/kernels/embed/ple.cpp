@@ -200,25 +200,26 @@ PleEvents ple_decode(sycl::queue &q, const PleShape &s, int rows, const ple_bf16
   return ev;
 }
 
-PleEvents ple_rows(sycl::queue &q, const PleShape &s, int m, int64_t pos0, const ple_bf16 *emb_host, const PleWeights &w, const PleState &st,
-                   const PleRowsScratch &sc, ple_bf16 *res, const int32_t *rec) {
+PleEvents ple_rows_gate(sycl::queue &q, const PleShape &s, int lo, int hi, const ple_bf16 *emb_host, const PleWeights &w, const PleRowsScratch &sc,
+                        const ple_bf16 *res) {
   const int S = s.streams, H = s.hidden, C = s.width(), KV = s.kv_n();
-  const int gate_n = gate_items(H);
-  if (m < 1 || !gate_n) throw std::invalid_argument("ple_rows: rows / hidden");
-  if (!w.kv.valid() || w.kv.n < KV || w.kv.k != s.emb) throw std::invalid_argument("ple_rows: kv weights do not match the shape");
+  const int gate_n = gate_items(H), m = hi - lo;
+  if (lo < 0 || m < 1 || !gate_n) throw std::invalid_argument("ple_rows_gate: rows / hidden");
+  if (!w.kv.valid() || w.kv.n < KV || w.kv.k != s.emb) throw std::invalid_argument("ple_rows_gate: kv weights do not match the shape");
   PleEvents ev;
-  ev.up = q.memcpy(sc.emb, emb_host, static_cast<size_t>(m) * s.emb * sizeof(ple_bf16));
-  ev.kv = pf_dense(q, m, w.kv, sc.emb, s.emb, PfOut{sc.kv, nullptr, w.kv.n}, sc.a8.on());
+  const size_t emb_at = static_cast<size_t>(lo) * s.emb;
+  ev.up = q.memcpy(sc.emb + emb_at, emb_host + emb_at, static_cast<size_t>(m) * s.emb * sizeof(ple_bf16));
   const int kv_ld = w.kv.n;
+  // a W8A8 row's result does not depend on the call around it (pf_dense.hpp), nor a W8A16 one's: the rows' bits as one call
+  ev.kv = pf_dense(q, m, w.kv, sc.emb + emb_at, s.emb, PfOut{sc.kv + static_cast<size_t>(lo) * kv_ld, nullptr, w.kv.n}, sc.a8.on());
   const float eps = s.eps, inv_sqrt_h = 1.f / sycl::sqrt(static_cast<float>(H));
-  const ple_bf16 *nk = w.nk, *nq = w.nq, *ncw = w.ncw, *cw = w.conv;
+  const ple_bf16 *nk = w.nk, *nq = w.nq, *ncw = w.ncw;
   const float *kv = sc.kv;
-  ple_bf16 *gated = sc.gated, *xs = sc.x, *ring0 = st.ring;
-  const size_t slot_elems = st.slot_elems;
+  ple_bf16 *gated = sc.gated, *xs = sc.x;
   // The gate: decode's arithmetic, conv inputs into the chunk buffer.
   ev.gate = q.parallel_for<PleGate<true>>(
       sycl::nd_range<1>(static_cast<size_t>(m) * S * gate_n, gate_n), [=](sycl::nd_item<1> it) {
-        const int g = static_cast<int>(it.get_group(0)), row = g / S, st_ = g % S, lid = static_cast<int>(it.get_local_id(0));
+        const int g = static_cast<int>(it.get_group(0)), row = lo + g / S, st_ = g % S, lid = static_cast<int>(it.get_local_id(0));
         const int per = H / gate_n;
         const float *krow = kv + static_cast<size_t>(row) * kv_ld + static_cast<size_t>(st_) * H;
         const float *vrow = kv + static_cast<size_t>(row) * kv_ld + C;
@@ -270,7 +271,18 @@ PleEvents ple_rows(sycl::queue &q, const PleShape &s, int m, int64_t pos0, const
             xrow[i] = ple_bf16(gv[j] * rg * (1.f + static_cast<float>(ncw[st_ * H + i])));
           }
       });
-  const size_t items = static_cast<size_t>(m) * C;
+  return ev;
+}
+
+PleEvents ple_rows_conv(sycl::queue &q, const PleShape &s, int lo, int hi, int m, int64_t pos0, const PleWeights &w, const PleState &st,
+                        const PleRowsScratch &sc, ple_bf16 *res, bool ring_tail, const int32_t *rec) {
+  const int C = s.width();
+  if (lo < 0 || hi <= lo || hi > m) throw std::invalid_argument("ple_rows_conv: rows");
+  PleEvents ev;
+  const ple_bf16 *cw = w.conv, *xs = sc.x, *gated = sc.gated;
+  ple_bf16 *ring0 = st.ring;
+  const size_t slot_elems = st.slot_elems;
+  const size_t items = static_cast<size_t>(hi - lo) * C;
   const int64_t host_p0 = pos0;
   ev.conv = q.parallel_for<PleConvRows>(
       sycl::nd_range<1>((items + kConvItems - 1) / kConvItems * kConvItems, kConvItems), [=](sycl::nd_item<1> it) {
@@ -278,7 +290,7 @@ PleEvents ple_rows(sycl::queue &q, const PleShape &s, int m, int64_t pos0, const
         if (gi >= items) return;
         const int64_t p0 = rec ? static_cast<int64_t>(rec[kSegPos]) : host_p0;
         const ple_bf16 *ring = rec ? ring0 + static_cast<size_t>(rec[kSegSlot]) * slot_elems : ring0;
-        const int row = static_cast<int>(gi / C), c = static_cast<int>(gi % C);
+        const int row = lo + static_cast<int>(gi / C), c = static_cast<int>(gi % C);
         const int64_t p = p0 + row;
         float acc = 0.f;
 #pragma unroll
@@ -293,14 +305,23 @@ PleEvents ple_rows(sycl::queue &q, const PleShape &s, int m, int64_t pos0, const
         const size_t o = static_cast<size_t>(row) * C + c;
         res[o] = ple_bf16(static_cast<float>(res[o]) + bfround(static_cast<float>(gated[o]) + y));
       });
+  if (!ring_tail) return ev;
   // The chunk's last kPleRing positions into the ring (the next steps' conv history).
   const int first = m > kPleRing ? m - kPleRing : 0, n = m - first;
-  q.parallel_for<PleRing>(sycl::range<1>(static_cast<size_t>(n) * C), [=](sycl::id<1> id) {
+  ev.kv = q.parallel_for<PleRing>(sycl::range<1>(static_cast<size_t>(n) * C), [=](sycl::id<1> id) {
     const int64_t p0 = rec ? static_cast<int64_t>(rec[kSegPos]) : host_p0;
     ple_bf16 *ring = rec ? ring0 + static_cast<size_t>(rec[kSegSlot]) * slot_elems : ring0;
     const int r = first + static_cast<int>(id[0] / C), c = static_cast<int>(id[0] % C);
     ring[static_cast<size_t>((p0 + r) % kPleRing) * C + c] = xs[static_cast<size_t>(r) * C + c];
   });
+  return ev;
+}
+
+PleEvents ple_rows(sycl::queue &q, const PleShape &s, int m, int64_t pos0, const ple_bf16 *emb_host, const PleWeights &w, const PleState &st,
+                   const PleRowsScratch &sc, ple_bf16 *res, const int32_t *rec) {
+  if (m < 1) throw std::invalid_argument("ple_rows: rows");
+  PleEvents ev = ple_rows_gate(q, s, 0, m, emb_host, w, sc, res);
+  ev.conv = ple_rows_conv(q, s, 0, m, m, pos0, w, st, sc, res, true, rec).conv;
   return ev;
 }
 

@@ -291,8 +291,9 @@ struct SplitShare {
   void *const *bufs = nullptr;  // every card's buffer, by card: [m] rows of row_bytes each
   size_t row_bytes = 0;
 };
+// tail > 0: only the last `tail` of the card's own rows go (the rows a neighbour's window reads; every row still flags).
 sycl::event pair_split_share(sycl::queue &q, sycl::queue *side, int card, int m, std::span<const SplitShare> sets, const PairSplit &sp,
-                             uint32_t seq, const sycl::event *after = nullptr);
+                             uint32_t seq, const sycl::event *after = nullptr, int tail = 0);
 // Diagnostic: one work-item writes the card's GT-clock cycle counter (ESIMD
 // rdtsc; it runs at the GT frequency, so convert with a calibration over a known span) into *at, in
 // order on q. No event or barrier is needed to read it.

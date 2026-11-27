@@ -1,6 +1,7 @@
 // Xenithium · two-card sum of fp32 partials (see wire.hpp).
 #include "xenithium/kernels/comm/wire.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -587,7 +588,7 @@ PairSplitEvents pair_split_finish(sycl::queue *const q[2], sycl::queue *const si
 }
 
 sycl::event pair_split_share(sycl::queue &q, sycl::queue *side, int card, int m, std::span<const SplitShare> sets, const PairSplit &sp, uint32_t seq,
-                             const sycl::event *after) {
+                             const sycl::event *after, int tail) {
   const bool quad = sp.cards == kWireCardsMax;
   if (sp.cards != 2 && !quad) throw std::invalid_argument("pair_split_share: two or four cards");
   if (card < 0 || card >= sp.cards || (quad && card != sp.card)) throw std::invalid_argument("pair_split_share: the card is not the split's");
@@ -600,6 +601,7 @@ sycl::event pair_split_share(sycl::queue &q, sycl::queue *side, int card, int m,
   }
   int lo = 0, hi = 0;
   pair_split_owner_rows(card, m, &lo, &hi, sp.cards);
+  if (tail > 0) lo = std::max(lo, hi - tail);
   sycl::queue &cq = side ? *side : q;
   // (the first copy's wait list, not a barrier on the side queue: see pair_split_send)
   sycl::event dep;
