@@ -867,6 +867,7 @@ class Model {
   int pf_lane_count(int m) const;                // the lanes of a call of m rows; 0 = not by owner
   void pf_layers_owner(int count);
   void pf_owner_ple(int layer);                  // the PLE layer's block, on every row on every card
+  void pf_ple_rows();                            // the pending call's PLE rows on the host, once (as the PLE layer is next)
   void pf_owner_state();                         // every card gets every row of the chunk's state (the PLE block, the call's end)
   void pf_lane_mixers(int layer, PfMixer which); // per lane: its pending sum, the mixer on each card's own rows, the output shared
   void pf_lane_attention(int lane, int layer);   // GDN or QSA over the lane's rows; its sum stays pending

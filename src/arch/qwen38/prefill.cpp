@@ -241,18 +241,10 @@ void Model::pf_start(const int32_t *tokens, int m, int row_base, const std::func
   }
   const int32_t *tk = R.tokens.data();
 
-  // PLE rows of the whole chunk (host): the n-gram context advances past the chunk (committed).
-  // A calibration layer that is not the PLE layer skips them (an NVMe gather per sample).
-  if (!pf_skip_ple_) {
-    std::vector<int64_t> toks(static_cast<size_t>(m));
-    const int32_t vocab = cfg_.vocab;  // an image (video) position's PLE n-grams see the image (video) token
-    for (int r = 0; r < m; ++r) toks[static_cast<size_t>(r)] = vis_ && tk[r] >= vocab ? vis_->pad_token(tk[r]) : tk[r];  // video: <|video_pad|>
-    std::vector<int64_t> ids(static_cast<size_t>(m) * ple_tab_->heads());
-    std::vector<uint8_t> codes(ids.size() * ple_tab_->row_bytes());
-    ple_tab_->ids(toks.data(), m, sq.ple_ctx, ids.data());
-    ple_tab_->read(ids.data(), m, codes.data());
-    ple_tab_->dequant(codes.data(), m, pf_ple_);
-  }
+  // PLE rows of the whole chunk (host): made by pf_ple_rows when the PLE layer is next, so the host's table read runs
+  // while the cards compute the layers before it. A calibration layer that is not the PLE layer skips them (an NVMe
+  // gather per sample).
+  R.ple_rows_due = !pf_skip_ple_;
   // Slice records (rows.hpp): position of the slice's row 0, the GDN accept count (the previous
   // slice's rows), the slot.
   pf_words_.assign(static_cast<size_t>(R.slices) * k::kSegRec, 0);
@@ -443,6 +435,26 @@ RowRange lane_own_rows(int card, int cards, int r0, int m) {
   return {r0 + lo, r0 + hi};
 }
 }  // namespace
+
+// The pending call's PLE rows on the host, once: the n-gram context advances past the chunk (committed). Called where the
+// PLE layer's launches (or a graph that holds them) are next: pf_start's host work then overlaps layer 0's device time
+// (6-6.5 ms a 4,096-row call: the ids, the table read, the dequant into the pinned pf_ple_).
+void Model::pf_ple_rows() {
+  PfRun &R = *pf_run_;
+  if (!R.ple_rows_due) return;
+  R.ple_rows_due = false;
+  const int m = R.m;
+  const int32_t *tk = R.tokens.data();
+  Seq &sq = seqs_[static_cast<size_t>(R.slot)];
+  std::vector<int64_t> toks(static_cast<size_t>(m));
+  const int32_t vocab = cfg_.vocab;  // an image (video) position's PLE n-grams see the image (video) token
+  for (int r = 0; r < m; ++r) toks[static_cast<size_t>(r)] = vis_ && tk[r] >= vocab ? vis_->pad_token(tk[r]) : tk[r];  // video: <|video_pad|>
+  std::vector<int64_t> ids(static_cast<size_t>(m) * ple_tab_->heads());
+  std::vector<uint8_t> codes(ids.size() * ple_tab_->row_bytes());
+  ple_tab_->ids(toks.data(), m, sq.ple_ctx, ids.data());
+  ple_tab_->read(ids.data(), m, codes.data());
+  ple_tab_->dequant(codes.data(), m, pf_ple_);
+}
 
 int Model::pf_lane_count(int m) const {
   // the diagnostics that read a card's whole chunk state mid-call keep every row on every card
@@ -770,6 +782,7 @@ void Model::pf_owner_ple(int layer) {
   // ring on every card: every card needs every row's streams here. Before the first layer they are the embeddings
   // (every card has them); later the owners share the chunk's state first.
   if (layer > 0) pf_owner_state();
+  pf_ple_rows();
   for (int c = 0; c < nc_; ++c) {
     auto &q = fab_.compute(c);
     Card &K = *cards_[static_cast<size_t>(c)];
@@ -928,6 +941,7 @@ void Model::pf_layers(int count) {
     const int l = R.l;
     const int fetch_last = std::min(l_end - 1, l + 2);  // the fetch runs up to two layers ahead (kPfFetchBufs)
     // attention mixer over the chunk (PLE first on its layer: the pending combine, then the block per slice)
+    if (l == ps_.layer) pf_ple_rows();
     for (int c = 0; c < nc_; ++c) {
       auto &q = fab_.compute(c);
       Card &K = *cards_[static_cast<size_t>(c)];
@@ -1122,6 +1136,7 @@ std::optional<Model::PfGraphKey> Model::pf_graph_key(int count) const {
 void Model::pf_layers_run(int count) {
   const auto key = pf_graph_key(count);
   if (!key) return pf_layers(count);
+  if (pf_run_->l <= ps_.layer && ps_.layer < key->layer_end) pf_ple_rows();  // a graph reads them as it replays
   if (!pf_graphs_) pf_graphs_ = std::make_unique<PfGraphs>();
   PfGraphs &G = *pf_graphs_;
   if (!G.map.contains(*key)) {

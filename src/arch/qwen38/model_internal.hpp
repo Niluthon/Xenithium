@@ -238,6 +238,7 @@ struct Model::PfRun {
   std::vector<kernels::HcState> cs;  // the chunk's HC state per card
   int start_cur[kMaxCards] = {}, start_lcur[kMaxCards] = {};
   int l = 0;                   // the next layer
+  bool ple_rows_due = false;   // the chunk's PLE rows wait for Model::pf_ple_rows (made as the PLE layer is next)
   // While the call's layers record into a graph: the QSA grid bound every batch takes (the key's bucket, so the
   // launches do not depend on the position); unset = each batch's own (kernels::qsa_rows).
   std::optional<int64_t> qsa_bound;
