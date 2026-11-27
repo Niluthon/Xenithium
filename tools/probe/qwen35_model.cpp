@@ -1224,11 +1224,15 @@ int cmd_model35(const std::string &model, const std::string &ppl, const std::str
     while (static_cast<int64_t>(fill.size()) < at) fill.insert(fill.end(), corpus.begin(), corpus.end());
     fill.resize(static_cast<size_t>(at));
     const auto tf = std::chrono::steady_clock::now();
-    for (int sl = 0; sl < m.slots(); ++sl) {
+    // A fresh served prompt: the trained-QSA index starts at token 0 (Model::note_prompt, as the batch engine does), so
+    // past kTrainedQsaShort the steps take the trained sparse walk that serving takes, not the dense fallback.
+    auto fill_slot = [&](int sl) {
       m.use_slot(sl);
       m.reset();
+      m.note_prompt(sl, static_cast<int64_t>(fill.size()), 0);
       m.prefill(fill.data(), static_cast<int>(fill.size()));
-    }
+    };
+    for (int sl = 0; sl < m.slots(); ++sl) fill_slot(sl);
     m.use_slot(0);
     std::printf("\nstep A/B: %d slot(s) prefilled to position %lld in %.1f s (native xenithium, %s)\n", m.slots(), static_cast<long long>(at),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tf).count(), m.cards() == 1 ? "one B70" : "two B70s");
@@ -1237,6 +1241,7 @@ int cmd_model35(const std::string &model, const std::string &ppl, const std::str
     bool run_tree = false;  // The shape's segments are trees (shape_tree)
     int tree_par[xenithium::kernels::kStepRows32] = {-1};
     for (int r = 1; r < xenithium::kernels::kStepRows32; ++r) tree_par[r] = r <= 6 ? (r % 2 ? r - 1 : r - 2) : r - 1;
+    long sparse_steps = 0, all_steps = 0;  // verify steps on the trained sparse walk (route check)
     auto run = [&](int S, int R, std::vector<double> *wall, std::vector<double> *sub, int count) {
       std::vector<int32_t> tk(static_cast<size_t>(S * R));
       std::vector<q35::Model::SeqRows> segs;
@@ -1246,6 +1251,7 @@ int cmd_model35(const std::string &model, const std::string &ppl, const std::str
         for (int j = 0; j < S; ++j) segs[static_cast<size_t>(j)].tokens = tk.data() + j * R;
         const auto ts = std::chrono::steady_clock::now();
         m.verify_batch(segs);
+        sparse_steps += m.step_trained_sparse() ? 1 : 0, all_steps += 1;
         if (wall) wall->push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count());
         if (sub) sub->push_back(m.submit_ms());
         m.accept_batch(std::vector<int>(static_cast<size_t>(S), 1));
@@ -1255,14 +1261,11 @@ int cmd_model35(const std::string &model, const std::string &ppl, const std::str
       const auto [S, R] = shapes[si];
       run_tree = shape_tree[si] != 0;
       if (g_step_reset && si > 0) {  // every shape from --at: a shape's walls do not carry the positions of the shapes before it
-        for (int sl = 0; sl < S; ++sl) {
-          m.use_slot(sl);
-          m.reset();
-          m.prefill(fill.data(), static_cast<int>(fill.size()));
-        }
+        for (int sl = 0; sl < S; ++sl) fill_slot(sl);
         m.use_slot(0);
       }
       std::vector<std::vector<double>> wall(cases.size()), sub(cases.size());
+      sparse_steps = all_steps = 0;
       const int64_t p_start = m.position(0);
       for (int rep = 0; rep < std::max(1, step_reps); ++rep)
         for (size_t ci = 0; ci < cases.size(); ++ci) {
@@ -1273,6 +1276,9 @@ int cmd_model35(const std::string &model, const std::string &ppl, const std::str
       m.set_step_options(base_step);
       std::printf("step A/B %dx%d%s (%d rows) near position %lld, %d rounds x %d steps:\n", S, R, run_tree ? "t" : "", S * R, static_cast<long long>(m.position(0)),
                   std::max(1, step_reps), N);
+      if (m.trained_qsa())
+        std::printf("  trained-QSA route: %ld of %ld steps sparse%s\n", sparse_steps, all_steps,
+                    sparse_steps < all_steps && at > q35::Model::trained_qsa_short() ? " (WARNING: dense steps past the short threshold)" : "");
       std::printf("  | case | wall ms per step | submit ms |\n  | --- | --- | --- |\n");
       for (size_t ci = 0; ci < cases.size(); ++ci) std::printf("  | %s | %.3f | %.3f |\n", cases[ci].name.c_str(), median(wall[ci]), median(sub[ci]));
       for (int card = 0; card < C; ++card) {

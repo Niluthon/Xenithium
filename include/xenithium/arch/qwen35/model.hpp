@@ -368,6 +368,8 @@ class Model {
   void kv_release(int slot);
   int64_t kv_pool_tokens() const { return kvp_.pool_tokens(); }
   bool trained_qsa() const { return trained_qsa3_ != nullptr; }  // a trained page selection bank is loaded
+  bool step_trained_sparse() const { return qsa_step_sparse_; }  // the last verify step ran the trained sparse walk
+  static constexpr int trained_qsa_short() { return kTrainedQsaShort; }  // decode positions below it run dense
   int64_t kv_free_tokens() const { return kvp_.free_tokens(); }
   int64_t kv_used_tokens() const { return kvp_.used_tokens(); }
   size_t kv_bytes(int c) const { return kv_bytes_.at(static_cast<size_t>(c)); }  // KV of the target + drafter on card c
