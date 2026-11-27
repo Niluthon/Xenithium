@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -2774,9 +2775,10 @@ struct Running {
 
 void start_server(Running &r, core::Engine &e, const text::Tokenizer &tok, const text::ChatFormat *chat, int max_queue = 0,
                   std::vector<int32_t> eos = {}, int prepare_threads = 2, xenithium::server::MediaHook *media = nullptr, int64_t vocab = 0,
-                  const xenithium::util::FetchOptions *fetch = nullptr) {
+                  const xenithium::util::FetchOptions *fetch = nullptr, const std::function<void(xenithium::server::Config &)> &more = {}) {
   xenithium::server::Config cfg;
   if (fetch) cfg.fetch = *fetch;
+  if (more) more(cfg);  // what GET /v1/models reports beyond the engine: cards, build, launch
   cfg.prepare_threads = prepare_threads;
   cfg.media = media;
   cfg.vocab = vocab;
@@ -3522,7 +3524,14 @@ void test_server(const std::string &tokdir) {
   sc.slots = 2;
   core::StubEngine stub(sc);
   Running r;
-  start_server(r, stub, tok, chat.get());
+  start_server(r, stub, tok, chat.get(), 0, {}, 2, nullptr, 0, nullptr, [](xenithium::server::Config &cfg) {
+    cfg.devices = {{.name = "Card A", .memory_bytes = 1ull << 30, .memory_gb = 1, .pci = "0000:03:00.0", .driver = "1.17.39395+16"}, {.name = "Card A", .memory_bytes = 1ull << 30}};
+    cfg.tensor_parallel = 2;
+    cfg.build = "abc1234", cfg.oneapi = "2025.3.0", cfg.drafter = "dspine+mtp";
+    cfg.machine = {.os = "Ubuntu 26.04.1 LTS", .kernel = "7.0.0-43-generic", .cpu = "AMD EPYC 7282", .cpu_threads = 16, .memory_gib = 46};
+    cfg.launch_args = {"--model", "/m/ckpt", "--kv", "int8-v4", "--report-launch"};
+    cfg.launch_env = {{"XEN_QSA_GATHER", "1"}};
+  });
 
   {
     const auto h = xenithium::http::request("GET", r.base + "/health", "", 10);
@@ -3537,6 +3546,66 @@ void test_server(const std::string &tokdir) {
       expect(len && len->num == 4096 && sl && sl->num == 2 && pool && pool->num == 2 * 4096 && e.get_string("kv_layout") &&
                  *e.get_string("kv_layout") == "per_slot",
              "server: /v1/models reports max_model_len per request plus slots, kv_layout and kv_pool_tokens");
+      const json::Value *tp = e.get("tensor_parallel"), *devs = e.get_array("devices");
+      expect(tp && tp->num == 2 && devs && devs->arr.size() == 2 && devs->arr[0].get_string("name") && *devs->arr[0].get_string("name") == "Card A" &&
+                 devs->arr[0].get("memory_bytes") && devs->arr[0].get("memory_bytes")->num == 1073741824.0 && devs->arr[0].get_string("pci") &&
+                 *devs->arr[0].get_string("pci") == "0000:03:00.0" && devs->arr[0].get("memory_gb") && devs->arr[0].get("memory_gb")->num == 1 &&
+                 !devs->arr[1].get("pci") && !devs->arr[1].get("memory_gb"),
+             "server: /v1/models reports the TP width and the cards in rank order (no pci or memory_gb field where none is known)");
+      const json::Value *launch = e.get_object("launch");
+      const json::Value *args = launch ? launch->get_array("args") : nullptr, *env = launch ? launch->get_object("env") : nullptr;
+      auto text = [&](const char *key) { return e.get_string(key) ? *e.get_string(key) : std::string(); };
+      expect(text("build") == "abc1234" && text("oneapi") == "2025.3.0" && text("drafter") == "dspine+mtp" && devs && devs->arr[0].get_string("driver") &&
+                 *devs->arr[0].get_string("driver") == "1.17.39395+16" && args && args->arr.size() == 5 && args->arr[3].str == "int8-v4" && env &&
+                 env->get_string("XEN_QSA_GATHER") && *env->get_string("XEN_QSA_GATHER") == "1" && e.get_object("machine") &&
+                 e.get_object("machine")->get_string("kernel") && *e.get_object("machine")->get_string("kernel") == "7.0.0-43-generic" &&
+                 e.get_object("machine")->get("memory_gib") && e.get_object("machine")->get("memory_gib")->num == 46,
+             "server: /v1/models reports its build, oneAPI, drafter, machine, the cards' driver and its launch (arguments, XEN_ variables)");
+      json::Value one;  // retrieve one model: the same entry, every field
+      json::parse(xenithium::http::request("GET", r.base + "/v1/models/test-model", "", 10).body, one);
+      const json::Value *one_launch = one.get_object("launch");
+      expect(one.get_string("build") && *one.get_string("build") == "abc1234" && one.get_string("drafter") && *one.get_string("drafter") == "dspine+mtp" &&
+                 one.get_array("devices") && one.get_array("devices")->arr.size() == 2 && one.get_object("machine") && one_launch &&
+                 one_launch->get_array("args") && one_launch->get_array("args")->arr.size() == 5,
+             "server: /v1/models/<id> carries the same build, drafter, cards, machine and launch as the list");
+    }
+    {
+      std::istringstream good("MemFree: 1 kB\nMemTotal:       48234496 kB\n"), bad("MemTotal: lots\n"), huge("MemTotal: 99999999999999999999999 kB\n"),
+          none("MemFree: 1 kB\n");
+      expect(xenithium::util::memory_gib_from(good) == 46 && xenithium::util::memory_gib_from(bad) == 0 && xenithium::util::memory_gib_from(none) == 0 &&
+                 xenithium::util::memory_gib_from(huge) > 0,
+             "machine: MemTotal in GiB; a malformed, missing or out-of-range line never throws (0 = not known when it is not a number)");
+    }
+    expect(xenithium::server::secret_name("XEN_BENCH_API_KEY") && xenithium::server::secret_name("--api-key") && xenithium::server::secret_name("HF_TOKEN") &&
+               !xenithium::server::secret_name("XEN_KV_POOL_TOKENS") && !xenithium::server::secret_name("--kv-pool-tokens") && !xenithium::server::secret_name("XEN_KV_LEND_KEEP"),
+           "server: secret-looking names (key, token) are hidden from the launch report, counts of tokens are not");
+    {
+      namespace sv = xenithium::server;
+      expect(sv::secret_name("XEN_AUTHORIZATION") && sv::secret_name("XEN_JWT") && sv::secret_name("XEN_OAUTH_CLIENT") &&
+                 sv::secret_name("XEN_DB_PASSWORD") && sv::secret_name("XEN_SESSION_COOKIE") && !sv::secret_name("XEN_PREFILL_SHARE"),
+             "server: AUTH, JWT, PASSW, COOKIE inside a name hide it (XEN_AUTHORIZATION), ordinary names stay");
+      expect(sv::hide_url_credentials("http://user:pa55@proxy:3128") == "http://user:(hidden)@proxy:3128" &&
+                 sv::hide_url_credentials("a=https://u:p@x/y,b=http://plain/z") == "a=https://u:(hidden)@x/y,b=http://plain/z" &&
+                 sv::hide_url_credentials("http://user@host/x") == "http://user@host/x" && sv::hide_url_credentials("/models/q@1") == "/models/q@1",
+             "server: a URL's password is hidden, a user name alone and a path with @ are kept");
+      expect(sv::secret_value("hf_abcdefghijklmnopqrstuvwxyz") && sv::secret_value("Bearer abc") &&
+                 sv::secret_value("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig") && !sv::secret_value("hf_short") &&
+                 !sv::secret_value("/models/Qwen/Qwen3.8-27B") && !sv::secret_value("sk-x"),
+             "server: token-looking values (hf_, Bearer, a JWT) are secret whatever their name, paths and short words are not");
+      sv::Config c;
+      sv::fill_launch(c,
+                      {"--model", "/m", "--api-key", "k1", "--x-token=k2", "--served-model-name", "hf_abcdefghijklmnopqrstuvwxyz",
+                       "--name=sk-abcdefghijklmnopqrstuv", "--proxy", "http://u:p@h:1"},
+                      {"XEN_B=1", "XEN_AUTHORIZATION=abc", "XEN_HTTP_PROXY=http://u:p@h:1", "HOME=/home/x", "XEN_A=ghp_abcdefghijklmnopqrstu"});
+      const std::vector<std::string> want_args = {"--model", "/m", "--api-key", "(hidden)", "--x-token=(hidden)", "--served-model-name",
+                                                  "(hidden)", "--name=(hidden)", "--proxy", "http://u:(hidden)@h:1"};
+      const std::vector<std::pair<std::string, std::string>> want_env = {
+          {"XEN_A", "(hidden)"}, {"XEN_AUTHORIZATION", "(hidden)"}, {"XEN_B", "1"}, {"XEN_HTTP_PROXY", "http://u:(hidden)@h:1"}};
+      bool env_ok = c.launch_env.size() == want_env.size();
+      for (size_t k = 0; env_ok && k < want_env.size(); ++k) env_ok = c.launch_env[k].first == want_env[k].first && c.launch_env[k].second == want_env[k].second;
+      expect(c.launch_args == want_args && env_ok,
+             "server: the launch report hides a secret flag's value (both forms), a token passed under an ordinary flag, a URL's "
+             "password, and keeps only XEN_ variables, sorted");
     }
     expect(xenithium::http::request("GET", r.base + "/nope", "", 10).status == 404, "server: unknown path 404");
   }

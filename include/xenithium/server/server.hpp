@@ -21,9 +21,13 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "xenithium/core/engine.hpp"
+#include "xenithium/util/machine.hpp"
+#include "xenithium/util/secrets.hpp"
 #include "xenithium/server/http.hpp"
 #include "xenithium/text/chat.hpp"
 #include "xenithium/text/tokenizer.hpp"
@@ -66,6 +70,15 @@ class MediaHook {
   virtual int32_t pad_token(int64_t id) const { (void)id; return image_token(); }
 };
 
+// A card the model runs on, as GET /v1/models reports it (benchmarks record what they measured on).
+struct Device {
+  std::string name;  // the driver's name, e.g. "Intel(R) Arc(TM) Pro B65 Graphics"
+  uint64_t memory_bytes = 0;  // device-local memory as the driver reports it (a 32 GB B65: 30.3 GiB)
+  int memory_gb = 0;  // the nominal size, the card table's (util:nominal_vram_gb); 0 = not known
+  std::string pci = {};  // PCI address "0000:01:00.0"; empty when the driver reports none
+  std::string driver = {};  // the GPU driver's version, "1.17.39395+16" (rt:Loader:driver_version_text); empty = not known
+};
+
 struct Config {
   std::string host = "0.0.0.0";  // every interface: reachable from the LAN
   int port = 8000;  // 0 = pick a free port (tests)
@@ -88,7 +101,31 @@ struct Config {
   MediaHook* media = nullptr;
   // How media URLs are loaded (data: always; http(s) fetched unless fetch.enabled is false).
   util::FetchOptions fetch;
+  // The cards the model runs on, in rank order, and its tensor-parallel width (GET /v1/models; empty / 0 = not
+  // reported, as with the stub engine).
+  std::vector<Device> devices;
+  int tensor_parallel = 0;
+  // What it runs (GET /v1/models; empty = not reported): the build's `git describe`, the oneAPI compiler it was built
+  // with ("2025.3.0") and the drafter ("none", "mtp", "dflash2", "dspine", "+mtp" when both draft: serve::Backend:drafter).
+  std::string build, oneapi, drafter;
+  // The machine it runs on (OS, kernel, CPU, host memory; util:this_machine); an empty kernel = not reported.
+  util::Machine machine;
+  // How it was started, only with --report-launch (it shows local paths): the command line's arguments after the
+  // program and the XEN_ variables it saw, so a benchmark can show the launch and anyone can start the same. Values of
+  // secrets are hidden before they get here (fill_launch below). Empty = not reported.
+  std::vector<std::string> launch_args;
+  std::vector<std::pair<std::string, std::string>> launch_env;
 };
+
+// What --report-launch hides: util/secrets.hpp (shared with xenithium-bench, which hides the same in a run's notes).
+using util::hide_url_credentials;
+using util::secret_name;
+using util::secret_value;
+
+// How the server was started, as GET /v1/models shows it with --report-launch: `args` (the arguments after the program)
+// with the value of a secret-named flag (--x-token V, --x-token=V) or a secret-looking value hidden, every URL's
+// password hidden; `env` ("NAME=VALUE", the XEN_ ones kept, sorted) the same way.
+void fill_launch(Config &cfg, const std::vector<std::string> &args, const std::vector<std::string> &env);
 
 class Server {
  public:

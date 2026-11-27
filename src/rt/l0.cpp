@@ -155,6 +155,26 @@ uint32_t Loader::driver_version(size_t i) const {
   return props.driverVersion;
 }
 
+std::string Loader::driver_version_text(size_t i) const {
+  // Intel's driver extension ZE_intel_get_driver_version_string: the Level Zero driver's version ("1.17.39395+16"); not in
+  // the loader's headers, so looked up by name. Its signature: (driver, char *version, size_t *size); a null version
+  // asks for the size.
+  using GetVersionString = ze_result_t (*)(ze_driver_handle_t, char *, size_t *);
+  void *fn = nullptr;
+  if (zeDriverGetExtensionFunctionAddress(driver_of(i), "zeIntelGetDriverVersionString", &fn) == ZE_RESULT_SUCCESS && fn) {
+    const auto get = reinterpret_cast<GetVersionString>(fn);
+    // a fixed buffer, one byte more than the size the driver may fill, so it ends in a 0 whatever the driver writes
+    char text[257] = {};
+    size_t size = 0;
+    if (get(driver_of(i), nullptr, &size) == ZE_RESULT_SUCCESS && size > 0 && size <= 256 &&
+        get(driver_of(i), text, &size) == ZE_RESULT_SUCCESS && text[0] != '\0')
+      return std::string(text, strnlen(text, 256));
+  }
+  // else the build number, the one part of driverVersion every Intel driver fills the same way (low 16 bits)
+  const uint32_t v = driver_version(i);
+  return v ? "build " + std::to_string(v & 0xffffu) : std::string();
+}
+
 Context::Context(ze_driver_handle_t driver, const std::vector<ze_device_handle_t> &devices) {
   ze_context_desc_t desc{};
   desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;

@@ -6,8 +6,11 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "xenithium/arch/common/drafter_archs.hpp"
 #include "xenithium/arch/common/vision.hpp"
 #include "xenithium/model/checkpoint.hpp"
+#include "xenithium/model/config.hpp"
+#include "xenithium/rt/card.hpp"
 #include "xenithium/rt/fabric.hpp"
 #include "xenithium/rt/l0.hpp"
 #include "xenithium/util/video.hpp"
@@ -96,6 +99,17 @@ std::vector<size_t> cards_for(const l0::Loader &loader, int tp, int card, std::s
     throw OptionError(b);
   }
   return tp == 1 ? std::vector<size_t>{static_cast<size_t>(card)} : std::vector<size_t>{0, 1};
+}
+
+std::vector<server::Device> devices_of(const l0::Loader &loader, const Fabric &fab) {
+  std::vector<server::Device> out;
+  for (size_t c = 0; c < fab.size(); ++c) {
+    const l0::DeviceInfo d = loader.info(fab.rank_index(c));
+    const util::CardMatch card = util::identify_card(d.device_id, d.name, static_cast<int>(d.eu_total()) / rt::kXvePerCore, d.vram_bytes);
+    out.push_back({.name = d.name, .memory_bytes = d.vram_bytes, .memory_gb = util::nominal_vram_gb(card.spec, d.vram_bytes), .pci = d.has_pci ? d.pci_bdf() : std::string(),
+                   .driver = loader.driver_version_text(fab.rank_index(c))});
+  }
+  return out;
 }
 
 std::string plan_json(const MemPlan &p) {
@@ -324,6 +338,18 @@ void log_vision(const arch::VisionStore &store, const std::vector<double> &gib_p
                "%lld image rows on each of %d cards (%s GiB per card); image_url / input_image parts take PNG / JPEG\n",
                vc.depth, vc.hidden, vc.heads, load_s, static_cast<long long>(px), static_cast<long long>(max_tokens), static_cast<long long>(store.rows()),
                store.cards(), gib.c_str());
+}
+
+std::string drafter_name(const std::string &block_dir, bool mtp) {
+  if (block_dir.empty()) return mtp ? "mtp" : "none";
+  std::string kind = "dflash2";
+  try {
+    for (const std::string &a : model::ModelConfig::load(block_dir).architectures())
+      if (arch::is_dspine_arch(a)) kind = "dspine";
+  } catch (const std::exception &e) {  // the load read it already: kept as dflash2 if a second read fails, said so
+    std::fprintf(stderr, "server: warning: the drafter's config could not be read again (%s); GET /v1/models says dflash2\n", e.what());
+  }
+  return mtp ? kind + "+mtp" : kind;
 }
 
 }  // namespace xenithium:serve
