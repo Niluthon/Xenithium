@@ -979,6 +979,21 @@ GqaEvents gqa_decode(sycl::queue &q, const GqaShape &s, int rows, const bf16 *x,
     if (step.attn_rows != 0) gg.rows = step.attn_rows;
     if (step.attn_grf > 0) gg.grf = step.attn_grf;
     if (step.attn_pf >= 0) gg.pf = step.attn_pf != 0;
+    static const int dfa_on = [] { const char *v = std::getenv("XEN_ATTN_DEC_FA"); return v ? std::atoi(v) : 1; }();
+    static const int dfa_rows = [] { const char *v = std::getenv("XEN_ATTN_DEC_FA_ROWS"); return v ? std::atoi(v) : 9; }();
+    static const int dfa_pos = [] { const char *v = std::getenv("XEN_ATTN_DEC_FA_POS"); return v ? std::atoi(v) : 1024; }();
+    static const int dfa_pos8 = [] { const char *v = std::getenv("XEN_ATTN_DEC_FA_POS8"); return v ? std::atoi(v) : 4096; }();
+    // DDTree steps from 12 rows (a 16-row tree on 2 x B60: 39.5 -> 35.2 ms per verify step in serving); 8-row trees stay
+    // on the segment kernel, which is faster there (probe: 26.2 vs 26.5 ms at 32k, 32.5 vs 35.1 at 96k).
+    constexpr int kDfaTreeRows = 12;
+    const bool dfa = dfa_on && !trained && !sel && (!step.tree || rows >= kDfaTreeRows) && seg == rows && rows <= 16 && s.kv != QsaKv::bf16 && s.head_dim == kD && s.grp() == 6 &&
+                     s.gate && s.window == 0 && step.attn_rows == 0 && (step.stride == 0 || step.stride >= kSegRec) &&
+                     ((rows >= dfa_rows && step.pos_bound >= dfa_pos) || (rows >= 5 && step.pos_bound >= dfa_pos8));
+    if (dfa) {  // the fa body, gate fused (no merge)
+      e.attn = gqa_attn_fa_decode(q, s, rows, c, step.pos, step.stride, sc.y, w.qkv_n(), sc.q, sc.attn, s.dec_exact() || s.dec_p_lo, s.dec_qk == 1 ? 1 : 0, step.tree);
+      e.merge = e.attn;
+      goto dec_o;
+    }
     if (trained) e.attn = gqa_attn_seg_trained_xl(q, s, rows, c, step, sc.q, sc.part, ns);
     else if (sel) e.attn = attn_sel(q, s, rows, c, sw, sc, ns, gg);
     else if (gg.rows < 0) e.attn = attn_kv(q, s, rows, c, sw, sc, ns);
@@ -987,6 +1002,7 @@ GqaEvents gqa_decode(sycl::queue &q, const GqaShape &s, int rows, const bf16 *x,
   }
   e.merge = trained ? merge_d<256, true, true>(q, s, rows, w.qkv_n(), sw, sc, step.trained_qsa.counts)
                     : merge(q, s, rows, w.qkv_n(), sw, sc, sel ? sc.sel_n : nullptr);
+dec_o:
   e.o = w.dense() ? dense_gemm(q, rows, sc.attn, w.o_d, sc.partial, o_ks) : w4a16_gemm_rows(q, rows, sc.attn, w.o.w, w.o.scales, sc.partial, w.o.n, w.o.k, o_ks);
   e.reduce = pair_reduce(q, rows, s.hidden, sc.partial, wire, wire_parity, out);
   return e;
