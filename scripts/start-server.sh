@@ -187,6 +187,7 @@ XEN_QUEUE_TIMEOUT=${XEN_QUEUE_TIMEOUT:-0}
 XEN_IDLE_TIMEOUT=${XEN_IDLE_TIMEOUT:-300}
 XEN_LOG_INTERVAL=${XEN_LOG_INTERVAL:-10}
 XEN_STUB=${XEN_STUB:-0}
+XEN_REPORT_LAUNCH=${XEN_REPORT_LAUNCH:-0}
 XEN_CHAT_TEMPLATE=${XEN_CHAT_TEMPLATE:-auto}
 XEN_VISION=${XEN_VISION:-0}
 XEN_VISION_MAX_PIXELS=${XEN_VISION_MAX_PIXELS:-1048576}
@@ -242,6 +243,7 @@ cmd+=(--moe-cpu "$XEN_MOE_CPU" --moe-cpu-threads "$XEN_MOE_CPU_THREADS" --moe-cp
       --moe-cpu-timeout-ms "$XEN_MOE_CPU_TIMEOUT_MS")
 [[ -n "$XEN_MOE_CPU_CORES" ]] && cmd+=(--moe-cpu-cores "$XEN_MOE_CPU_CORES")
 [[ "$XEN_STUB" == 1 ]] && cmd+=(--stub)
+[[ "$XEN_REPORT_LAUNCH" == 1 ]] && cmd+=(--report-launch)
 cmd+=("$@")
 
 if [[ "${SERVE_DRY_RUN:-0}" == 1 ]]; then

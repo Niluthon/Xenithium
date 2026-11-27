@@ -21,9 +21,21 @@ struct RunInfo {
   std::string timestamp;  // "20261116-200500" local time: sorts by time
   std::string host;  // where the tool ran
   std::string endpoint;
+  std::string engine = {};  // the endpoint's owned_by ("xenithium", "vllm"); empty = not reported (runs from before)
+  // What the server runs and how it was started, as it reports it (xenithium-server's GET /v1/models): its build's git
+  // revision, the oneAPI compiler, the drafter ("none", "mtp", "dflash2", "dspine", "...+mtp"); with --report-launch its
+  // arguments after the program and the XEN_ variables it saw. Empty = not reported.
+  std::string engine_build = {}, engine_oneapi = {}, engine_drafter = {};
+  std::vector<std::string> server_args = {};
+  std::vector<Label> server_env = {};
+  std::vector<std::string> command = {};  // this run's xenithium-bench arguments after `run` (--api-key hidden)
   std::string model;
   int64_t context_tokens = 0;
   int64_t kv_pool_tokens = 0;  // the endpoint's shared KV pool, where it reports one
+  int tensor_parallel = 0;  // the endpoint's TP width (0 = not known)
+  std::vector<Device> devices = {};  // the cards it runs on, in rank order (empty = not known)
+  // The server's machine as it reports it, and the machine the benchmark ran on (an empty kernel = not known)
+  util::Machine machine = {}, bench_machine = {};
   std::string suite;  // a suite's id, or "custom" for a hand-picked scenario list
   uint64_t seed = 0;
   Sampling sampling;
@@ -66,7 +78,20 @@ struct Headline {
 Headline headline(const Run &run);
 
 std::string to_json(const Run &run);
+
+// A command line with what must not leave the machine hidden (util/secrets.hpp, the server's rules): the value of a
+// secret-named NAME=V, --flag=V or --flag V, a token-looking word, a URL's password. The spacing is kept.
+std::string hide_command_secrets(std::string_view command);
+// A note's value as it may be recorded and shown: "(hidden)" for a secret name or value, else hide_command_secrets (a
+// server_cmd note is a command line the user wrote).
+std::string hide_note(std::string_view key, std::string_view value);
 std::optional<Run> run_from_json(std::string_view text, std::string &err);
+
+// "1x Intel Arc Pro B65 Graphics, 32 GB": the cards, equal neighbours counted once ("(R)" and "(TM)" dropped), the
+// nominal size where known (else the driver's GiB); empty when none are known.
+std::string gpus_text(const std::vector<Device> &devices);
+// The cards and the TP width ("1x Intel Arc Pro B65 Graphics, 32 GB; TP 1"), or `missing` when neither is known.
+std::string devices_text(const std::vector<Device> &devices, int tensor_parallel, std::string_view missing);
 
 // A scenario's rows as text cells: the label columns, then one column per metric (a latency with several samples
 // shows "median / max", a yes / no metric "yes/total"). Rows that only carry notes are left out.

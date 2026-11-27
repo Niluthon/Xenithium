@@ -69,6 +69,9 @@ constexpr const char *kUsage =
     "  --context TOKENS      the longest prompt to send (default: what the endpoint reports)\n"
     "  --kv-pool TOKENS      tokens of context the endpoint holds for all requests at once (default: what it\n"
     "                        reports); the scenarios sized by a share of it use this\n"
+    "  --gpu NAME            a card the endpoint runs on, once per card (default: what it reports; xenithium-server\n"
+    "                        lists its cards), shown in the report's hardware row\n"
+    "  --tp N                the endpoint's tensor-parallel width (default: what it reports)\n"
     "  --timeout SECONDS     per request (default 1800)\n"
     "  --corpus hard|medium|DIR the text long prompts are cut from (default: the mode's): hard = this engine's own code\n"
     "                        and docs, medium = conventional template-made code and prose a drafter guesses well,\n"
@@ -89,6 +92,9 @@ struct Options {
   bench::Sampling sampling;
   int64_t context_tokens = 0;
   int64_t kv_pool_tokens = 0;
+  std::vector<std::string> command;  // the run's arguments after `run` (--api-key's value hidden)
+  std::vector<std::string> gpus;  // --gpu, one per card
+  int tensor_parallel = 0;
   double timeout_s = kDefaultTimeoutS;
   bool strict = false;
 };
@@ -160,6 +166,13 @@ Number number_of(const std::string &flag, const std::string &value) {
 
 Options parse_run_options(int argc, char **argv) {
   Options o;
+  for (int i = 2; i < argc; ++i) {  // the command as typed, for the run file (the key's value and a note's secrets hidden)
+    const std::string arg = argv[i], before = i > 2 ? argv[i - 1] : "";
+    const size_t eq = arg.find('=');
+    if (before == "--api-key") o.command.emplace_back("(hidden)");
+    else if (before == "--note" && eq != std::string::npos) o.command.push_back(arg.substr(0, eq + 1) + bench::hide_note(arg.substr(0, eq), arg.substr(eq + 1)));
+    else o.command.push_back(arg);
+  }
   for (int i = 2; i < argc; ++i) {
     const std::string flag = argv[i];
     if (flag == "--strict") {
@@ -187,11 +200,13 @@ Options parse_run_options(int argc, char **argv) {
     else if (flag == "--top-k") o.sampling.top_k = number_of<int>(flag, value);
     else if (flag == "--context") o.context_tokens = number_of<int64_t>(flag, value);
     else if (flag == "--kv-pool") o.kv_pool_tokens = number_of<int64_t>(flag, value);
+    else if (flag == "--gpu") o.gpus.push_back(value);
+    else if (flag == "--tp") o.tensor_parallel = number_of<int>(flag, value);
     else if (flag == "--timeout") o.timeout_s = number_of<double>(flag, value);
     else if (flag == "--note") {
       const size_t eq = value.find('=');
       if (eq == std::string::npos) usage_error("--note takes KEY=VALUE");
-      o.notes.emplace_back(value.substr(0, eq), value.substr(eq + 1));
+      o.notes.emplace_back(value.substr(0, eq), bench::hide_note(value.substr(0, eq), value.substr(eq + 1)));  // never a key in the run file
     } else usage_error("unknown option " + flag);
   }
   if (o.api_key.empty()) o.api_key = env_or("XEN_BENCH_API_KEY", env_or("OPENAI_API_KEY", ""));
@@ -297,7 +312,9 @@ bench::ModelInfo model_to_bench(const bench::Endpoint &endpoint, const Options &
   if (const auto served = bench::served_model(endpoint, o.model, kSetupTimeoutS, err)) return *served;
   if (o.model.empty()) setup_error("the endpoint " + endpoint.url() + ": " + err);
   std::fprintf(stderr, "xenithium-bench: %s; going on with --model %s, its context unknown\n", err.c_str(), o.model.c_str());
-  return {o.model, 0};
+  bench::ModelInfo info;
+  info.id = o.model;
+  return info;
 }
 
 // One tiny request as the run will send them. A refusal here (a wrong key, a wrong model name) would fail every
@@ -329,6 +346,13 @@ int cmd_run(const Options &o) {
   caps.max_model_len = served.max_model_len;
   caps.kv_pool_tokens = o.kv_pool_tokens > 0 ? o.kv_pool_tokens : served.kv_pool_tokens;
   const int64_t context_tokens = o.context_tokens > 0 ? o.context_tokens : caps.max_model_len;
+  // What the endpoint runs on: --gpu / --tp over what it reports (--gpu without --tp: one card each)
+  std::vector<bench::Device> devices = served.devices;
+  if (!o.gpus.empty()) {
+    devices.clear();
+    for (const std::string &name : o.gpus) devices.push_back({.name = name});
+  }
+  const int tensor_parallel = o.tensor_parallel > 0 ? o.tensor_parallel : !o.gpus.empty() ? static_cast<int>(o.gpus.size()) : served.tensor_parallel;
 
   const bench::Corpus corpus = load_corpus(o);
   const bench::CorpusSet *corpus_set = bench::find_corpus_set(o.corpus);
@@ -351,9 +375,20 @@ int cmd_run(const Options &o) {
                       .timestamp = timestamp_now(),
                       .host = host_name(),
                       .endpoint = endpoint->url(),
+                      .engine = served.owned_by,
+                      .engine_build = served.build,
+                      .engine_oneapi = served.oneapi,
+                      .engine_drafter = served.drafter,
+                      .server_args = served.launch_args,
+                      .server_env = served.launch_env,
+                      .command = o.command,
                       .model = model,
                       .context_tokens = context_tokens,
                       .kv_pool_tokens = caps.kv_pool_tokens,
+                      .tensor_parallel = tensor_parallel,
+                      .devices = devices,
+                      .machine = served.machine,
+                      .bench_machine = xenithium::util::this_machine(),
                       .suite = plan.suite,
                       .seed = o.seed,
                       .sampling = o.sampling,
@@ -376,6 +411,7 @@ int cmd_run(const Options &o) {
               caps.kv_pool_tokens > 0 ? std::to_string(caps.kv_pool_tokens).c_str() : "not reported", plan.suite.c_str(), plan.steps.size(), dir.c_str());
   std::printf("  extensions: ignore_eos %s, top_k %s, thinking switch %s, usage in the stream %s, /metrics %s\n", caps.ignore_eos ? "yes" : "no", caps.top_k ? "yes" : "no",
               caps.thinking_switch ? "yes" : "no", caps.stream_usage ? "yes" : "no (token counts are estimates)", caps.metrics ? "yes" : "no");
+  std::printf("  runs on: %s\n", bench::devices_text(info.devices, info.tensor_parallel, "not reported (pass --gpu NAME, --tp N)").c_str());
   if (power) std::printf("  power: sampling %zu card(s) from hwmon (board energy, GPU clock)\n", power->cards().size());
   std::printf("  mode %s: %.*s; long prompts from the %s corpus\n", o.mode.c_str(), static_cast<int>(mode.about.size()), mode.about.data(), o.corpus.c_str());
   std::printf("  replies of the sampled scenarios: %s length%s\n", o.reply_length.c_str(),

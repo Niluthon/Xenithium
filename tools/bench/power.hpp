@@ -23,6 +23,8 @@ struct PowerSample {
   double at_s = 0;  // since the meter started
   std::vector<uint64_t> energy_uj;  // cumulative, per card
   std::vector<double> mhz;  // actual clock per card (0 = not readable)
+  std::vector<double> temp_c;  // GPU package temperature per card (0 = not readable)
+  std::vector<std::string> throttle;  // throttle reasons per card, space-separated ("" = none or not readable)
 };
 
 class PowerMeter {
@@ -44,7 +46,7 @@ class PowerMeter {
 
  private:
   struct CardFiles {
-    std::string energy_path, clock_path;
+    std::string energy_path, clock_path, temp_path, throttle_path;
   };
   PowerMeter(std::vector<PowerCard> cards, std::vector<CardFiles> files);
   PowerSample read_now() const;

@@ -27,6 +27,9 @@ x-xenithium: &xenithium
     context: .
     dockerfile: docker/Dockerfile
     target: runtime
+    # the revision the server reports (the build context has no .git): XEN_BUILD_REV=$(git describe --always --dirty)
+    args:
+      XEN_BUILD_REV: ${XEN_BUILD_REV:-}
   # the host user, so the files it writes stay yours
   user: "${XEN_UID:-1000}:${XEN_GID:-1000}"
   # render + video own /dev/dri/renderD*; docker owns the socket

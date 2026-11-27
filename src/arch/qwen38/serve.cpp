@@ -252,6 +252,11 @@ class Backend final : public serve::Backend {
 
   core::StepModel &step_model() override { return *adapter_; }
   server::MediaHook *media() override { return hook_.get(); }
+  std::vector<server::Device> devices() const override { return serve::devices_of(*loader_, *fab_); }
+  std::string drafter() const override {  // the --mtp checkpoint, a block drafter, or both (--drafter-mtp-from)
+    const bool block = o_.drafter != 0 && !o_.drafter_model.empty();
+    return serve::drafter_name(block ? o_.drafter_model : std::string(), !o_.mtp.empty() && (!block || o_.drafter_mtp_from > 0));
+  }
   int64_t vocab() const override { return model_->config().vocab; }
   // four cards: parts of 90 ms with whole-chunk prompt calls (step_model.hpp prefill_long_parts); one / two cards keep
   // 12 ms with the stall budget's calls

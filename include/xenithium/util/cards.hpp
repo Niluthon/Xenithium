@@ -11,6 +11,7 @@
 // has 8 GiB less).
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -79,6 +80,13 @@ inline CardMatch identify_card(uint32_t pci_id, std::string_view name, int xe_co
     if (xe_cores == 20 && gib > 20) return {card_by_key("b60"), "cores + VRAM"};  // a B580 (20 cores, 12 GB) stays unknown
   }
   return {};
+}
+
+// A device's nominal memory in GB (the size on the box): the table's for a known card, else from the reported module
+// size (zeDeviceGetMemoryProperties: a 32 GB B70 reports 30.30 GiB, sysman 31.89; the B70's ratio scales an unknown card).
+inline int nominal_vram_gb(const CardSpec *spec, uint64_t vram_bytes) {
+  if (spec) return spec->vram_gb;
+  return static_cast<int>(std::lround(static_cast<double>(vram_bytes) / 1073741824.0 * 32 / 30.30));
 }
 
 // XEN_EMU_CARD: the card this process pretends to run on (launch shapes for its cores, its VRAM; docs/server-env.md).

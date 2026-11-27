@@ -21,6 +21,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -42,9 +43,34 @@ namespace serve = xenithium::serve;
 namespace text = xenithium::text;
 namespace json = xenithium::json;
 
+extern char **environ;
+
+namespace xenithium {
+const char *build_rev();  // `git describe --always --dirty` at build time (cmake/BuildRev.cmake)
+}  // namespace xenithium
+
 namespace {
 
 xenithium::server::Server *g_server = nullptr;
+
+using xenithium::server::secret_name;
+
+// The oneAPI compiler this server was built with ("2025.3.0" from __INTEL_LLVM_COMPILER = 20250300), else the
+// compiler's own version string.
+std::string oneapi_version() {
+#ifdef __INTEL_LLVM_COMPILER
+  char v[32];
+  std::snprintf(v, sizeof v, "%d.%d.%d", __INTEL_LLVM_COMPILER / 10000, __INTEL_LLVM_COMPILER / 100 % 100, __INTEL_LLVM_COMPILER % 100);
+  return v;
+#else
+  return std::string("not oneAPI: ") + __VERSION__;
+#endif
+}
+
+// The XEN_ variables as the server was started with them, taken first thing in main: the server sets some of its own
+// later (XEN_EMU_CARD), which are not part of how it was started.
+std::vector<std::string> g_start_env;
+
 
 void on_signal(int) {
   if (g_server) g_server->stop();
@@ -285,6 +311,15 @@ int server_main(int argc, char **argv) {
   scfg.eos_ids = eos;
   scfg.vocab = vocab;  // token masks cover the logits row (structured output); 0 with the stub
   scfg.media = backend ? backend->media() : nullptr;  // Image input (--vision 1)
+  if (backend) {  // What the model runs on (GET /v1/models): its cards, their count the TP width
+    scfg.devices = backend->devices();
+    scfg.tensor_parallel = static_cast<int>(scfg.devices.size());
+  }
+  scfg.build = xenithium::build_rev();  // what it runs
+  scfg.oneapi = oneapi_version();
+  scfg.machine = xenithium::util::this_machine();
+  if (backend) scfg.drafter = backend->drafter();
+  if (o.report_launch) fill_launch(scfg, std::vector<std::string>(argv + 1, argv + argc), g_start_env);  // and how it was started (opt-in: it shows local paths)
   scfg.fetch.enabled = o.media_urls != 0;  // Http(s) media URLs
   scfg.fetch.allowed_domains = xenithium::util::split_domains(o.media_domains);
   scfg.fetch.timeout_s = o.media_timeout_s;
@@ -321,6 +356,8 @@ int server_main(int argc, char **argv) {
 // on a directory without lm_head.qweight) ends the server with its message and exit 1, without an abort's core dump. No
 // unwinding: catching it in main hung in the destructors of the half-built devices and threads.
 int main(int argc, char **argv) {
+  for (char **e = environ; e && *e; ++e)
+    if (std::string_view(*e).starts_with("XEN_")) g_start_env.emplace_back(*e);
   install_crash_handlers();
   std::set_terminate([] {
     if (const std::exception_ptr e = std::current_exception()) {

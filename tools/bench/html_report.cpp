@@ -5,7 +5,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
+#include <tuple>
 #include <pwd.h>
 #include <unistd.h>
 
@@ -389,36 +391,35 @@ std::string replies_text(const RunInfo &i) {
   return std::string("fixed: the sampled scenarios' replies run to their length") + (i.capabilities.ignore_eos ? " (ignore_eos)" : ", asked for but not taken by the endpoint");
 }
 
+// The page's last section: what the facts rows under the title leave out (where and when, the suite, the replies, which
+// API extensions the endpoint took or not, the power limits, the cards' PCI addresses), then every note and every XEN_
+// variable the run recorded, as they were recorded.
 std::string setup_html(const RunInfo &i) {
-  char sampling[96];
-  std::snprintf(sampling, sizeof(sampling), "temperature %.2f, top-p %.2f, top-k %d, seed %llu + request number", i.sampling.temperature, i.sampling.top_p, i.sampling.top_k,
-                static_cast<unsigned long long>(i.seed));
   const Capabilities &caps = i.capabilities;
   std::string extensions;
   for (const auto &[name, taken] : {std::pair{"ignore_eos", caps.ignore_eos}, {"top_k", caps.top_k}, {"thinking switch", caps.thinking_switch},
                                     {"usage in the stream", caps.stream_usage}, {"/metrics", caps.metrics}})
     extensions += std::string(extensions.empty() ? "" : ", ") + name + (taken ? " yes" : " no");
 
-  std::string html = "<section id=\"setup\"><h2><span class=\"ttl\">Setup</span></h2><dl class=\"setup\">";
-  html += term("endpoint", i.endpoint) + term("model", i.model);
-  html += term("context", i.context_tokens > 0 ? with_thousands(i.context_tokens) + " tokens per request" : "not reported by the endpoint");
-  if (i.kv_pool_tokens > 0) html += term("KV pool", with_thousands(i.kv_pool_tokens) + " tokens shared by all requests");
-  html += term("mode", i.mode + ", version " + std::to_string(i.mode_version)) + term("suite", i.suite) + term("sampling", sampling) + term("thinking", i.thinking.empty() ? "default" : i.thinking) + term("replies", replies_text(i));
-  html += term("corpus", (i.corpus.empty() ? std::string() : i.corpus + ", ") + "version " + std::to_string(i.corpus_version) + ", hash " + i.corpus_hash);
-  html += term("extensions", extensions);
+  std::string html = "<section id=\"setup\"><h2><span class=\"ttl\">Everything the run recorded</span></h2><dl class=\"setup\">";
+  html += term("run", i.timestamp + "-" + i.name) + term("endpoint", i.endpoint) + term("served model", i.model) + term("bench ran on", i.host);
+  html += term("suite", i.suite) + term("mode", i.mode + ", version " + std::to_string(i.mode_version)) + term("replies", replies_text(i));
+  html += term("API extensions", extensions);
+  std::string pci;
+  for (const Device &d : i.devices)
+    if (!d.pci.empty()) pci += (pci.empty() ? "" : ", ") + d.pci;
+  if (!pci.empty()) html += term("PCI", pci);
+  if (const util::Machine &b = i.bench_machine; !b.kernel.empty())
+    html += term("bench machine", b.os + ", kernel " + b.kernel + ", " + b.cpu + " (" + std::to_string(b.cpu_threads) + " threads), " + std::to_string(b.memory_gib) + " GiB RAM");
   if (i.power) {
     std::string cards;
     for (const PowerCard &card : i.power->cards)
       cards += (cards.empty() ? "" : ", ") + card.name + (card.cap_watts > 0 ? " (limit " + format_number(card.cap_watts) + " W)" : "");
     html += term("power", cards + "; idle " + format_number(i.power->idle_watts) + " W before the run");
   }
-  html += term("measured from", i.host) + term("run", i.timestamp + "-" + i.name) + "</dl>";
-  if (!i.notes.empty()) {
-    html += "<details><summary>" + std::to_string(i.notes.size()) + " notes recorded with the run</summary><dl class=\"setup\">";
-    for (const Label &note : i.notes) html += term(note.first, note.second);
-    html += "</dl></details>";
-  }
-  return html + "</section>";
+  for (const Label &note : i.notes) html += term(note.first, hide_note(note.first, note.second));  // runs from before hid nothing
+  for (const Label &var : i.server_env) html += term(var.first, var.second);
+  return html + "</dl></section>";
 }
 
 std::string nav_html(const Run &run, bool with_anatomy) {
@@ -430,20 +431,461 @@ std::string nav_html(const Run &run, bool with_anatomy) {
     else if (!s.misses.empty()) mark = " class=\"err\" title=\"" + escaped(misses_heading(s)) + "\"";
     html += "<a href=\"#" + escaped(s.id) + "\"" + mark + ">" + escaped(s.id) + "</a>";
   }
-  return html + "<a href=\"#setup\">setup</a></div></nav>";
+  return html + "<a href=\"#setup\">recorded</a></div></nav>";
+}
+
+// ---- the run's facts: labelled rows of chips under the title (what ran, on what, with which settings) ----
+
+// The server's settings, from the best source the run has:
+//   1. the launch the server reported (xenithium-server --report-launch): its XEN_ variables and --flag value pairs, exact;
+//   2. the launcher's notes (a Bench-tab run carries its launch.env as XEN_* notes);
+//   3. fallback, for other engines and runs from before: the server_cmd note's --flag value pairs and XEN_X=value
+//      words (split at spaces, quotes dropped; `bash -c '... exec xenithium-server --model ...'` reads the same).
+// The launcher's own notes (engine_rev, settings_file) come from the notes either way.
+struct Settings {
+  const std::vector<Label> *notes = nullptr;
+  std::vector<Label> env;  // XEN_ variables: reported, else parsed from server_cmd
+  std::vector<Label> flags;  // --flag, value ("1" for a flag without a value): reported, else parsed from server_cmd
+  bool reported = false;  // env and flags are the server's own report
+
+  std::string note(std::string_view key) const {
+    for (const auto &[k, v] : *notes)
+      if (k == key) return hide_note(k, v);  // a key in a run from before the bench hid them
+    return {};
+  }
+  // The XEN_ key's value, else its flag's; "" = not known.
+  std::string get(std::string_view key, std::string_view flag) const {
+    for (const auto &[k, v] : env)
+      if (k == key) return v;
+    for (const auto &[f, v] : flags)
+      if (f == flag) return v;
+    return note(key);
+  }
+};
+
+Settings settings_of(const RunInfo &i) {
+  Settings s{&i.notes, {}, {}, !i.server_args.empty() || !i.server_env.empty()};
+  std::vector<std::string> words;
+  if (s.reported) {
+    words = i.server_args;
+    s.env = i.server_env;
+  } else {
+    words.emplace_back();
+    for (const char c : s.note("server_cmd")) {
+      if (c == '\'' || c == '"') continue;
+      if (std::isspace(static_cast<unsigned char>(c))) {
+        if (!words.back().empty()) words.emplace_back();
+      } else
+        words.back() += c;
+    }
+  }
+  for (size_t k = 0; k < words.size(); ++k)
+    if (const size_t eq = words[k].find('='); !s.reported && words[k].rfind("XEN_", 0) == 0 && eq != std::string::npos)
+      s.env.push_back({words[k].substr(0, eq), words[k].substr(eq + 1)});
+    else if (words[k].size() > 2 && words[k].rfind("--", 0) == 0) {
+      const bool valued = k + 1 < words.size() && !words[k + 1].empty() && words[k + 1].rfind("--", 0) != 0;
+      s.flags.push_back({words[k], valued ? words[k + 1] : "1"});
+    }
+  return s;
+}
+
+std::string base_name(const std::string &path) {
+  std::string p = path;
+  while (p.size() > 1 && p.back() == '/') p.pop_back();
+  const size_t slash = p.rfind('/');
+  return slash == std::string::npos ? p : p.substr(slash + 1);
+}
+
+// What the server's counters said over the whole run: each scenario's notes carry its share ("server: 4.43 tokens per
+// speculative step over 7916 steps", "server: its prefix cache served 0 of 8339 prompt tokens"; counters.cpp).
+struct ServerTotals {
+  double spec_tokens = 0, spec_steps = 0;
+  double cache_hit = 0, cache_asked = 0;
+};
+
+ServerTotals server_totals(const Run &run) {
+  ServerTotals t;
+  for (const ScenarioResult &scenario : run.scenarios)
+    for (const std::string &note : unique_notes(scenario)) {
+      double a = 0, b = 0;
+      if (std::sscanf(note.c_str(), "server: %lf tokens per speculative step over %lf steps", &a, &b) == 2) t.spec_tokens += a * b, t.spec_steps += b;
+      else if (std::sscanf(note.c_str(), "server: its prefix cache served %lf of %lf prompt tokens", &a, &b) == 2) t.cache_hit += a, t.cache_asked += b;
+    }
+  return t;
+}
+
+// ---- run this yourself: the three commands that repeat the run (build, server, benchmark) ----
+
+// A word as a POSIX shell reads it back: as it is when it holds only plain characters, else in single quotes.
+std::string shell_word(const std::string &w) {
+  const bool plain = !w.empty() && std::all_of(w.begin(), w.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || std::strchr("_-./:=,@%+", c); });
+  if (plain) return w;
+  std::string out = "'";
+  for (const char c : w) out += c == '\'' ? std::string("'\\''") : std::string(1, c);
+  return out + "'";
+}
+
+// A command over several lines: the program, then each --flag with its value on a line of its own.
+std::string command_lines(const std::vector<std::string> &env, const std::string &program, const std::vector<std::string> &args) {
+  std::string out;
+  for (const std::string &e : env) out += e + " \\\n";
+  out += program;
+  for (size_t a = 0; a < args.size(); ++a) {
+    const bool flag = args[a].rfind("--", 0) == 0;
+    out += flag ? " \\\n  " : " ";
+    out += shell_word(args[a]);
+  }
+  return out;
+}
+
+// The benchmark's command: as typed (recorded since the run file kept it), else rebuilt from the run's settings.
+// Flags of the recorded command that only make sense on the machine that ran it: --out (its folder) and --api-key (its
+// key, hidden anyway); `dropped` says which were there.
+std::vector<std::string> portable_args(const std::vector<std::string> &args, std::vector<std::string> &dropped) {
+  std::vector<std::string> out;
+  for (size_t a = 0; a < args.size(); ++a) {
+    bool drop = false;
+    for (const char *flag : {"--out", "--api-key"})
+      if (args[a] == flag || args[a].rfind(std::string(flag) + "=", 0) == 0) {
+        drop = true;
+        if (std::find(dropped.begin(), dropped.end(), flag) == dropped.end()) dropped.emplace_back(flag);
+        if (args[a] == flag && a + 1 < args.size()) ++a;  // its value
+      }
+    if (!drop) out.push_back(args[a]);
+  }
+  return out;
+}
+
+std::string bench_command(const RunInfo &i, bool &rebuilt, std::vector<std::string> &dropped) {
+  std::vector<std::string> args = portable_args(i.command, dropped);
+  rebuilt = i.command.empty();
+  if (rebuilt) {
+    char number[32];
+    auto add = [&](const char *flag, const std::string &value) { args.push_back(flag), args.push_back(value); };
+    add("--url", i.endpoint);
+    if (i.suite != "custom") add("--suite", i.suite);
+    add("--mode", i.mode);
+    add("--seed", std::to_string(i.seed));
+    std::snprintf(number, sizeof number, "%g", i.sampling.temperature), add("--temperature", number);
+    std::snprintf(number, sizeof number, "%g", i.sampling.top_p), add("--top-p", number);
+    add("--top-k", std::to_string(i.sampling.top_k));
+    if (!i.thinking.empty() && i.thinking != "default") add("--thinking", i.thinking);
+    add("--reply-length", i.reply_length);
+    add("--corpus", i.corpus);
+  }
+  return command_lines({}, "build/xenithium-bench run", args);
+}
+
+// Where the engine's code is published (the clone step of "Run this yourself").
+constexpr std::string_view kRepoUrl = "https://github.com/Niluthon/xenithium";
+
+// "Run this yourself": the run repeated from a fresh machine, for someone who has never run the engine. Numbered steps,
+// each a short why, its commands (one copy button each) and what to look for: what is needed, the code at the run's
+// revision, the dependencies, the build, the model files, the server, the benchmark, the result.
+std::string rerun_html(const Run &run, const Settings &s) {
+  const RunInfo &i = run.info;
+  const std::string rev = !i.engine_build.empty() ? i.engine_build : s.note("engine_rev");
+  const bool xenithium = i.engine == "xenithium" || (i.engine.empty() && (!rev.empty() || !i.devices.empty() || s.reported));
+  const std::string engine = i.engine.empty() ? std::string("the engine") : i.engine;
+  std::string steps;
+  auto step = [&](const std::string &title, const std::string &about, const std::string &cmd, const std::string &after) {
+    steps += "<li><p><b class=\"step\">" + title + ".</b>" + (about.empty() ? "" : " " + about) + "</p>";
+    if (!cmd.empty()) steps += "<pre class=\"cmd\">" + escaped(cmd) + "</pre>";
+    if (!after.empty()) steps += "<p class=\"hint\">" + after + "</p>";
+    steps += "</li>";
+  };
+  auto code = [](const std::string &text) { return "<code>" + escaped(text) + "</code>"; };
+
+  // what is needed: the machine, the cards
+  const std::string gpus = gpus_text(i.devices);
+  std::string intro = "Repeat this run on your own machine, from nothing. Run the commands in order, each in a terminal; every box has a copy "
+                      "button. You need Linux with the <code>xe</code> GPU driver (tested on Ubuntu 26.04), <code>git</code>, and ";
+  intro += gpus.empty() ? std::string("Intel Arc Pro B-series cards (this run did not record which).")
+                        : "the same cards: <b>" + escaped(gpus) + "</b>" + (i.tensor_parallel > 1 ? " (TP " + std::to_string(i.tensor_parallel) + ")" : "") +
+                              ". Cards with less memory may not fit its settings.";
+
+  // 1. the code at the run's revision
+  const bool dirty = rev.size() > 6 && rev.compare(rev.size() - 6, 6, "-dirty") == 0;
+  const std::string commit = dirty ? rev.substr(0, rev.size() - 6) : rev;
+  std::string clone = "git clone " + std::string(kRepoUrl) + "\ncd xenithium";
+  if (!commit.empty() && commit != "unknown") clone += "\ngit checkout " + shell_word(commit);
+  std::string clone_after;
+  if (commit.empty() || commit == "unknown") clone_after = "This run did not record its revision: you get the newest code, which may give other numbers.";
+  else {
+    clone_after = "The checkout puts the code back to the revision this run was built from (" + code(commit) +
+                  "). If git says it does not know it, the run was built from code that is not published: skip the checkout and use the newest code.";
+    if (dirty) clone_after += " <b>Its build also had changes that were never committed, so even this revision may not match it exactly.</b>";
+  }
+  step("Get the code", xenithium ? "The engine's code, at the revision this run used." : "The benchmark tool's code.", clone, clone_after);
+
+  // 2. dependencies, and a look at the cards
+  step("Install what it needs", "Once per machine. It asks for your password: it installs packages with apt.",
+       "scripts/install-deps.sh\nsource scripts/oneapi-env.sh\nsycl-ls",
+       "<code>install-deps.sh</code> installs Intel's oneAPI compiler, oneDNN and the GPU driver. <code>sycl-ls</code> should then list each of "
+       "your cards as a <code>level_zero:gpu</code>; if none shows up, the driver is not working yet. A new terminal needs "
+       "<code>source scripts/oneapi-env.sh</code> again before the commands below.");
+
+  // 3. the build
+  step("Build it", xenithium ? "The server and the benchmark tool; this takes several minutes." : "The benchmark tool.",
+       xenithium ? "scripts/build-host.sh xenithium-server xenithium-bench" : "scripts/build-host.sh xenithium-bench",
+       "The programs land in <code>build/</code>.");
+
+  // 4. the model files the server read
+  std::vector<std::pair<std::string, std::string>> files;  // (what, path)
+  for (const auto &[what, key, flag] : {std::tuple{"the model", "XEN_MODEL", "--model"}, {"the drafter", "XEN_DRAFTER_MODEL", "--drafter-model"},
+                                        {"the MTP drafter", "XEN_MTP", "--mtp"}, {"the trained-QSA sidecar", "XEN_TRAINED_QSA_DELTA_DIR", ""}})
+    if (const std::string path = s.get(key, flag); !path.empty()) files.push_back({what, path});
+  if (files.empty() && !i.model.empty()) {
+    step("Get the model", "This run served " + code(i.model) + ".", "",
+         "The run did not record which checkpoint that is. <code>README.md</code> (Supported models) lists the checkpoints the engine runs and where "
+         "to download them.");
+  } else if (!files.empty()) {
+    std::string list, check = "ls -d";
+    for (const auto &[what, path] : files) {
+      list += "<li>" + std::string(what) + ": " + code(base_name(path)) + " (this run: " + code(path) + ")</li>";
+      check += " " + shell_word(path);
+    }
+    steps += "<li><p><b class=\"step\">Get the model files.</b> This run read these:</p><ul class=\"files\">" + list +
+             "</ul><p class=\"hint\">The <a href=\"" + std::string(kRepoUrl) + "#supported-models\">Supported models</a> table in <code>README.md</code> "
+             "links each checkpoint the engine runs on Hugging Face. A name that is not there was probably converted or renamed on the machine that ran "
+             "this: ask whoever shared this page how they made it. Put each one at the path above (the server command below reads those), or change the "
+             "paths in that command to where you put them. This shows whether they are in place:</p><pre class=\"cmd\">" + escaped(check) + "</pre></li>";
+  }
+
+  // 5. the server
+  const std::string oneapi = "source scripts/oneapi-env.sh\n";  // the server needs oneAPI's libraries in its terminal
+  const std::string wait = "Leave it running in this terminal. Loading takes a few minutes; it is ready when it prints " +
+                           code("server: serving on http://...") + ". Stop it with Ctrl+C when you are done.";
+  std::vector<std::string> launcher_env;  // a Bench-tab run (settings_file names its launch.env): XEN_* notes start-server.sh reads
+  if (const std::string file = s.note("settings_file"); !file.empty() && file[0] != '(')
+    for (const auto &[k, v] : i.notes)
+      if (k.rfind("XEN_", 0) == 0) launcher_env.push_back(k + "=" + shell_word(hide_note(k, v)));
+  if (s.reported) {
+    std::vector<std::string> env;
+    std::vector<std::string> hidden;  // a key or token the server would not show: left out, the reader sets their own
+    for (const auto &[k, v] : i.server_env)
+      if (v == "(hidden)") hidden.push_back(k);
+      else env.push_back(k + "=" + shell_word(v));
+    std::string about = wait;
+    if (!hidden.empty()) {
+      std::string names;
+      for (const std::string &h : hidden) names += (names.empty() ? "" : ", ") + code(h);
+      about += " Left out: " + names + ", which held a key or token (hidden by the server): set your own if your setup needs it.";
+    }
+    // any (hidden) left in the command: a flag's value (--key V, --key=V) or part of one (a URL's password)
+    auto has_hidden = [](const std::string &text) { return text.find("(hidden)") != std::string::npos; };
+    const bool hidden_left = std::any_of(i.server_args.begin(), i.server_args.end(), has_hidden) ||
+                             std::any_of(env.begin(), env.end(), has_hidden);
+    if (hidden_left) about += " Where the command shows <code>(hidden)</code>, it held a key, token or password: put your own there.";
+    step("Start the server", "Exactly as this run's was started: the server reported its own command line.",
+         oneapi + command_lines(env, "build/xenithium-server", i.server_args), about);
+  } else if (!launcher_env.empty()) {
+    step("Start the server", "With the launcher settings this run used.", command_lines(launcher_env, "scripts/start-server.sh", {}),
+         wait + (std::any_of(launcher_env.begin(), launcher_env.end(), [](const std::string &e) { return e.find("(hidden)") != std::string::npos; })
+                     ? std::string(" Where it shows <code>(hidden)</code>, it held a key, token or password: put your own there.")
+                     : std::string()));
+  } else if (const std::string cmd = s.note("server_cmd"); !cmd.empty()) {
+    step("Start the server", "With the command line recorded with this run.", oneapi + cmd,
+         wait + (cmd.find("(hidden)") != std::string::npos ? std::string(" Where it shows <code>(hidden)</code>, it held a key, token or password: put your own there.")
+                                                           : std::string()));
+  } else {
+    step("Start the server", "<b>This run did not record how its server was started</b>, so your numbers may differ.",
+         xenithium ? oneapi + (files.empty() ? std::string("build/xenithium-server --model /path/to/the/model") : "build/xenithium-server --model " + shell_word(files[0].second)) : "",
+         (xenithium ? wait + " " : "Start " + escaped(engine) + " as you normally do, serving an OpenAI-compatible API. ") +
+             "Next time, start xenithium-server with <code>--report-launch</code> and the benchmark records the exact command.");
+  }
+
+  // 6. the benchmark
+  bool rebuilt = false;
+  std::vector<std::string> dropped;
+  const std::string bench = bench_command(i, rebuilt, dropped);
+  std::string bench_after = "Run it in a second terminal, in the <code>xenithium</code> folder, while the server is running";
+  if (i.seconds > 0) bench_after += ": this run took " + duration_text(i.seconds);
+  bench_after += ". It talks to <code>http://127.0.0.1:8000/v1</code> unless <code>--url</code> says otherwise: change it if your server listens elsewhere.";
+  if (rebuilt) bench_after += " This run did not record its command, so this one is rebuilt from its settings.";
+  if (std::find(dropped.begin(), dropped.end(), "--out") != dropped.end())
+    bench_after += " Its <code>--out</code> folder was on the machine that ran it, so it is left out: your results go to <code>~/.xenithium/bench/runs</code>.";
+  if (std::find(dropped.begin(), dropped.end(), "--api-key") != dropped.end())
+    bench_after += " It used an API key: add <code>--api-key YOUR_KEY</code> if your server needs one.";
+  step("Run the benchmark", "With the same settings as this run.", bench, bench_after);
+
+  // 7. the result
+  step("Look at your result", "When the benchmark finishes it prints <code>run DIR</code>: open <code>DIR/report.html</code> in a browser, a page like this one.",
+       "build/xenithium-bench compare THIS_RUN YOUR_RUN",
+       "To see your numbers against this run, metric by metric: save this run's <code>results.json</code> (ask whoever shared this page) and give "
+       "its folder as <code>THIS_RUN</code>, your run's as <code>YOUR_RUN</code>.");
+
+  return "<details class=\"launch rerun\"><summary>Run this yourself: step by step, from a fresh machine</summary><p class=\"intro\">" + intro + "</p><ol>" +
+         steps + "</ol></details>";
+}
+
+// One labelled row; a row with no known fact is left out.
+void fact_row(std::string &html, std::string_view label, const std::vector<std::string> &facts) {
+  std::string items;
+  for (const std::string &f : facts)
+    if (!f.empty()) items += "<li>" + escaped(f) + "</li>";
+  if (!items.empty()) html += "<dt>" + escaped(label) + "</dt><dd><ul class=\"chips\">" + items + "</ul></dd>";
+}
+
+std::string facts_html(const Run &run) {
+  const RunInfo &i = run.info;
+  const Settings s = settings_of(i);
+  const ServerTotals totals = server_totals(run);
+  const std::string dot(kDot);
+  auto num = [](double v) { return with_thousands(static_cast<int64_t>(std::llround(v))); };
+  std::string rows;
+
+  // engine: its name and build (the server's own report, else the launcher's note), how it was started, and the API
+  // extensions the endpoint took (what the benchmark could ask for: ignore_eos = replies run to a fixed length)
+  const std::string rev = !i.engine_build.empty() ? i.engine_build : s.note("engine_rev"), settings_file = s.note("settings_file");
+  std::string extensions;
+  for (const auto &[name, taken] : {std::pair{"ignore_eos", i.capabilities.ignore_eos}, {"top_k", i.capabilities.top_k}, {"thinking switch", i.capabilities.thinking_switch},
+                                    {"usage in stream", i.capabilities.stream_usage}, {"/metrics", i.capabilities.metrics}})
+    if (taken) extensions += (extensions.empty() ? "API: " : dot) + name;
+  const std::string engine = i.engine.empty() ? (rev.empty() ? "" : "xenithium") : i.engine;
+  fact_row(rows, "engine",
+           {engine.empty() ? "" : engine + (rev.empty() ? "" : " " + rev), i.engine_oneapi.empty() ? "" : "oneAPI " + i.engine_oneapi,
+            settings_file.empty() ? "" : settings_file[0] == '(' ? "started outside the launcher" : "launcher settings " + settings_file, extensions});
+
+  // model: the served name's checkpoint, the context, the chat template and image input where set
+  const std::string model_dir = s.get("XEN_MODEL", "--model"), tmpl = s.get("XEN_CHAT_TEMPLATE", "--chat-template"), vision = s.get("XEN_VISION", "--vision");
+  fact_row(rows, "model",
+           {model_dir.empty() ? i.model : base_name(model_dir), i.context_tokens > 0 ? with_thousands(i.context_tokens) + "-token context" : "",
+            tmpl.empty() || tmpl == "auto" ? "" : "chat template " + tmpl, vision == "1" ? "image input on" : ""});
+
+  // KV cache: its type, the pool, the prefix cache
+  const std::string kv = s.get("XEN_KV", "--kv"), pool_set = s.get("XEN_KV_POOL_TOKENS", "--kv-pool-tokens");
+  const std::string prefix = s.get("XEN_PREFIX_CACHE", "--prefix-cache"), prefix_gib = s.get("XEN_PREFIX_CACHE_GIB", "--prefix-cache-gib");
+  const std::string qsa = s.get("XEN_TRAINED_QSA_DELTA_DIR", "");  // the trained sparse-attention sidecar (docs/trained-k8v4-qsa.md)
+  fact_row(rows, "KV cache",
+           {kv.empty() ? "" : kv + " KV", i.kv_pool_tokens > 0 ? with_thousands(i.kv_pool_tokens) + "-token pool" + (pool_set == "auto" ? " (auto)" : "") : "",
+            prefix.empty() ? "" : prefix == "0" ? "prefix cache off" : "prefix cache on" + (prefix_gib.empty() ? "" : dot + prefix_gib + " GiB host"),
+            qsa.empty() ? "" : "trained QSA " + base_name(qsa)});
+
+  // parallel: the TP width (and the wire between the cards, or the one card), the slots
+  const std::string tp_set = s.get("XEN_TP", "--tp"), slots = s.get("XEN_SLOTS", "--slots");
+  const int tp = i.tensor_parallel > 0 ? i.tensor_parallel : std::atoi(tp_set.c_str());
+  const std::string wire = s.get("XEN_WIRE", "--wire"), card = s.get("XEN_CARD", "--card");
+  fact_row(rows, "parallel",
+           {tp > 0 ? "TP " + std::to_string(tp) + (tp > 1 && !wire.empty() ? dot + "wire " + wire : "") : "", tp == 1 && !card.empty() ? "card " + card : "",
+            slots.empty() ? "" : slots + " slots"});
+
+  // speculation: the drafter (the kind the server reports, else what the settings say), its checkpoint, and what it gave
+  const std::string drafter = s.get("XEN_DRAFTER", "--drafter"), drafter_model = s.get("XEN_DRAFTER_MODEL", "--drafter-model");
+  const std::string tree = s.get("XEN_DRAFTER_TREE", "--drafter-tree"), mtp = s.get("XEN_MTP_DEPTH", "--mtp-depth");
+  const std::string &kind = i.engine_drafter;  // "none", "mtp", "dflash2", "dspine", "...+mtp"
+  const bool off = kind == "none" || (kind.empty() && drafter == "0");
+  const bool block = kind.empty() ? !off && !drafter_model.empty() : kind.rfind("dflash2", 0) == 0 || kind.rfind("dspine", 0) == 0;
+  std::string drafting;
+  if (off) drafting = "drafter off";
+  else if (kind.rfind("dspine", 0) == 0) drafting = "DSpine";
+  else if (kind.rfind("dflash2", 0) == 0) drafting = "DFlash 2";
+  else if (kind == "mtp" || (kind.empty() && !drafter.empty() && !block)) drafting = "MTP" + (mtp.empty() ? std::string() : " depth " + mtp);
+  if (kind.ends_with("+mtp")) drafting += " + MTP";
+  char per_step[96] = "";
+  if (totals.spec_steps > 0) std::snprintf(per_step, sizeof per_step, "%.2f tokens per step this run", totals.spec_tokens / totals.spec_steps);
+  fact_row(rows, "speculation",
+           {drafting, block && !drafter_model.empty() ? "drafter " + base_name(drafter_model) : "", !off && block && !tree.empty() && tree != "0" ? "tree " + tree : "", per_step});
+
+  // hardware: the cards, their power limit and draw, the clock, the machine
+  std::string cap, draw, clock;
+  if (i.power) {
+    const RunPower &p = *i.power;
+    if (!p.cards.empty() && p.cards.front().cap_watts > 0) {
+      const bool same = std::all_of(p.cards.begin(), p.cards.end(), [&](const PowerCard &c) { return c.cap_watts == p.cards.front().cap_watts; });
+      cap = format_number(p.cards.front().cap_watts) + " W cap" + (same && p.cards.size() > 1 ? " each" : "");
+    }
+    double sum = 0, peak = 0, mhz_sum = 0, mhz_low = 0;
+    int n = 0, n_mhz = 0;
+    for (const PowerPoint &pt : p.trace) {
+      double w = 0;
+      for (const double card_w : pt.watts) w += card_w;
+      sum += w, peak = std::max(peak, w), ++n;
+      if (pt.mhz > 0) mhz_sum += pt.mhz, mhz_low = n_mhz ? std::min(mhz_low, pt.mhz) : pt.mhz, ++n_mhz;
+    }
+    if (n) draw = num(sum / n) + " W mean" + dot + num(peak) + " W peak" + (p.cards.size() > 1 ? " (all cards)" : "") + dot + "idle " + num(p.idle_watts) + " W";
+    if (n_mhz) clock = "clock " + num(mhz_sum / n_mhz) + " MHz mean" + dot + num(mhz_low) + " lowest";
+  }
+  // the cards' heat and what held their clock back (the power sampler's sensors; none when it could not read them). The
+  // driver's reasons in two kinds: the power limit (pl1, pl2, pl4, vr_tdc: a card at its cap, expected under load) and
+  // heat (thermal, prochot, vr_thermalert, ratl and anything else: the cooling cannot keep up), each with its share of
+  // the run's points.
+  std::string heat, power_limited, hot_limited;
+  if (i.power) {
+    const RunPower &p = *i.power;
+    const bool temps = std::any_of(p.cards.begin(), p.cards.end(), [](const PowerCard &c) { return c.reads_temp; });
+    const bool limits = std::any_of(p.cards.begin(), p.cards.end(), [](const PowerCard &c) { return c.reads_throttle; });
+    double sum = 0, peak = 0;
+    int n = 0, by_power = 0, by_heat = 0;
+    std::string power_reasons, heat_reasons;
+    auto add = [](std::string &list, const std::string &word) {
+      if ((", " + list + ",").find(" " + word + ",") == std::string::npos) list += (list.empty() ? "" : ", ") + word;
+    };
+    for (const PowerPoint &pt : p.trace) {
+      if (pt.temp_c > 0) sum += pt.temp_c, peak = std::max(peak, pt.temp_c), ++n;
+      bool power_point = false, heat_point = false;
+      std::string word;
+      for (size_t c = 0; c <= pt.throttle.size(); ++c)
+        if (c < pt.throttle.size() && pt.throttle[c] != ' ') word += pt.throttle[c];
+        else {
+          if (word.empty()) continue;
+          const bool power_word = word == "pl1" || word == "pl2" || word == "pl4" || word == "vr_tdc";
+          add(power_word ? power_reasons : heat_reasons, word);
+          (power_word ? power_point : heat_point) = true;
+          word.clear();
+        }
+      by_power += power_point, by_heat += heat_point;
+    }
+    if (temps && n) heat = "GPU " + num(sum / n) + " \xC2\xB0" "C mean" + dot + num(peak) + " \xC2\xB0" "C peak";
+    if (limits && !p.trace.empty()) {
+      auto share = [&](int k) {
+        char text[32];
+        std::snprintf(text, sizeof text, "%.0f%%", 100.0 * k / static_cast<double>(p.trace.size()));
+        return std::string(text);
+      };
+      if (by_power) power_limited = "at its power limit " + share(by_power) + " of the run (" + power_reasons + ")";
+      hot_limited = by_heat ? "throttled by heat " + share(by_heat) + " of the run (" + heat_reasons + ")" : by_power ? "never throttled by heat" : "never throttled";
+    }
+    if (!p.cards.empty() && p.cards.front().max_mhz > 0 && !clock.empty()) clock += dot + "max " + num(p.cards.front().max_mhz);
+  }
+  const std::string driver = i.devices.empty() ? std::string() : i.devices.front().driver;
+  fact_row(rows, "hardware", {gpus_text(i.devices), driver.empty() ? "" : "driver " + driver, cap, draw, clock, heat, power_limited, hot_limited});
+
+  // machine: the server's (its own report; else the bench's when it measured the cards here, so the same machine)
+  const util::Machine &m = !i.machine.kernel.empty() ? i.machine : i.power ? i.bench_machine : util::Machine{};
+  fact_row(rows, "machine",
+           {m.os, m.kernel.empty() ? "" : "kernel " + m.kernel, m.cpu.empty() ? "" : m.cpu + (m.cpu_threads > 0 ? " (" + std::to_string(m.cpu_threads) + " threads)" : ""),
+            m.memory_gib > 0 ? std::to_string(m.memory_gib) + " GiB RAM" : "", i.host.empty() ? "" : "bench ran on " + i.host});
+
+  // sampling: what the benchmark's requests asked for
+  char sampling[96];
+  std::snprintf(sampling, sizeof sampling, "temperature %g%stop_p %g%stop_k %d", i.sampling.temperature, dot.c_str(), i.sampling.top_p, dot.c_str(), i.sampling.top_k);
+  fact_row(rows, "sampling", {sampling, "thinking " + (i.thinking.empty() ? std::string("default") : i.thinking), "seed " + std::to_string(i.seed)});
+
+  // during the run: the server's prefix cache, the corpus (the requests and replies are chips above)
+  std::string cache;
+  if (totals.cache_asked > 0) {
+    char pct[32];
+    std::snprintf(pct, sizeof pct, " (%.0f%%)", 100 * totals.cache_hit / totals.cache_asked);
+    cache = num(totals.cache_hit) + " of " + num(totals.cache_asked) + " prompt tokens from the server's cache" + pct;
+  }
+  fact_row(rows, "during run", {cache, "corpus " + i.corpus + " v" + std::to_string(i.corpus_version) + dot + i.corpus_hash});
+
+  return "<dl class=\"facts\">" + rows + "</dl>" + rerun_html(run, s);
 }
 
 // The masthead: the brand (and the buttons the script adds), the model, and the run's facts as chips.
 std::string header_html(const Run &run) {
   const RunInfo &i = run.info;
   const int failed = failed_requests(run);
-  std::string chips = "<li>" + escaped(timestamp_text(i.timestamp)) + "</li><li>mode <b>" + escaped(i.mode) + "</b></li><li>suite <b>" + escaped(i.suite) + "</b></li><li><b>" +
+  std::string chips = "<li>" + escaped(timestamp_text(i.timestamp)) + "</li>";
+  chips += "<li>mode <b>" + escaped(i.mode) + "</b></li><li>suite <b>" + escaped(i.suite) + "</b></li><li><b>" +
                       duration_text(i.seconds) + "</b></li>";
   chips += "<li><b>" + with_thousands(all_requests(run)) + "</b> requests</li>";
   if (failed) chips += "<li class=\"bad\"><b>" + std::to_string(failed) + "</b> failed</li>";
   chips += "<li>replies <b>" + escaped(i.reply_length) + "</b></li><li>" + escaped(i.endpoint) + "</li>";
   return "<header id=\"top\"><div class=\"top\"><div class=\"brand\"><i>\xE2\x97\x86</i>xenithium <b>bench</b></div><div class=\"tools\"></div></div><h1>" + escaped(i.model) +
-         "</h1><ul class=\"chips\">" + chips + "</ul></header>";
+         "</h1><ul class=\"chips\">" + chips + "</ul>" + facts_html(run) + "</header>";
 }
 
 // Writes the page's own size where kSizeToken stands. The number's width can change the size, so settle it.

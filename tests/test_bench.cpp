@@ -302,6 +302,12 @@ void test_power() {
     write_text(root / card / "device/hwmon/hwmon3/power1_cap", "220000000\n");
   }
   write_text(root / "card0/device/tile0/gt0/freq0/act_freq", "2400\n");
+  write_text(root / "card0/device/tile0/gt0/freq0/rp0_freq", "2800\n");
+  write_text(root / "card0/device/hwmon/hwmon3/temp1_label", "vram\n");
+  write_text(root / "card0/device/hwmon/hwmon3/temp1_input", "90000\n");
+  write_text(root / "card0/device/hwmon/hwmon3/temp2_label", "pkg\n");
+  write_text(root / "card0/device/hwmon/hwmon3/temp2_input", "61000\n");
+  write_text(root / "card0/device/tile0/gt0/freq0/throttle/reasons", "none\n");
   write_text(root / "card0-DP-1/status", "connected\n");
   write_text(root / "card2/device/vendor", "0x1234\n");
   {
@@ -320,6 +326,17 @@ void test_power() {
       CHECK(meter->use(to_s, to_s).joules == 0 && !meter->trace(0, 100).empty() && meter->trace(0, 100).back().watts.size() == 2, "power: an empty span is zero; the trace has a point per card");
       write_text(root / "card0/device/hwmon/hwmon3/energy1_input", "5\n");  // the counter restarted
       CHECK(meter->use(to_s, meter->mark()).watts_per_card[0] == 0, "power: a counter that went backwards counts as nothing");
+      CHECK(meter->cards()[0].max_mhz == 2800 && meter->cards()[0].reads_temp && meter->cards()[0].reads_throttle && !meter->cards()[1].reads_temp &&
+                !meter->cards()[1].reads_throttle && meter->trace(0, 100).back().temp_c == 61 && meter->trace(0, 100).back().throttle.empty(),
+            "power: the max clock, the package temperature (not another sensor) and no throttling of the card that reports them");
+      write_text(root / "card0/device/hwmon/hwmon3/temp2_input", "88000\n");
+      write_text(root / "card0/device/tile0/gt0/freq0/throttle/reasons", "pl1 thermal\n");
+      meter->mark();
+      write_text(root / "card0/device/tile0/gt0/freq0/throttle/reasons", "thermal\n");
+      meter->mark();
+      const auto hot = meter->trace(0, 1);
+      CHECK(hot.size() == 1 && hot[0].temp_c == 88 && hot[0].throttle == "pl1 thermal", "power: a point keeps the hottest reading and every throttle reason since the previous one ('%s')",
+            hot.empty() ? "" : hot[0].throttle.c_str());
     }
   }
   fs::remove_all(root);
@@ -432,6 +449,149 @@ void test_report() {
             back->info.power->trace[2].watts == std::vector<double>({215, 195}) && back->info.power->trace[2].mhz == 2200,
         "run file: charts, the scenario's power and the run's power trace survive the round trip");
   CHECK(!b::run_from_json("{\"tool\":\"other\"}", err) && !b::run_from_json("not json", err), "run file: another tool's file and a non-JSON text are refused");
+  {  // what the endpoint runs on: the cards and the TP width survive the round trip and head both reports
+    b::Run on = sample_run(200);
+    on.info.tensor_parallel = 2;
+    on.info.devices = {{"Intel(R) Arc(TM) Pro B65 Graphics", 32530182144ull, 32, "0000:01:00.0"}, {"Intel(R) Arc(TM) Pro B65 Graphics", 32530182144ull, 32, "0000:02:00.0"}};
+    const auto on_back = b::run_from_json(b::to_json(on), err);
+    CHECK(on_back && on_back->info.tensor_parallel == 2 && on_back->info.devices.size() == 2 && on_back->info.devices[1].pci == "0000:02:00.0" &&
+              on_back->info.devices[0].memory_bytes == 32530182144ull && on_back->info.devices[0].memory_gb == 32 && on_back->info.devices[0].name == on.info.devices[0].name,
+          "run file: the cards and the TP width survive the round trip");
+    CHECK(b::render_run(on).find("runs on 2x Intel Arc Pro B65 Graphics, 32 GB; TP 2\n") != std::string::npos && b::render_run(run).find("runs on") == std::string::npos,
+          "run report: a 'runs on' line names the cards (their nominal size) and the TP width, none when neither is known");
+    const std::string page = b::render_html(on);
+    CHECK(page.find("<dt>hardware</dt><dd><ul class=\"chips\"><li>2x Intel Arc Pro B65 Graphics, 32 GB</li>") != std::string::npos &&
+              page.find("<dt>parallel</dt><dd><ul class=\"chips\"><li>TP 2</li>") != std::string::npos && page.find("<li>GPU ") == std::string::npos &&
+              page.find("<dt>PCI</dt><dd>0000:01:00.0, 0000:02:00.0</dd>") != std::string::npos && b::render_html(run).find("<li>TP ") == std::string::npos,
+          "html report: the cards in the hardware row and the TP width in the parallel row (not as top chips; none when not known), the PCI addresses in the recorded section");
+    b::Run launched = on;  // a server started by hand: its command line in the notes (env words and flags)
+    launched.info.notes.push_back({"server_cmd", "XEN_TRAINED_QSA_DELTA_DIR=/m/qsa-sidecar build/xenithium-server --model /m/ckpt-w4 --kv int8-v4 --drafter 1 "
+                                                 "--drafter-model /m/dflash2 --drafter-tree 7 --prefix-cache 1 --prefix-cache-gib 8 --wire bf16"});
+    const std::string facts = b::render_html(launched);
+    CHECK(facts.find("<dt>KV cache</dt><dd><ul class=\"chips\"><li>int8-v4 KV</li>") != std::string::npos && facts.find("<li>trained QSA qsa-sidecar</li>") != std::string::npos &&
+              facts.find("<li>prefix cache on \xC2\xB7 8 GiB host</li>") != std::string::npos && facts.find("<li>drafter dflash2</li><li>tree 7</li>") != std::string::npos &&
+              facts.find("<li>TP 2 \xC2\xB7 wire bf16</li>") != std::string::npos && facts.find("<li>16 slots</li>") != std::string::npos &&
+              facts.find("<dt>model</dt><dd><ul class=\"chips\"><li>ckpt-w4</li>") != std::string::npos &&
+              facts.find("<pre class=\"cmd\">source scripts/oneapi-env.sh\nXEN_TRAINED_QSA_DELTA_DIR=/m/qsa-sidecar build/xenithium-server") != std::string::npos,
+          "html report: the facts rows read the notes (XEN_SLOTS) and a hand-started server's command line (env words, flags), the command to copy below");
+    CHECK(b::hide_command_secrets("XEN_API_KEY=abc  build/x --api-key k1 --x-token=k2 --name hf_abcdefghijklmnopqrstuvwxyz\n  --proxy http://u:pw@h:1 --model /m") ==
+              "XEN_API_KEY=(hidden)  build/x --api-key (hidden) --x-token=(hidden) --name (hidden)\n  --proxy http://u:(hidden)@h:1 --model /m" &&
+              b::hide_command_secrets("XEN_AUTHORIZATION='Bearer x' a") == "XEN_AUTHORIZATION=(hidden) a" &&
+              b::hide_command_secrets("XEN_NOTE=\"two words\" --x-token \"Bearer y z\" b") == "XEN_NOTE=\"two words\" --x-token (hidden) b" && b::hide_note("XEN_API_KEY", "abc") == "(hidden)" &&
+              b::hide_note("purpose", "report-e2e") == "report-e2e" && b::hide_command_secrets("") == "",
+          "run file: a command line's secrets hidden by the server's rules (NAME=V, --flag=V, --flag V, token-looking words, URL passwords), its spacing kept");
+    b::Run keyed = on;  // a hand-written server_cmd note with keys in it (a run from before the bench hid them)
+    keyed.info.notes.push_back({"server_cmd", "XEN_API_KEY=abc123 build/xenithium-server --model /m/ckpt --api-key sekrit --served-model-name hf_abcdefghijklmnopqrstuvwxyz"});
+    const std::string keyed_page = b::render_html(keyed);
+    CHECK(keyed_page.find("abc123") == std::string::npos && keyed_page.find("sekrit") == std::string::npos && keyed_page.find("hf_abcdefghij") == std::string::npos &&
+              keyed_page.find("XEN_API_KEY=(hidden) build/xenithium-server --model /m/ckpt --api-key (hidden)") != std::string::npos &&
+              keyed_page.find("Where it shows <code>(hidden)</code>, it held a key, token or password") != std::string::npos,
+          "html report: a server_cmd note's keys are hidden in the server step and the recorded section, with the put-your-own hint");
+    const std::string bare = b::render_html(run);
+    CHECK(bare.find("<dt>speculation</dt>") == std::string::npos &&
+              bare.find("<section id=\"setup\"><h2><span class=\"ttl\">Everything the run recorded</span></h2><dl class=\"setup\">") != std::string::npos &&
+              bare.find("<dt>context</dt>") == std::string::npos && bare.find(">Setup<") == std::string::npos &&
+              bare.find("<b>This run did not record how its server was started</b>") != std::string::npos &&
+              bare.find("git clone https://github.com/Niluthon/xenithium\ncd xenithium</pre>") != std::string::npos &&
+              bare.find("did not record its revision: you get the newest code") != std::string::npos &&
+              bare.find("<pre class=\"cmd\">build/xenithium-bench run \\\n  --url http://e/v1 \\\n  --suite quick \\\n  --mode medium") != std::string::npos &&
+              bare.find("git checkout") == std::string::npos,
+          "html report: a row with nothing known is left out; one recorded section without what the rows show; an unrecorded server says so, the benchmark's "
+          "command is rebuilt from the run, no build step without a revision");
+    b::Run from_launcher = run;  // a Bench-tab run: the launcher's launch.env as notes
+    from_launcher.info.notes = {{"settings_file", "~/.xenithium/launch.env"}, {"XEN_MODEL", "/m/ckpt"}, {"XEN_KV", "int8-v4"}};
+    const std::string launcher_page = b::render_html(from_launcher);
+    CHECK(launcher_page.find("<pre class=\"cmd\">XEN_MODEL=/m/ckpt \\\nXEN_KV=int8-v4 \\\nscripts/start-server.sh</pre>") != std::string::npos &&
+              launcher_page.find("<li>int8-v4 KV</li>") != std::string::npos,
+          "html report: a launcher run's server step starts start-server.sh with its settings");
+    b::Run reported = on;  // the server reported its own launch and the benchmark kept its command
+    reported.info.engine = "xenithium", reported.info.engine_build = "abc1234-dirty", reported.info.engine_oneapi = "2025.3.0", reported.info.engine_drafter = "dspine";
+    reported.info.notes = {{"XEN_KV", "bf16"}};  // the launcher said otherwise: the server's own report wins
+    reported.info.server_args = {"--model", "/m/ckpt-w4", "--kv", "int8-v4", "--chat-template", "a b"};
+    reported.info.server_env = {{"XEN_BENCH_API_KEY", "(hidden)"}, {"XEN_HTTP_PROXY", "http://u:(hidden)@h:1"}, {"XEN_QSA_GATHER", "1"}};
+    reported.info.command = {"--url", "http://x:8000/v1", "--suite", "quick", "--out", "/srv/mine/runs", "--api-key", "(hidden)"};
+    reported.info.devices[0].driver = "1.17.39395+16";
+    const auto reported_back = b::run_from_json(b::to_json(reported), err);
+    CHECK(reported_back && reported_back->info.engine_build == "abc1234-dirty" && reported_back->info.server_args == reported.info.server_args &&
+              reported_back->info.server_env == reported.info.server_env && reported_back->info.command == reported.info.command &&
+              reported_back->info.devices[0].driver == "1.17.39395+16" && reported_back->info.engine_oneapi == "2025.3.0" && reported_back->info.engine_drafter == "dspine",
+          "run file: the server's build, oneAPI, drafter and launch, the benchmark's command and the driver survive the round trip");
+    const std::string rerun = b::render_html(reported);
+    CHECK(rerun.find("<details class=\"launch rerun\"><summary>Run this yourself: step by step, from a fresh machine</summary>") != std::string::npos &&
+              rerun.find("git clone https://github.com/Niluthon/xenithium\ncd xenithium\ngit checkout abc1234</pre>") != std::string::npos &&
+              rerun.find("scripts/install-deps.sh\nsource scripts/oneapi-env.sh\nsycl-ls</pre>") != std::string::npos &&
+              rerun.find("scripts/build-host.sh xenithium-server xenithium-bench</pre>") != std::string::npos &&
+              rerun.find("changes that were never committed") != std::string::npos && rerun.find("the same cards: <b>2x Intel Arc Pro B65 Graphics, 32 GB</b> (TP 2)") != std::string::npos &&
+              rerun.find("<li>the model: <code>ckpt-w4</code> (this run: <code>/m/ckpt-w4</code>)</li>") != std::string::npos &&
+              rerun.find("<pre class=\"cmd\">ls -d /m/ckpt-w4</pre>") != std::string::npos && rerun.find("build/xenithium-bench compare THIS_RUN YOUR_RUN") != std::string::npos &&
+              rerun.find("XEN_QSA_GATHER=1 \\\nbuild/xenithium-server \\\n  --model /m/ckpt-w4 \\\n  --kv int8-v4 \\\n  --chat-template 'a b'") != std::string::npos &&
+              rerun.find("build/xenithium-bench run \\\n  --url http://x:8000/v1 \\\n  --suite quick</pre>") != std::string::npos &&
+              rerun.find("<li>xenithium abc1234-dirty</li>") != std::string::npos && rerun.find("<li>driver 1.17.39395+16</li>") != std::string::npos &&
+              rerun.find("<li>int8-v4 KV</li>") != std::string::npos && rerun.find("<li>bench ran on h</li>") != std::string::npos &&
+              rerun.find("<li>API: ignore_eos") != std::string::npos && rerun.find("<li>oneAPI 2025.3.0</li>") != std::string::npos &&
+              rerun.find("<dt>speculation</dt><dd><ul class=\"chips\"><li>DSpine</li>") != std::string::npos && rerun.find("<li>bf16 KV</li>") == std::string::npos &&
+              rerun.find("<dt>XEN_QSA_GATHER</dt><dd>1</dd>") != std::string::npos && rerun.find("XEN_BENCH_API_KEY=") == std::string::npos &&
+              rerun.find("Left out: <code>XEN_BENCH_API_KEY</code>, which held a key or token") != std::string::npos &&
+              rerun.find("/srv/mine/runs") == std::string::npos && rerun.find("your results go to <code>~/.xenithium/bench/runs</code>") != std::string::npos &&
+              rerun.find("add <code>--api-key YOUR_KEY</code>") != std::string::npos &&
+              rerun.find("Where the command shows <code>(hidden)</code>") != std::string::npos,
+          "html report: run this yourself - clone at the run's revision (dirty flagged), install, build, the model files and a check, the server as it "
+          "reported its launch (quoted where needed), the "
+          "benchmark as typed; the engine row names the build and oneAPI, the speculation row the reported drafter, the hardware row the driver and where the "
+          "bench ran; the reported launch wins over the notes, its XEN_ variables are in the recorded section; a hidden key is left out of the server "
+          "command and named, --out and --api-key left out of the benchmark's");
+    b::Run measured = on;  // the server's machine, the bench's, and what the sensors said
+    measured.info.machine = {.os = "Ubuntu 26.04.1 LTS", .kernel = "7.0.0-43-generic", .cpu = "AMD EPYC 7282 16-Core Processor", .cpu_threads = 16, .memory_gib = 46};
+    measured.info.bench_machine = {.os = "Fedora 44", .kernel = "7.1.0", .cpu = "Laptop CPU", .cpu_threads = 8, .memory_gib = 16};
+    for (b::PowerCard &c : measured.info.power->cards) c.max_mhz = 2800, c.reads_temp = true, c.reads_throttle = true;
+    for (size_t p = 0; p < measured.info.power->trace.size(); ++p) measured.info.power->trace[p].temp_c = 60.0 + 10.0 * static_cast<double>(p);
+    measured.info.power->trace[1].throttle = "pl1";
+    measured.info.power->trace[2].throttle = "pl1 thermal";
+    const auto measured_back = b::run_from_json(b::to_json(measured), err);
+    CHECK(measured_back && measured_back->info.machine.cpu == "AMD EPYC 7282 16-Core Processor" && measured_back->info.machine.memory_gib == 46 &&
+              measured_back->info.bench_machine.kernel == "7.1.0" && measured_back->info.power->cards[0].max_mhz == 2800 && measured_back->info.power->cards[1].reads_throttle &&
+              measured_back->info.power->trace[2].temp_c == 80 && measured_back->info.power->trace[2].throttle == "pl1 thermal" && measured_back->info.power->trace[0].throttle.empty(),
+          "run file: both machines, the cards' max clock and sensors, and each point's temperature and throttle reasons survive the round trip");
+    {  // the first trace row damaged (one number): it is skipped, and the later points keep their own temperature and reasons
+      std::string text = b::to_json(measured);
+      const size_t trace = text.find("\"trace\": [");
+      const size_t open = text.find('[', trace + 10), close = text.find(']', open + 1);
+      CHECK(trace != std::string::npos && open != std::string::npos && close != std::string::npos, "run file: the test finds the trace's first row");
+      text.replace(open + 1, close - open - 1, "1");
+      const auto damaged = b::run_from_json(text, err);
+      CHECK(damaged && damaged->info.power->trace.size() == measured.info.power->trace.size() - 1 && damaged->info.power->trace[0].temp_c == 70 &&
+                damaged->info.power->trace[0].throttle == "pl1" && damaged->info.power->trace[1].temp_c == 80 && damaged->info.power->trace[1].throttle == "pl1 thermal",
+            "run file: a malformed trace row is skipped without shifting the later points' temperature and throttle reasons");
+    }
+    const std::string hw = b::render_html(measured);
+    CHECK(hw.find("<dt>machine</dt><dd><ul class=\"chips\"><li>Ubuntu 26.04.1 LTS</li><li>kernel 7.0.0-43-generic</li><li>AMD EPYC 7282 16-Core Processor (16 threads)</li><li>46 GiB RAM</li>") !=
+                  std::string::npos &&
+              hw.find("<li>GPU 70 \xC2\xB0" "C mean \xC2\xB7 80 \xC2\xB0" "C peak</li>") != std::string::npos && hw.find("<li>at its power limit 67% of the run (pl1)</li><li>throttled by heat 33% of the run (thermal)</li>") != std::string::npos &&
+              hw.find("max 2,800</li>") != std::string::npos && hw.find("<dt>bench machine</dt><dd>Fedora 44, kernel 7.1.0, Laptop CPU (8 threads), 16 GiB RAM</dd>") != std::string::npos,
+          "html report: the machine row (the server's own), the GPU temperature, the power-limited and heat-throttled shares with their reasons, the max "
+          "clock; the bench's machine recorded");
+    b::Run capped = measured;  // a card at its power cap all run, never hot
+    for (b::PowerPoint &pt : capped.info.power->trace) pt.throttle = "pl2";
+    const std::string capped_page = b::render_html(capped);
+    CHECK(capped_page.find("<li>at its power limit 100% of the run (pl2)</li><li>never throttled by heat</li>") != std::string::npos,
+          "html report: a card at its power cap is said to be at its power limit, not throttled by heat");
+    b::Run cool = measured;
+    cool.info.machine = {};
+    for (b::PowerPoint &pt : cool.info.power->trace) pt.throttle.clear();
+    const std::string cool_page = b::render_html(cool);
+    CHECK(cool_page.find("<li>never throttled</li>") != std::string::npos && cool_page.find("<li>Fedora 44</li>") != std::string::npos && b::render_html(on).find("throttled") == std::string::npos,
+          "html report: never throttled; without the server's machine the bench's (it measured the cards here); nothing said without sensors");
+    b::Run vllm = run;  // the engine the endpoint names
+    vllm.info.engine = "vLLM";
+    const auto engine_back = b::run_from_json(b::to_json(vllm), err);
+    CHECK(engine_back && engine_back->info.engine == "vLLM" && b::run_from_json(b::to_json(run), err)->info.engine.empty(), "run file: the endpoint's engine name survives the round trip");
+    b::Run mixed = on;
+    mixed.info.devices[1] = {"Other Card", 1610612736ull, 0, ""};
+    mixed.info.devices.push_back({"Named Only", 0, 0, ""});
+    CHECK(b::gpus_text(mixed.info.devices) == "1x Intel Arc Pro B65 Graphics, 32 GB + 1x Other Card, 1.5 GiB + 1x Named Only" &&
+              b::devices_text({}, 4, "-") == "TP 4" && b::devices_text({}, 0, "-") == "-",
+          "devices text: unlike cards listed apart, GiB where only the driver's figure is known, a TP width alone, the missing text when neither");
+  }
   xenithium::json::Value root;
   CHECK(xenithium::json::parse(b::to_json(run), root) && root.get_object("summary") && root.get_object("summary")->get("decode_tps")->num == 200,
         "run file: the summary carries the weighted decode figure");
@@ -632,7 +792,7 @@ class FakeEndpoint {
 
   void serve(int fd) {
     const std::string request = read_request(fd);
-    if (request.rfind("GET /v1/models", 0) == 0) send_plain(fd, 200, R"({"object":"list","data":[{"id":"fake-model","max_model_len":8192,"kv_pool_tokens":40000},{"id":"other-listed","max_model_len":4096}]})");
+    if (request.rfind("GET /v1/models", 0) == 0) send_plain(fd, 200, R"({"object":"list","data":[{"id":"fake-model","max_model_len":8192,"kv_pool_tokens":40000,"tensor_parallel":1,"devices":[{"name":"Card A","memory_bytes":1073741824,"memory_gb":1,"pci":"0000:03:00.0"}]},{"id":"other-listed","max_model_len":4096}]})");
     else if (request.rfind("POST /v1/chat/completions", 0) != 0) send_plain(fd, 404, "{}");
     else if (request.find("\"top_k\"") != std::string::npos) send_plain(fd, 400, R"({"error":{"message":"unknown field top_k"}})");
     else if (refuse_images && request.find("\"image_url\"") != std::string::npos) send_plain(fd, 400, R"({"error":{"message":"image input is off on this server"}})");
@@ -688,6 +848,9 @@ void test_end_to_end() {
         err.c_str());
   const auto second = b::served_model(*endpoint, "other-listed", 10, err);
   CHECK(second && second->id == "other-listed" && second->max_model_len == 4096 && second->kv_pool_tokens == 0, "end to end: a named model's own context, not the first entry's");
+  CHECK(served && served->tensor_parallel == 1 && served->devices.size() == 1 && served->devices[0].name == "Card A" && served->devices[0].memory_bytes == 1073741824 && served->devices[0].memory_gb == 1 &&
+            served->devices[0].pci == "0000:03:00.0" && second && second->tensor_parallel == 0 && second->devices.empty(),
+        "end to end: the cards and the TP width the endpoint reports (none where it reports none)");
   std::string unlisted_err;
   CHECK(!b::served_model(*endpoint, "not-listed", 10, unlisted_err) && unlisted_err.find("not-listed") != std::string::npos, "end to end: a model the endpoint does not list is named in the error");
 

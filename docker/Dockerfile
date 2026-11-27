@@ -3,8 +3,11 @@
 # Xenithium image: builds the engine with the toolchain it is tested with (oneAPI 2026.2 DPC++, oneAPI's oneDNN, Level
 # Zero + the Intel GPU user-mode driver with its OpenCL device) and ships a runtime image without the compiler.
 #
-#   docker compose build                          (compose.yaml at the repo root; the usual way)
-#   docker build -f docker/Dockerfile -t xenithium:beta .
+#   XEN_BUILD_REV=$(git describe --always --dirty) docker compose build    (compose.yaml at the repo root; the usual way)
+#   docker build -f docker/Dockerfile --build-arg XEN_BUILD_REV=$(git describe --always --dirty) -t xenithium:beta .
+#
+# XEN_BUILD_REV: the revision GET /v1/models reports as "build" (the context has no .git: .dockerignore); without it,
+# "unknown", and a benchmark page cannot say which revision to check out.
 #
 # Stages: deps (compiler, oneDNN, build tools: scripts/install-deps.sh) -> build (the engine, then the host test gates)
 # -> runtime (SYCL runtime, oneDNN, Level Zero, the GPU driver, ffmpeg, the binaries, scripts/, models/presets/, docs/).
@@ -25,12 +28,13 @@ RUN if dpkg -l | grep -qi 'intel-oneapi-ccl'; then echo "oneCCL must not be in t
 
 # ---------------------------------------------------------------- build
 FROM deps AS build
+ARG XEN_BUILD_REV=
 COPY . /opt/xenithium
 ENV XEN_ONEAPI=/opt/intel/oneapi/2026.2
 # Same configure as scripts/build-host.sh (Release, icpx, AOT for bmg), then the host gates (ctest label host; the gpu
 # gates need the cards: run scripts/test.sh on the host or in the container).
 RUN bash -c 'set -euo pipefail; source scripts/oneapi-env.sh; \
-      cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=Release; \
+      cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=Release -DXENITHIUM_BUILD_REV="${XEN_BUILD_REV}"; \
       cmake --build build -j "$(nproc)"; \
       ctest --test-dir build -L host --output-on-failure'
 # What the runtime image takes: the tools (not the test binaries) and the kernel library they load from build/.

@@ -8,6 +8,7 @@
 #include "scenario.hpp"
 #include "stats.hpp"
 #include "xenithium/util/json.hpp"
+#include "xenithium/util/secrets.hpp"
 
 namespace xenithium::bench {
 namespace {
@@ -182,6 +183,9 @@ json::Value run_power_json(const RunPower &power) {
     json::Value c = json::Value::object();
     c.set("name", json::Value::string(card.name));
     c.set("cap_watts", json::Value::real(card.cap_watts));
+    if (card.max_mhz > 0) c.set("max_mhz", json::Value::real(card.max_mhz));
+    if (card.reads_temp) c.set("reads_temp", json::Value::boolean(true));
+    if (card.reads_throttle) c.set("reads_throttle", json::Value::boolean(true));
     cards.push(std::move(c));
   }
   obj.set("cards", std::move(cards));
@@ -196,6 +200,11 @@ json::Value run_power_json(const RunPower &power) {
     trace.push(std::move(row));
   }
   obj.set("trace", std::move(trace));
+  // per trace row: the hottest GPU package and the throttle reasons (apart from the rows, which older readers parse)
+  json::Value temps = json::Value::array(), throttles = json::Value::array();
+  for (const PowerPoint &point : power.trace) temps.push(json::Value::real(point.temp_c)), throttles.push(json::Value::string(point.throttle));
+  obj.set("trace_temp_c", std::move(temps));
+  obj.set("trace_throttle", std::move(throttles));
   return obj;
 }
 
@@ -296,6 +305,49 @@ double number_at(const json::Value &obj, std::string_view key) {
   const json::Value *v = obj.get(key);
   return v && v->is_number() ? v->num : 0;
 }
+json::Value devices_json(const std::vector<Device> &devices) {
+  json::Value arr = json::Value::array();
+  for (const Device &d : devices) {
+    json::Value obj = json::Value::object();
+    obj.set("name", json::Value::string(d.name));
+    if (d.memory_bytes) obj.set("memory_bytes", json::Value::integer(static_cast<int64_t>(d.memory_bytes)));
+    if (d.memory_gb) obj.set("memory_gb", json::Value::integer(d.memory_gb));
+    if (!d.pci.empty()) obj.set("pci", json::Value::string(d.pci));
+    if (!d.driver.empty()) obj.set("driver", json::Value::string(d.driver));
+    arr.push(std::move(obj));
+  }
+  return arr;
+}
+std::vector<Device> devices_from(const json::Value *arr) {
+  std::vector<Device> out;
+  if (!arr) return out;
+  for (const json::Value &d : arr->arr)
+    out.push_back({.name = text_at(d, "name"), .memory_bytes = static_cast<uint64_t>(number_at(d, "memory_bytes")), .memory_gb = static_cast<int>(number_at(d, "memory_gb")),
+                   .pci = text_at(d, "pci"), .driver = text_at(d, "driver")});
+  return out;
+}
+json::Value machine_json(const util::Machine &m) {
+  json::Value obj = json::Value::object();
+  obj.set("os", json::Value::string(m.os));
+  obj.set("kernel", json::Value::string(m.kernel));
+  obj.set("cpu", json::Value::string(m.cpu));
+  obj.set("cpu_threads", json::Value::integer(m.cpu_threads));
+  obj.set("memory_gib", json::Value::integer(m.memory_gib));
+  return obj;
+}
+json::Value strings_json(const std::vector<std::string> &strings) {
+  json::Value arr = json::Value::array();
+  for (const std::string &s : strings) arr.push(json::Value::string(s));
+  return arr;
+}
+std::vector<std::string> strings_from(const json::Value *arr) {
+  std::vector<std::string> out;
+  if (arr)
+    for (const json::Value &v : arr->arr)
+      if (v.is_string()) out.push_back(v.str);
+  return out;
+}
+
 bool flag_at(const json::Value &obj, std::string_view key) {
   const json::Value *v = obj.get(key);
   return v && v->is_bool() && v->b;
@@ -333,14 +385,22 @@ ChartSpec chart_from(const json::Value &obj) {
 RunPower run_power_from(const json::Value &obj) {
   RunPower power;
   if (const json::Value *cards = obj.get_array("cards"))
-    for (const json::Value &card : cards->arr) power.cards.push_back({text_at(card, "name"), number_at(card, "cap_watts")});
+    for (const json::Value &card : cards->arr)
+      power.cards.push_back({.name = text_at(card, "name"), .cap_watts = number_at(card, "cap_watts"), .max_mhz = number_at(card, "max_mhz"),
+                             .reads_temp = flag_at(card, "reads_temp"), .reads_throttle = flag_at(card, "reads_throttle")});
   power.idle_watts = number_at(obj, "idle_watts");
   constexpr size_t kTraceHead = 2;  // seconds and clock come before the cards' watts
+  // trace_temp_c and trace_throttle hold one entry per trace row: taken by the row's own index, so a row skipped as
+  // malformed does not shift the later ones onto the wrong points
+  const json::Value *temps = obj.get_array("trace_temp_c"), *throttles = obj.get_array("trace_throttle");
   if (const json::Value *trace = obj.get_array("trace"))
-    for (const json::Value &row : trace->arr) {
+    for (size_t r = 0; r < trace->arr.size(); ++r) {
+      const json::Value &row = trace->arr[r];
       if (row.arr.size() < kTraceHead) continue;
-      PowerPoint point{row.arr[0].num, {}, row.arr[1].num};
+      PowerPoint point{.at_s = row.arr[0].num, .watts = {}, .mhz = row.arr[1].num};
       for (size_t i = kTraceHead; i < row.arr.size(); ++i) point.watts.push_back(row.arr[i].num);
+      if (temps && r < temps->arr.size() && temps->arr[r].is_number()) point.temp_c = temps->arr[r].num;
+      if (throttles && r < throttles->arr.size() && throttles->arr[r].is_string()) point.throttle = throttles->arr[r].str;
       power.trace.push_back(std::move(point));
     }
   return power;
@@ -484,6 +544,80 @@ std::vector<std::string> unique_notes(const ScenarioResult &scenario) {
   return notes;
 }
 
+std::string gpus_text(const std::vector<Device> &devices) {
+  auto name_of = [](std::string name) {
+    for (const std::string_view mark : {"(R)", "(TM)"})
+      for (size_t at; (at = name.find(mark)) != std::string::npos;) name.erase(at, mark.size());
+    return name;
+  };
+  std::string out;
+  for (size_t d = 0; d < devices.size();) {
+    size_t same = d + 1;
+    while (same < devices.size() && devices[same].name == devices[d].name && devices[same].memory_bytes == devices[d].memory_bytes &&
+           devices[same].memory_gb == devices[d].memory_gb)
+      ++same;
+    std::string part = std::to_string(same - d) + "x " + name_of(devices[d].name);
+    if (devices[d].memory_gb) part += ", " + std::to_string(devices[d].memory_gb) + " GB";  // the size on the box
+    else if (devices[d].memory_bytes) {  // only the driver's figure: in GiB, as it is
+      char gib[32];
+      std::snprintf(gib, sizeof gib, ", %.1f GiB", static_cast<double>(devices[d].memory_bytes) / 1073741824.0);
+      part += gib;
+    }
+    out += (out.empty() ? "" : " + ") + part;
+    d = same;
+  }
+  return out;
+}
+
+std::string devices_text(const std::vector<Device> &devices, int tensor_parallel, std::string_view missing) {
+  std::string out = gpus_text(devices);
+  if (tensor_parallel > 0) out += (out.empty() ? "TP " : "; TP ") + std::to_string(tensor_parallel);
+  return out.empty() ? std::string(missing) : out;
+}
+
+std::string hide_command_secrets(std::string_view command) {
+  std::string out;
+  bool after_secret_flag = false;  // the previous word was --some-token: this one is its value
+  size_t at = 0;
+  while (at < command.size()) {
+    const size_t start = command.find_first_not_of(" \t\n\r", at);
+    out.append(command.substr(at, (start == std::string_view::npos ? command.size() : start) - at));  // the spacing
+    if (start == std::string_view::npos) break;
+    size_t end = start;  // a word ends at a space outside quotes: XEN_X='Bearer abc' is one word
+    for (char quote = 0; end < command.size(); ++end) {
+      const char c = command[end];
+      if (quote) {
+        if (c == quote) quote = 0;
+      } else if (c == '\'' || c == '"') {
+        quote = c;
+      } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+        break;
+      }
+    }
+    const std::string word(command.substr(start, end - start));
+    std::string bare = word;  // without quotes, for the checks
+    std::erase_if(bare, [](char c) { return c == '\'' || c == '"'; });
+    const size_t eq = bare.find('=');
+    std::string shown;
+    if (after_secret_flag || util::secret_value(bare)) {
+      shown = "(hidden)";
+    } else if (eq != std::string::npos && eq > 0 && (util::secret_name(bare.substr(0, eq)) || util::secret_value(std::string_view(bare).substr(eq + 1)))) {
+      shown = bare.substr(0, eq) + "=(hidden)";
+    } else {
+      shown = util::hide_url_credentials(word);
+    }
+    after_secret_flag = bare.rfind("--", 0) == 0 && eq == std::string::npos && util::secret_name(bare);
+    out += shown;
+    at = end;
+  }
+  return out;
+}
+
+std::string hide_note(std::string_view key, std::string_view value) {
+  if (util::secret_name(key) || util::secret_value(value)) return "(hidden)";
+  return hide_command_secrets(value);
+}
+
 std::string to_json(const Run &run) {
   const RunInfo &i = run.info;
   json::Value root = json::Value::object();
@@ -494,9 +628,24 @@ std::string to_json(const Run &run) {
   env.set("timestamp", json::Value::string(i.timestamp));
   env.set("host", json::Value::string(i.host));
   env.set("endpoint", json::Value::string(i.endpoint));
+  if (!i.engine.empty()) env.set("engine", json::Value::string(i.engine));
+  if (!i.engine_build.empty()) env.set("engine_build", json::Value::string(i.engine_build));
+  if (!i.engine_oneapi.empty()) env.set("engine_oneapi", json::Value::string(i.engine_oneapi));
+  if (!i.engine_drafter.empty()) env.set("engine_drafter", json::Value::string(i.engine_drafter));
+  if (!i.server_args.empty() || !i.server_env.empty()) {
+    json::Value server = json::Value::object();
+    server.set("args", strings_json(i.server_args));
+    server.set("env", labels_json(i.server_env));
+    env.set("server", std::move(server));
+  }
+  if (!i.command.empty()) env.set("command", strings_json(i.command));
   env.set("model", json::Value::string(i.model));
   env.set("context_tokens", json::Value::integer(i.context_tokens));
   env.set("kv_pool_tokens", json::Value::integer(i.kv_pool_tokens));
+  if (i.tensor_parallel > 0) env.set("tensor_parallel", json::Value::integer(i.tensor_parallel));
+  if (!i.devices.empty()) env.set("devices", devices_json(i.devices));
+  if (!i.machine.kernel.empty()) env.set("machine", machine_json(i.machine));
+  if (!i.bench_machine.kernel.empty()) env.set("bench_machine", machine_json(i.bench_machine));
   env.set("seconds", json::Value::real(i.seconds));
   env.set("notes", labels_json(i.notes));
   json::Value caps = json::Value::object();
@@ -538,9 +687,19 @@ std::optional<Run> run_from_json(std::string_view text, std::string &err) {
   RunInfo &i = run.info;
   if (const json::Value *env = root.get_object("env")) {
     i.name = text_at(*env, "name"), i.timestamp = text_at(*env, "timestamp"), i.host = text_at(*env, "host");
-    i.endpoint = text_at(*env, "endpoint"), i.model = text_at(*env, "model");
+    i.endpoint = text_at(*env, "endpoint"), i.model = text_at(*env, "model"), i.engine = text_at(*env, "engine");
+    i.engine_build = text_at(*env, "engine_build"), i.engine_oneapi = text_at(*env, "engine_oneapi"), i.engine_drafter = text_at(*env, "engine_drafter");
+    if (const json::Value *server = env->get_object("server")) {
+      i.server_args = strings_from(server->get_array("args"));
+      i.server_env = labels_from(server->get_object("env"));
+    }
+    i.command = strings_from(env->get_array("command"));
     i.context_tokens = static_cast<int64_t>(number_at(*env, "context_tokens"));
     i.kv_pool_tokens = static_cast<int64_t>(number_at(*env, "kv_pool_tokens"));
+    i.tensor_parallel = static_cast<int>(number_at(*env, "tensor_parallel"));  // runs from before: 0, no devices
+    i.devices = devices_from(env->get_array("devices"));
+    if (const json::Value *m = env->get_object("machine")) i.machine = machine_from(*m);
+    if (const json::Value *m = env->get_object("bench_machine")) i.bench_machine = machine_from(*m);
     i.seconds = number_at(*env, "seconds");
     i.notes = labels_from(env->get_object("notes"));
     if (const json::Value *caps = env->get_object("capabilities"))
@@ -647,6 +806,7 @@ std::string render_run(const Run &run) {
   std::string out = "xenithium-bench run " + i.timestamp + "-" + i.name + "\n";
   out += std::string(kIndent) + "endpoint " + i.endpoint + ", model " + i.model + (i.context_tokens ? ", context " + with_thousands(i.context_tokens) + " tokens" : "") +
          (i.kv_pool_tokens ? ", KV pool " + with_thousands(i.kv_pool_tokens) + " tokens" : "") + "\n";
+  if (const std::string on = devices_text(i.devices, i.tensor_parallel, ""); !on.empty()) out += std::string(kIndent) + "runs on " + on + "\n";
   char line[520];
   std::snprintf(line, sizeof(line), "mode %s v%d, suite %s, seed %llu, sampling T %.2f / top-p %.2f / top-k %d, thinking %.*s, replies %s, corpus %s v%d %s, %.0f s", i.mode.c_str(),
                 i.mode_version, i.suite.c_str(), static_cast<unsigned long long>(i.seed), i.sampling.temperature, i.sampling.top_p, i.sampling.top_k,
