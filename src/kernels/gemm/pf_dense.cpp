@@ -1090,6 +1090,29 @@ sycl::event pair_any(sycl::queue &q, const Args &A0, DenseKind k0, int b0, const
   return pair_k1<DenseKind::bf16, kBodyS1, Q, A8>(q, A0, A1, k1, b1, pq);  // bf16: the SLM body only (pair_body)
 }
 
+template <DenseKind K0, int B0>
+class PfOneQuant;
+
+// One GEMM (the pair kernel's body B0) and the W4A8 row quantiser in one launch: the GEMM's work-groups first, then
+// the quantiser's items, as launch_pair with no second matrix.
+template <DenseKind K0, int B0>
+sycl::event launch_one_quant(sycl::queue &q, const Args &A0, const PairQuant &Pq) {
+  static_assert(kLs == kWg, "the pair kernel's work-group serves the body");
+  const size_t w0 = pair_wgs<K0, B0>(A0), wq = (Pq.n + kWg - 1) / kWg;
+  const Args a0 = A0;
+  const PairQuant pq = Pq;
+  return q.submit([&](sycl::handler &cgh) {
+    cgh.parallel_for<PfOneQuant<K0, B0>>(sycl::nd_range<1>((w0 + wq) * kWg, kWg), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+      if constexpr (B0 == kBodyS1) esimd::slm_init<slm_bytes<1>()>();
+      const int wg = static_cast<int>(it.get_group(0)), lid = static_cast<int>(it.get_local_id(0));
+      if (wg < static_cast<int>(w0))  // uniform per work-group: the SLM body's barriers stay legal
+        pair_run<K0, B0>(a0, wg, lid);
+      else
+        pair_quant_item(pq, static_cast<size_t>(wg - static_cast<int>(w0)) * kWg + lid);
+    });
+  });
+}
+
 class PfQuant;
 
 // The quantiser alone (pf_dense_pair with rq when the GEMMs do not pair): moe_rows' launch shape.
@@ -1273,6 +1296,18 @@ sycl::event pf_dense_pair(sycl::queue &q, int m, const DenseWeights &w0, const b
   const bool a8 = u0 || u1;
   if (rq) return a8 ? pair_any<true, true>(q, A[0], w0.kind, b0, A[1], w1.kind, b1, pq) : pair_any<true, false>(q, A[0], w0.kind, b0, A[1], w1.kind, b1, pq);
   return a8 ? pair_any<false, true>(q, A[0], w0.kind, b0, A[1], w1.kind, b1, pq) : pair_any<false, false>(q, A[0], w0.kind, b0, A[1], w1.kind, b1, pq);
+}
+
+sycl::event pf_dense_quant(sycl::queue &q, int m, const DenseWeights &w, const bf16 *a, int lda, const PfOut &out, const PfRowQuant &rq) {
+  Args A = base(m, w, a, lda, nullptr);
+  A.f32 = out.f32;
+  A.b16 = out.b16;
+  A.ld = out.ld > 0 ? out.ld : w.n;
+  if (A.ld < w.n) throw std::invalid_argument("pf_dense_quant: ld < n");
+  if (!rq.src || !rq.dst || !rq.scl || rq.cols <= 0 || rq.cols % kQuantGroup) throw std::invalid_argument("pf_dense_quant: row quantiser");
+  const PairQuant pq{rq.src, rq.cols, rq.dst, rq.scl, static_cast<size_t>(m) * (rq.cols / kQuantGroup), rq.rot};
+  // the SLM body at one tile per work-group: pf_dense's bits at every tile count
+  return w.kind == DenseKind::i8 ? launch_one_quant<DenseKind::i8, kBodyS1>(q, A, pq) : launch_one_quant<DenseKind::bf16, kBodyS1>(q, A, pq);
 }
 
 sycl::event pf_dense_splitk(sycl::queue &q, int m, const DenseWeights &w, const bf16 *a, int lda, float *partials, int ld,

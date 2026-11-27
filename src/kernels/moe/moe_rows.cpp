@@ -814,9 +814,13 @@ MoeEvents moe_rows_route(sycl::queue &q, const MoeShape &s, int lo, int hi, cons
   at.topw += r * s.topk;
   at.sg += r;
   const bf16 *xr = x + r * s.hidden;
-  ev.router = pf_dense(q, m, w.router, xr, s.hidden, PfOut{at.logits, nullptr, w.router.n});
+  // W4A8: the x quantiser rides the router's launch (it reads only x; the same bits as its own launch)
+  if (a8)
+    ev.router = pf_dense_quant(q, m, w.router, xr, s.hidden, PfOut{at.logits, nullptr, w.router.n},
+                               PfRowQuant{xr, s.hidden, sc.xq + r * s.hidden, sc.xs + r * (s.hidden / kGroup)});
+  else
+    ev.router = pf_dense(q, m, w.router, xr, s.hidden, PfOut{at.logits, nullptr, w.router.n});
   ev.topk = ev.route = topk<32>(q, s, m, at.logits, w.router.n, at);
-  if (a8) ev.route = quant_rows<kGroup>(q, m, s.hidden, xr, sc.xq + r * s.hidden, sc.xs + r * (s.hidden / kGroup));
   return ev;
 }
 

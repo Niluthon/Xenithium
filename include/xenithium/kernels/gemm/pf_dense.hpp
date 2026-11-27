@@ -87,6 +87,11 @@ struct PfRowQuant {
 sycl::event pf_dense_pair(sycl::queue &q, int m, const DenseWeights &w0, const sycl::ext::oneapi::bfloat16 *a0, int lda0, const PfOut &out0,
                           const DenseWeights &w1, const sycl::ext::oneapi::bfloat16 *a1, int lda1, const PfOut &out1, bool pair = true,
                           const PfRowQuant *rq = nullptr, const PfA8 *a8_0 = nullptr, const PfA8 *a8_1 = nullptr);
+// One GEMM (C = A W^T, bf16 activations) and the row quantiser in ONE launch: the GEMM runs pf_dense's SLM body at one
+// tile per work-group (pf_dense's bits at every body), the quantiser beside it in the same launch (moe_rows_route: the
+// router and the W4A8 x of a row owner's rows).
+sycl::event pf_dense_quant(sycl::queue &q, int m, const DenseWeights &w, const sycl::ext::oneapi::bfloat16 *a, int lda, const PfOut &out,
+                           const PfRowQuant &rq);
 // Whether pf_dense_pair(m, w0, w1) runs as one launch (for tests and the probe).
 bool pf_dense_pairable(int m, const DenseWeights &w0, const DenseWeights &w1, bool a8_0 = false, bool a8_1 = false);
 
