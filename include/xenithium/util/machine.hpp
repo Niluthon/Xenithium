@@ -6,9 +6,11 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <istream>
 #include <string>
 
 namespace xenithium::util {
@@ -20,6 +22,19 @@ struct Machine {
   int cpu_threads = 0;  // online logical CPUs
   int memory_gib = 0;  // MemTotal, rounded to whole GiB
 };
+
+// MemTotal of a /proc/meminfo text, in whole GiB; 0 = not known (no such line, or not a number: a container's shim).
+// strtoll, not stod: it never throws, and this runs at the server's startup.
+inline int memory_gib_from(std::istream &meminfo) {
+  std::string line;
+  while (std::getline(meminfo, line))
+    if (line.rfind("MemTotal:", 0) == 0) {
+      const long long kb = std::strtoll(line.c_str() + 9, nullptr, 10);
+      if (kb <= 0) return 0;
+      return static_cast<int>(std::min(std::llround(static_cast<double>(kb) / (1024.0 * 1024.0)), 1LL << 30));  // capped: an int
+    }
+  return 0;
+}
 
 inline Machine this_machine() {
   Machine m;
@@ -40,14 +55,7 @@ inline Machine this_machine() {
         break;
       }
   if (const long n = ::sysconf(_SC_NPROCESSORS_ONLN); n > 0) m.cpu_threads = static_cast<int>(n);
-  if (std::ifstream mem("/proc/meminfo"); mem)
-    while (std::getline(mem, line))
-      if (line.rfind("MemTotal:", 0) == 0) {
-        // kB; strtoll, not stod: a malformed line (a container's shim) reads as 0 = not known, never throws at startup
-        const long long kb = std::strtoll(line.c_str() + 9, nullptr, 10);
-        if (kb > 0) m.memory_gib = static_cast<int>(std::lround(static_cast<double>(kb) / (1024.0 * 1024.0)));
-        break;
-      }
+  if (std::ifstream mem("/proc/meminfo"); mem) m.memory_gib = memory_gib_from(mem);
   return m;
 }
 

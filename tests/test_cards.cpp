@@ -54,6 +54,8 @@ int main() {
   CHECK(u::nominal_vram_gb(b65, 32530182144ull) == 32 && u::nominal_vram_gb(b60, 1) == 24 && u::nominal_vram_gb(nullptr, 32530182144ull) == 32 &&
             u::nominal_vram_gb(nullptr, 0) == 0,
         "nominal GB: the table's for a known card, else scaled from the driver's figure (a B65's 30.3 GiB = 32 GB)");
+  CHECK(u::nominal_vram_gb(b70, 32530182144ull) == 32 && u::nominal_vram_gb(b70, kB70Vram) == 32 && u::nominal_vram_gb(nullptr, kB70Vram) == 32,
+        "nominal GB: a B70 (the driver's 32530182144 bytes from a 2x B70 field run, and the module size) is 32 GB, known or scaled");
   CHECK(!u::identify_card(0x1234, "Intel(R) Arc(TM) Pro B605 Graphics", 20, kB70Vram).spec, "a name that only starts with a key is no match");
   // then cores + VRAM for an unlisted Battlemage id
   CHECK(u::identify_card(0xe220, "Intel(R) Graphics", 32, kB70Vram).spec == b70, "G31 id, 32 cores, 32 GB = B70");
