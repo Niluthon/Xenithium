@@ -59,15 +59,13 @@ Fabric::Fabric(const l0::Loader &loader, std::vector<size_t> ranks, bool profili
 }
 
 void *Fabric::alloc_mailbox(size_t r, size_t bytes) {
-  void *p = alloc(r, bytes);
-  for (size_t o = 0; o < devs_.size(); ++o) {
-    if (o == r) continue;
-    if (zeContextMakeMemoryResident(ctx_.handle(), devs_[o], p, bytes) != ZE_RESULT_SUCCESS) {
-      release(p);
-      throw std::runtime_error("fabric: zeContextMakeMemoryResident failed for a mailbox");
-    }
-  }
-  return p;
+  // [hostmail patch] Pinned host USM instead of peer-resident device VRAM. On xe 7.3.x
+  // a peer store into another card's VRAM can be partially visible to the owner's
+  // spin-read (some lane runs land, others read back zero), so mail_take accepted a
+  // half-written message: wrong sums, non-finite drafter activations, CCS page faults.
+  // Host USM is coherent behind the system-scope fence in mail_take (cf. PR #2).
+  (void)r;
+  return alloc_host(bytes);
 }
 
 bool Fabric::can_access(size_t from, size_t to) const {
